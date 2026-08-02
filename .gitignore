@@ -4,3 +4,5 @@ results/
 __pycache__/
 *.egg-info/
 .fastest/
+.zig-cache/
+zig-out/
