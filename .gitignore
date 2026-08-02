@@ -1,0 +1,6 @@
+testbeds/
+results/
+.venv/
+__pycache__/
+*.egg-info/
+.fastest/
