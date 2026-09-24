@@ -16,6 +16,7 @@ separately, because fork-per-test isolation, not selection, is the fix.
 Kill criterion: any first-order miss.
 
 Usage: python bench/mutate.py testbeds/httpx --n 15 [--seed 7]
+       python bench/mutate.py testbeds/httpx --target httpx/_client.py::Client.__exit__
 """
 
 from __future__ import annotations
@@ -107,6 +108,8 @@ def main():
     ap.add_argument("--n", type=int, default=15)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--pytest-args", default="")
+    ap.add_argument("--target", action="append", default=[], metavar="PATH::QUALNAME",
+                    help="mutate exactly this function (repeatable) instead of sampling")
     args = ap.parse_args()
     repo = args.repo.resolve()
     py = repo / ".venv" / "bin" / "python"
@@ -122,8 +125,12 @@ def main():
         "AND f.path NOT LIKE '%conftest%'"
     ).fetchall()
     con.close()
-    rng = random.Random(args.seed)
-    rng.shuffle(rows)
+    if args.target:
+        rows = [tuple(t.split("::", 1)) for t in args.target]
+        args.n = len(rows)
+    else:
+        rng = random.Random(args.seed)
+        rng.shuffle(rows)
 
     baseline = run_statuses(py, repo, extra, "base")
     print(f"baseline: {len(baseline)} tests, "
