@@ -1,23 +1,46 @@
-"""Phase 2: diff -> affected test selection, with receipts.
+"""Phase 2: diff -> affected test selection, with receipts and evidence.
 
-Given the map.sqlite from Phase 1 and a git diff, compute:
-  - changed (file, qualname) functions via unified-diff hunks + AST spans
-  - affected tests = inverted map lookup
-  - conservative set = unmapped tests, tests in changed test files,
-    everything if conftest / non-Python / module-level code changed
+Reads the roll-up in map.sqlite (tests + current_links; never the journal
+directly). A test's evidence is the tree of the run that last observed it, so
+selection is computed per observed tree:
 
-Usage: python -m fastest.select --repo testbeds/httpx --base HEAD~1 [--json]
+  1. group the contributing runs (last full run and everything after it, plus
+     any older run that still holds a live test's last observation) by the
+     tree they saw: HEAD commit + the files that were dirty, by content hash
+  2. per tree, compute what changed between that tree and now: the git diff
+     from its commit, with each dirty file's git hunks replaced by an exact
+     line diff of the content the run saw (stored in the journal) against the
+     content now — so a file that is still what the run saw is not a change,
+     and a file that differs is diffed at function level, not wholesale
+  3. map changed lines to (file, qualname) functions via AST spans, look them
+     up in the inverted map, restricted to the tests that tree observed
+  4. conservative rules on top: unmapped tests, tests in changed test files
+     (a test module whose known tests can't all be found statically, or that
+     has tests the map has never seen, is run as a whole file), and run-all
+     when conftest / a tracked non-Python file / module-level or import-time
+     code of a production module changed in any tree. Untracked non-Python
+     files are ignored.
+
+An explicit --base collapses this to one tree (that commit, all tests), which
+is what the replay/mutation harnesses use. Every result carries `evidence`:
+runs, commits, freshness, the trees, and every warning.
+
+Usage: python -m fastest.select --repo testbeds/httpx [--base REV] [--json]
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import difflib
 import json
 import re
-import sqlite3
 import subprocess
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from fastest import mapdb, provenance
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -33,6 +56,11 @@ def is_inert(path: str) -> bool:
         or path.startswith(INERT_PREFIXES)
         or Path(path).name in INERT_NAMES
     )
+
+
+def is_test_file(path: str) -> bool:
+    name = Path(path).name
+    return name.startswith("test_") or name.endswith("_test.py")
 
 
 def git(repo: Path, *args: str) -> str:
@@ -65,6 +93,40 @@ def function_spans(source: str) -> list[tuple[str, int, int]]:
     return spans
 
 
+def static_test_names(source: str) -> set[str]:
+    """Test names pytest would collect from a module, statically: 'test_x' and
+    'TestC::test_y' (parametrization ignored). Used to spot tests the map has
+    never seen; canonical ids still come from pytest."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            names.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test"):
+                    names.add(f"{node.name}::{sub.name}")
+    return names
+
+
+def parse_hunks(lines) -> tuple[set[int], set[int]]:
+    """(old_lines, new_lines) from unified-diff hunk headers (-U0 style)."""
+    old: set[int] = set()
+    new: set[int] = set()
+    for line in lines:
+        if line.startswith("@@"):
+            m = HUNK_RE.match(line)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2) or "1")
+                c, d = int(m.group(3)), int(m.group(4) or "1")
+                old.update(range(a, a + b))
+                new.update(range(c, c + d))
+    return old, new
+
+
 def changed_lines(repo: Path, base: str, head: str | None) -> dict[str, dict]:
     """path -> {'new': set[int], 'old': set[int], 'status': 'M'/'A'/'D'/...}"""
     rng = [base, head] if head else [base]
@@ -76,146 +138,506 @@ def changed_lines(repo: Path, base: str, head: str | None) -> dict[str, dict]:
         out[path] = {"new": set(), "old": set(), "status": st}
     diff = git(repo, "diff", "-U0", "-M", *rng)
     cur = None
+    chunk: list[str] = []
+
+    def flush():
+        if cur in out:
+            o, n = parse_hunks(chunk)
+            out[cur]["old"].update(o)
+            out[cur]["new"].update(n)
+
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
-            cur = line[6:]
-        elif line.startswith("@@") and cur in out:
-            m = HUNK_RE.match(line)
-            if m:
-                a, b = int(m.group(1)), int(m.group(2) or "1")
-                c, d = int(m.group(3)), int(m.group(4) or "1")
-                out[cur]["old"].update(range(a, a + b))
-                out[cur]["new"].update(range(c, c + d))
+            flush()
+            cur, chunk = line[6:], []
+        elif line.startswith("@@"):
+            chunk.append(line)
+    flush()
     return out
 
 
-def funcs_touching(spans, lines) -> tuple[set[str], set[int]]:
-    """(qualnames whose span overlaps lines, lines outside any function)."""
+def local_diff(old_text: str, new_text: str) -> tuple[set[int], set[int]]:
+    """(old_lines, new_lines) that differ, same convention as git diff -U0."""
+    diff = difflib.unified_diff(
+        old_text.splitlines(keepends=True), new_text.splitlines(keepends=True), n=0
+    )
+    return parse_hunks(diff)
+
+
+def funcs_touching(spans, lines, source: str | None = None) -> tuple[set[str], set[int]]:
+    """(qualnames whose span overlaps lines, lines outside any function).
+    With `source`, blank and comment-only lines outside functions are ignored:
+    they cannot execute, so they are not module-level changes."""
     hit, covered = set(), set()
     for qual, s, e in spans:
         overlap = {ln for ln in lines if s <= ln <= e}
         if overlap:
             hit.add(qual)
         covered |= overlap
-    return hit, lines - covered
+    outside = lines - covered
+    if source is not None and outside:
+        src_lines = source.splitlines()
+
+        def inert(ln: int) -> bool:
+            text = src_lines[ln - 1].strip() if 0 < ln <= len(src_lines) else ""
+            return text == "" or text.startswith("#")
+
+        outside = {ln for ln in outside if not inert(ln)}
+    return hit, outside
 
 
 def collection_deps(con) -> tuple[set[tuple[str, str]], set[str]]:
     """(funcs, files) executed at import/collection time."""
     rows = con.execute(
-        "SELECT f.path, fn.qualname FROM tests t JOIN links l ON l.test_id=t.id "
+        "SELECT f.path, fn.qualname FROM tests t JOIN current_links l ON l.test_id=t.id "
         "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
-        "WHERE t.test_id='__collection__'"
+        "WHERE t.test_id=?",
+        (mapdb.COLLECTION,),
     ).fetchall()
     return {(p, q) for p, q in rows}, {p for p, _ in rows}
 
 
-def select(db_path: Path, repo: Path, base: str, head: str | None = None) -> dict:
-    con = sqlite3.connect(db_path)
-    all_tests = {
-        r[0]: r[1]
-        for r in con.execute("SELECT test_id, mapped FROM tests")
-        if r[0] != "__collection__"
-    }
-    coll_funcs, coll_files = collection_deps(con)
+# --- evidence ----------------------------------------------------------------
 
-    changes = changed_lines(repo, base, head)
-    selected: dict[str, str] = {}  # test_id -> reason
-    run_all_reasons: list[str] = []
-    changed_funcs: set[tuple[str, str]] = set()  # (path, qualname)
-    changed_files_wholesale: set[str] = set()
+@dataclass
+class Tree:
+    """One observed state of the repository."""
+    commit: str                     # commit (or rev) to diff from
+    dirty: dict[str, str | None]    # path -> content hash the runs saw (None: absent)
+    unknown: set[str]               # paths that changed during an observing run
+    run_ids: set[int] | None        # runs that saw this tree; None = every test
+
+    def summary(self) -> dict:
+        return {
+            "commit": self.commit if len(self.commit) != 40 else self.commit[:8],
+            "dirty": sorted(self.dirty),
+            "unknown": sorted(self.unknown),
+            "runs": sorted(self.run_ids) if self.run_ids is not None else "all",
+        }
+
+
+@dataclass
+class Analysis:
+    """What changed between one tree and now, and what that implies."""
+    changed_funcs: set[tuple[str, str]] = field(default_factory=set)
+    wholesale: set[str] = field(default_factory=set)
+    run_all_reasons: list[str] = field(default_factory=list)
+    test_files: dict[str, str] = field(default_factory=dict)      # changed test file -> reason
+    selected_files: dict[str, str] = field(default_factory=dict)  # run whole file -> reason
+    unchanged: list[str] = field(default_factory=list)
+    forced: list[str] = field(default_factory=list)
+
+
+def _brief(run: dict | None) -> dict | None:
+    if run is None:
+        return None
+    return {
+        "id": run["id"],
+        "scope": run["scope"],
+        "commit": run["commit_sha"],
+        "finished_at": run["finished_at"],
+        "age_s": round(time.time() - run["finished_at"], 1) if run["finished_at"] else None,
+        "n_observed": run["n_observed"],
+        "n_collected": run["n_collected"],
+        "dirty_files": len(run["dirty_files"]),
+        "tree_changed": run["tree_changed"],
+        "recorder": run["recorder"],
+    }
+
+
+def evidence_summary(con, repo: Path) -> tuple[dict, list[dict]]:
+    """(evidence block, contributing runs)."""
+    all_runs = mapdb.runs(con)
+    full = mapdb.last_full_run(con)
+    contributing = mapdb.contributing_runs(con)
+    commits = sorted({r["commit_sha"] for r in contributing if r["commit_sha"]})
+    refreshed = None
+    if full:
+        refreshed = con.execute(
+            "SELECT COUNT(*) FROM tests WHERE retired_run IS NULL AND last_run > ? "
+            "AND test_id != ?",
+            (full["id"], mapdb.COLLECTION),
+        ).fetchone()[0]
+    ev = {
+        "schema": mapdb.SCHEMA_VERSION,
+        "runs": len(all_runs),
+        "last_full_run": _brief(full),
+        "last_run": _brief(all_runs[-1]) if all_runs else None,
+        "contributing_runs": [r["id"] for r in contributing],
+        "evidence_commits": commits,
+        "head": provenance.git_head(repo),
+        "commits_behind": (
+            provenance.commits_behind(repo, full["commit_sha"])
+            if full and full["commit_sha"] else None
+        ),
+        "tests_refreshed_since_full": refreshed,
+        "warnings": [],
+    }
+    if not full:
+        ev["warnings"].append("no full run recorded: evidence is partial runs only")
+    return ev, contributing
+
+
+def build_trees(repo: Path, contributing: list[dict], base: str | None, ev: dict) -> list[Tree]:
+    if base is not None:
+        ev["base_source"] = "explicit"
+        sha = provenance.rev_parse(repo, base)
+        if ev["evidence_commits"] and sha not in ev["evidence_commits"]:
+            ev["warnings"].append(
+                f"explicit base {base} is not an evidence commit "
+                f"{[c[:8] for c in ev['evidence_commits']]}; differences between them are invisible"
+            )
+        return [Tree(commit=base, dirty={}, unknown=set(), run_ids=None)]
+    ev["base_source"] = "evidence"
+    exists: dict[str, bool] = {}
+    groups: dict[tuple, set[int]] = {}
+    for r in contributing:
+        commit = r["commit_sha"]
+        if commit is not None:
+            if commit not in exists:
+                exists[commit] = provenance.rev_parse(repo, commit) is not None
+            if not exists[commit]:
+                ev["warnings"].append(
+                    f"run #{r['id']}: evidence commit {commit[:8]} no longer exists; diffing from HEAD"
+                )
+                commit = None
+        else:
+            ev["warnings"].append(f"run #{r['id']} carries no commit; diffing from HEAD")
+        commit = commit or "HEAD"
+        dirty = {p: he for p, (hs, he) in r["dirty_files"].items() if hs == he}
+        unknown = {p for p, (hs, he) in r["dirty_files"].items() if hs != he}
+        if unknown:
+            ev["warnings"].append(
+                f"run #{r['id']}: {sorted(unknown)} changed while it ran; selected wholesale"
+            )
+        key = (commit, tuple(sorted(dirty.items())), tuple(sorted(unknown)))
+        groups.setdefault(key, set()).add(r["id"])
+    return [
+        Tree(commit=c, dirty=dict(d), unknown=set(u), run_ids=ids)
+        for (c, d, u), ids in sorted(groups.items(), key=lambda kv: min(kv[1]))
+    ]
+
+
+class _Now:
+    """Current content of paths, in the working tree or at `head`, cached."""
+
+    def __init__(self, repo: Path, head: str | None):
+        self.repo, self.head = repo, head
+        self._cache: dict[str, tuple[str | None, bytes | None]] = {}
+
+    def get(self, path: str) -> tuple[str | None, bytes | None]:
+        if path not in self._cache:
+            if self.head is None:
+                self._cache[path] = provenance.read_and_hash(self.repo / path)
+            else:
+                try:
+                    data = subprocess.run(
+                        ["git", "show", f"{self.head}:{path}"], cwd=self.repo,
+                        capture_output=True, check=True,
+                    ).stdout
+                except subprocess.CalledProcessError:
+                    self._cache[path] = (None, None)
+                else:
+                    self._cache[path] = (provenance.bytes_hash(data), data)
+        return self._cache[path]
+
+    def text(self, path: str) -> str | None:
+        data = self.get(path)[1]
+        if data is None:
+            return None
+        try:
+            return data.decode()
+        except UnicodeDecodeError:
+            return None
+
+
+def tree_changes(
+    repo: Path, tree: Tree, now: _Now, con, git_cache: dict, untracked: dict[str, str | None],
+    an: Analysis,
+) -> dict[str, dict]:
+    """path -> {'new': set, 'old': {source: set}, 'status', ['wholesale']}
+    between the tree and now. `source` is a rev for git-derived hunks or
+    'blob:<hash>' for hunks against content the run saw."""
+    if tree.commit not in git_cache:
+        git_cache[tree.commit] = changed_lines(repo, tree.commit, now.head)
+    changes = {
+        path: {"new": set(ch["new"]), "old": {tree.commit: set(ch["old"])}, "status": ch["status"]}
+        for path, ch in git_cache[tree.commit].items()
+    }
+    for path, h in untracked.items():  # never in git diff; new to this tree unless it saw them
+        if path not in changes and path not in tree.dirty and path.endswith(".py") and h is not None:
+            changes[path] = {"new": set(), "old": {}, "status": "A"}
+    for path, observed_hash in tree.dirty.items():
+        now_hash, _ = now.get(path)
+        if observed_hash == now_hash:
+            changes.pop(path, None)
+            an.unchanged.append(path)
+            continue
+        if not path.endswith(".py"):
+            # same policy as the git path: a tracked non-Python change is
+            # already in `changes` (run-all); an untracked one is ignored
+            continue
+        if observed_hash is None:  # absent when observed
+            if now_hash is not None:
+                changes[path] = {"new": set(), "old": {}, "status": "A"}
+            else:
+                changes.pop(path, None)
+            continue
+        if now_hash is None:
+            changes[path] = {"new": set(), "old": {}, "status": "D"}
+            continue
+        observed = mapdb.blob(con, observed_hash)
+        new_text = now.text(path)
+        try:
+            old_text = observed.decode() if observed is not None else None
+        except UnicodeDecodeError:
+            old_text = None
+        if old_text is None or new_text is None:
+            changes[path] = {
+                "new": set(), "old": {}, "status": "M",
+                "wholesale": "dirty at observation; observed content unavailable",
+            }
+            an.forced.append(path)
+            continue
+        old_lines, new_lines = local_diff(old_text, new_text)
+        changes[path] = {
+            "new": new_lines, "old": {f"blob:{observed_hash}": old_lines}, "status": "M",
+        }
+    for path in tree.unknown:
+        if not path.endswith(".py"):
+            continue
+        now_hash, _ = now.get(path)
+        changes[path] = {
+            "new": set(), "old": {}, "status": "M" if now_hash is not None else "D",
+            "wholesale": "changed while the observing run was executing",
+        }
+        an.forced.append(path)
+    return changes
+
+
+def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis) -> Analysis:
+    """Turn a change set into changed functions, wholesale files, run-all
+    reasons and test-file selections."""
+
+    def old_source(source: str, path: str) -> str | None:
+        if source.startswith("blob:"):
+            data = mapdb.blob(con, source[5:])
+            try:
+                return data.decode() if data is not None else None
+            except UnicodeDecodeError:
+                return None
+        try:
+            return git(repo, "show", f"{source}:{path}")
+        except subprocess.CalledProcessError:
+            return None
+
+    def select_test_file(path: str, reason: str) -> None:
+        an.test_files[path] = reason
+        src = now.text(path)
+        if src is None:
+            return
+        known = {
+            t.split("::", 1)[1].split("[", 1)[0] for t in all_tests if t.startswith(path + "::")
+        }
+        names = static_test_names(src)
+        unknown = sorted(names - known)
+        vanished = sorted(known - names)
+        notes = []
+        if unknown:
+            notes.append(f"{len(unknown)} test(s) not in the map: {', '.join(unknown[:5])}"
+                         + (" ..." if len(unknown) > 5 else ""))
+        if vanished:
+            # deleted, renamed, or generated dynamically: their node ids can't
+            # be trusted, so run the file and let pytest decide what exists
+            notes.append(f"{len(vanished)} known test(s) not found statically: "
+                         f"{', '.join(vanished[:5])}" + (" ..." if len(vanished) > 5 else ""))
+        if notes:
+            an.selected_files[path] = "; ".join(notes)
 
     for path, ch in changes.items():
         name = Path(path).name
         if is_inert(path):
             continue
         if not path.endswith(".py"):
-            run_all_reasons.append(f"non-Python file changed: {path}")
+            an.run_all_reasons.append(f"non-Python file changed: {path}")
             continue
         if name == "conftest.py" or "conftest" in name:
-            run_all_reasons.append(f"conftest changed: {path}")
+            an.run_all_reasons.append(f"conftest changed: {path}")
+            continue
+        if ch.get("wholesale"):
+            # a test module's import-time code is its own tests' concern
+            # (conftest is the sanctioned shared hook and has its own rule),
+            # so it is never a reason to run everything
+            if is_test_file(path):
+                select_test_file(path, f"test file {ch['wholesale']}: {path}")
+            else:
+                an.wholesale.add(path)
             continue
         if ch["status"] == "A":
             # brand-new file: nothing maps to it; select tests defined in it
-            if name.startswith("test_") or name.endswith("_test.py"):
-                for t in all_tests:
-                    if t.startswith(path + "::"):
-                        selected[t] = f"new test file {path}"
+            if is_test_file(path):
+                select_test_file(path, f"new test file {path}")
             else:
-                changed_files_wholesale.add(path)
+                an.wholesale.add(path)
             continue
         if ch["status"] == "D":
-            changed_files_wholesale.add(path)
+            an.wholesale.add(path)
             continue
 
-        # modified file: map changed lines -> functions, in NEW and OLD version
+        # modified file: map changed lines -> functions, in NEW and each OLD version
         module_level = set()
-        try:
-            new_src = (repo / path).read_text()
-            hit, uncovered = funcs_touching(function_spans(new_src), ch["new"])
-            changed_funcs |= {(path, q) for q in hit}
+        unreadable = False
+        new_src = now.text(path)
+        if new_src is None:
+            unreadable = True
+        else:
+            hit, uncovered = funcs_touching(function_spans(new_src), ch["new"], new_src)
+            an.changed_funcs |= {(path, q) for q in hit}
             module_level |= uncovered
-        except FileNotFoundError:
-            changed_files_wholesale.add(path)
-        try:
-            old_src = git(repo, "show", f"{base}:{path}")
-            hit, uncovered = funcs_touching(function_spans(old_src), ch["old"])
-            changed_funcs |= {(path, q) for q in hit}
+        for source, old_lines in ch["old"].items():
+            old_src = old_source(source, path)
+            if old_src is None:
+                unreadable = True
+                continue
+            hit, uncovered = funcs_touching(function_spans(old_src), old_lines, old_src)
+            an.changed_funcs |= {(path, q) for q in hit}
             module_level |= uncovered
-        except subprocess.CalledProcessError:
-            pass
-        if module_level:
+
+        if is_test_file(path):
+            # any change to a test module selects that module's tests; see the
+            # wholesale branch above for why it never escalates to run-all
+            an.changed_funcs -= {(p, q) for p, q in an.changed_funcs if p == path}
+            select_test_file(
+                path,
+                f"module-level change in test file: {path}" if module_level or unreadable
+                else f"test file changed: {path}",
+            )
+        elif module_level or unreadable:
             # import-time code changed: every test importing this file is suspect
-            changed_files_wholesale.add(path)
+            an.wholesale.add(path)
+    return an
 
-        if name.startswith("test_") or name.endswith("_test.py"):
-            for t in all_tests:
-                if t.startswith(path + "::"):
-                    selected.setdefault(t, f"test file changed: {path}")
 
-    # import/collection-time execution: a changed function that runs during
-    # collection (decorators, module-level declarations) can break any test
-    # before it even starts — no per-test attribution possible, so run all.
-    for path, qual in sorted(changed_funcs):
-        if (path, qual) in coll_funcs:
-            run_all_reasons.append(f"executed at import/collection time: {path}::{qual}")
-    for path in sorted(changed_files_wholesale):
-        if path in coll_files:
-            run_all_reasons.append(f"module-level change in import-time file: {path}")
+# --- selection ---------------------------------------------------------------
+
+def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None) -> dict:
+    for rev in (base, head):
+        if rev is not None and provenance.rev_parse(repo, rev) is None:
+            return {"error": f"unknown revision: {rev}", "mode": "error"}
+    con = mapdb.connect(str(db_path))
+    ev, contributing = evidence_summary(con, repo)
+    now = _Now(repo, head)
+
+    # live tests whose module still exists (deleted modules cannot be run)
+    if head is None:
+        exists_cache: dict[str, bool] = {}
+
+        def module_exists(mod: str) -> bool:
+            if mod not in exists_cache:
+                exists_cache[mod] = (repo / mod).exists()
+            return exists_cache[mod]
+    else:
+        tree_paths = set(git(repo, "ls-tree", "-r", "--name-only", head).splitlines())
+
+        def module_exists(mod: str) -> bool:
+            return mod in tree_paths
+
+    all_tests: dict[str, tuple[int, int]] = {}  # test_id -> (mapped, last_run)
+    missing_modules: set[str] = set()
+    for test_id, mapped, last_run in con.execute(
+        "SELECT test_id, mapped, last_run FROM tests WHERE retired_run IS NULL "
+        "AND deps_set IS NOT NULL AND test_id != ?",
+        (mapdb.COLLECTION,),
+    ):
+        mod = test_id.split("::", 1)[0]
+        if module_exists(mod):
+            all_tests[test_id] = (mapped, last_run)
+        else:
+            missing_modules.add(mod)
+    ev["missing_modules"] = sorted(missing_modules)
+    coll_funcs, coll_files = collection_deps(con)
+
+    trees = build_trees(repo, contributing, base, ev)
+    untracked = provenance.dirty_files(repo) if head is None else {}
+    git_cache: dict[str, dict] = {}
+    analyses: list[Analysis] = []
+    for tree in trees:
+        an = Analysis()
+        changes = tree_changes(repo, tree, now, con, git_cache, untracked, an)
+        analyze(repo, con, now, changes, all_tests, an)
+        # import/collection-time execution: a changed function that runs during
+        # collection (decorators, module-level declarations) can break any test
+        # before it even starts — no per-test attribution possible, so run all.
+        for path, qual in sorted(an.changed_funcs):
+            if (path, qual) in coll_funcs:
+                an.run_all_reasons.append(f"executed at import/collection time: {path}::{qual}")
+        for path in sorted(an.wholesale):
+            if path in coll_files:
+                an.run_all_reasons.append(f"module-level change in import-time file: {path}")
+        analyses.append(an)
+
+    ev["trees"] = [t.summary() for t in trees]
+    ev["dirty_rule"] = {
+        "unchanged_since_observation": sorted({p for a in analyses for p in a.unchanged}),
+        "forced_wholesale": sorted({p for a in analyses for p in a.forced}),
+    }
+    run_all_reasons = sorted({r for a in analyses for r in a.run_all_reasons})
+    changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs})
+    wholesale = sorted({p for a in analyses for p in a.wholesale})
 
     if run_all_reasons:
         con.close()
         return {
             "mode": "run_all",
             "reasons": run_all_reasons,
-            "selected": sorted(all_tests),
+            "selected": {t: "run_all" for t in sorted(all_tests)},
+            "selected_files": {},
+            "targets": sorted(all_tests),
             "n_total": len(all_tests),
+            "changed_functions": changed_funcs,
+            "changed_files_wholesale": wholesale,
+            "evidence": ev,
         }
 
-    # inverted-map lookup: function-level
-    for path, qual in changed_funcs:
-        rows = con.execute(
-            "SELECT t.test_id FROM tests t JOIN links l ON l.test_id=t.id "
-            "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
-            "WHERE f.path=? AND fn.qualname=?",
-            (path, qual),
-        )
-        for (t,) in rows:
-            selected.setdefault(t, f"touches changed function {path}::{qual}")
-
-    # file-level (wholesale) lookup
-    for path in changed_files_wholesale:
-        rows = con.execute(
-            "SELECT DISTINCT t.test_id FROM tests t JOIN links l ON l.test_id=t.id "
-            "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
-            "WHERE f.path=?",
-            (path,),
-        )
-        for (t,) in rows:
-            selected.setdefault(t, f"imports/touches changed file {path}")
+    known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids}
+    selected: dict[str, str] = {}  # test_id -> reason
+    selected_files: dict[str, str] = {}
+    for tree, an in zip(trees, analyses):
+        if tree.run_ids is None:
+            in_tree = set(all_tests)
+        else:
+            in_tree = {
+                t for t, (_, last_run) in all_tests.items()
+                if last_run in tree.run_ids or last_run not in known_runs
+            }
+        for path, qual in an.changed_funcs:
+            rows = con.execute(
+                "SELECT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
+                "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
+                "WHERE f.path=? AND fn.qualname=?",
+                (path, qual),
+            )
+            for (t,) in rows:
+                if t in in_tree:
+                    selected.setdefault(t, f"touches changed function {path}::{qual}")
+        for path in an.wholesale:
+            rows = con.execute(
+                "SELECT DISTINCT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
+                "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
+                "WHERE f.path=?",
+                (path,),
+            )
+            for (t,) in rows:
+                if t in in_tree:
+                    selected.setdefault(t, f"imports/touches changed file {path}")
+        for path, reason in an.test_files.items():
+            for t in in_tree:
+                if t.startswith(path + "::"):
+                    selected.setdefault(t, reason)
+        selected_files.update(an.selected_files)
 
     # conservative: unmapped tests always run
-    for t, mapped in all_tests.items():
+    for t, (mapped, _) in all_tests.items():
         if not mapped:
             selected.setdefault(t, "unmapped test (conservative)")
 
@@ -224,15 +646,22 @@ def select(db_path: Path, repo: Path, base: str, head: str | None = None) -> dic
         for t in all_tests
         if t not in selected
     }
+    # a whole-file target subsumes that file's individual node ids
+    targets = sorted(selected_files) + sorted(
+        t for t in selected if t.split("::", 1)[0] not in selected_files
+    )
     con.close()
     return {
         "mode": "select",
-        "changed_functions": sorted(f"{p}::{q}" for p, q in changed_funcs),
-        "changed_files_wholesale": sorted(changed_files_wholesale),
+        "changed_functions": changed_funcs,
+        "changed_files_wholesale": wholesale,
         "selected": {t: selected[t] for t in sorted(selected)},
+        "selected_files": selected_files,
+        "targets": targets,
         "n_selected": len(selected),
         "n_skipped": len(skipped),
         "n_total": len(all_tests),
+        "evidence": ev,
     }
 
 
@@ -240,7 +669,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", type=Path, required=True)
     ap.add_argument("--db", type=Path)
-    ap.add_argument("--base", default="HEAD")
+    ap.add_argument("--base", default=None, help="diff base (default: the trees the evidence saw)")
     ap.add_argument("--head", default=None)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -249,6 +678,13 @@ def main():
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        ev = result["evidence"]
+        print(
+            f"evidence: {ev['runs']} runs, commits {[c[:8] for c in ev['evidence_commits']]}, "
+            f"{ev['commits_behind']} behind HEAD, {len(ev['trees'])} tree(s) ({ev['base_source']})"
+        )
+        for w in ev["warnings"]:
+            print(f"  ! {w}")
         if result["mode"] == "run_all":
             print(f"RUN ALL ({result['n_total']} tests): {'; '.join(result['reasons'])}")
         else:
@@ -260,6 +696,8 @@ def main():
                 print(f"  changed: {f}")
             for t, why in list(result["selected"].items())[:20]:
                 print(f"  RUN  {t}  [{why}]")
+            for p, why in result["selected_files"].items():
+                print(f"  RUN  {p}  [{why}]")
 
 
 if __name__ == "__main__":

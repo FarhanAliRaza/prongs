@@ -113,7 +113,7 @@ def main():
     con = sqlite3.connect(db)
     rows = con.execute(
         "SELECT DISTINCT f.path, fn.qualname FROM funcs fn JOIN files f ON f.id=fn.file_id "
-        "JOIN links l ON l.func_id=fn.id WHERE f.path NOT LIKE 'tests%' "
+        "JOIN current_links l ON l.func_id=fn.id WHERE f.path NOT LIKE 'tests%' "
         "AND f.path NOT LIKE '%conftest%'"
     ).fetchall()
     con.close()
