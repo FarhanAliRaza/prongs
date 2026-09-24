@@ -195,6 +195,18 @@ def test_v1_map_is_migrated_into_run_one(tmp_path, root):
     assert rows(con, "SELECT status, last_run FROM tests WHERE test_id='tests/a.py::test_1'") == [("failed", 2)]
 
 
+def test_connect_does_not_write_when_the_schema_is_current(tmp_path, root):
+    db = str(tmp_path / "map.sqlite")
+    mapdb.record_run(db, root, {"tests/a.py::t": (0.1, "passed", [])}, run_info())
+    watcher = sqlite3.connect(db)
+    version = watcher.execute("PRAGMA data_version").fetchone()
+    for _ in range(3):
+        con = mapdb.connect(db)  # a read path: must not take the write lock
+        assert con.execute("SELECT COUNT(*) FROM runs").fetchone() == (1,)
+        con.close()
+    assert watcher.execute("PRAGMA data_version").fetchone() == version
+
+
 def test_blobs_are_content_addressed(tmp_path, root):
     db = str(tmp_path / "map.sqlite")
     info = run_info(dirty={"pkg/mod.py": ["h1", "h1"]}, blobs={"h1": b"x = 1\n"})

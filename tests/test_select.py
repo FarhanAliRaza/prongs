@@ -33,9 +33,11 @@ def test_function_change_selects_its_dependents(recorded):
 
 def test_recorded_partial_run_is_credited_exactly(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
-    out = recorded.cli("run", "--record")
-    assert out["summary"]["ran"] == 2 and out["summary"]["record_ok"] is True
-    assert out["summary"]["recorded"] == {"run_id": 2, "scope": "partial", "n_observed": 2}
+    out = recorded.cli("run")  # recording is the default
+    s = out["summary"]
+    assert s["status"] == "passed" and s["ran"] == 2 and s["complete"] is True
+    assert s["unrun_targets"] == [] and s["record_ok"] is True
+    assert s["recorded"] == {"run_id": 2, "scope": "partial", "n_observed": 2}
     assert [r[1] for r in recorded.runs()] == ["full", "partial"]
 
     sel = recorded.select()
@@ -170,9 +172,60 @@ def test_commit_to_commit_selection(recorded):
     assert sel["targets"] == [T_C, T_A] and sel["changed_functions"] == ["pkg/mod.py::a"]
 
 
+def test_no_record_leaves_the_journal_alone(recorded):
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    out = recorded.cli("run", "--no-record")
+    assert out["summary"]["ran"] == 2 and "recorded" not in out["summary"]
+    assert [r[1] for r in recorded.runs()] == ["full"]
+
+
+def test_targets_that_never_ran_are_reported(recorded):
+    recorded.write(
+        "tests/test_m.py",
+        "import pytest\npytest.skip('whole module', allow_module_level=True)\n" + recorded.read("tests/test_m.py"),
+    )
+    out = recorded.cli("run")
+    s = out["summary"]
+    assert s["ran"] == 0 and s["failed"] == 0
+    assert s["status"] == "incomplete" and s["complete"] is False
+    assert s["unrun_targets"] == [T_C, T_A, T_B]
+    assert s["record_ok"] is True  # the journal saw exactly what ran: nothing
+
+
 def test_unknown_revision_is_a_clean_error(recorded):
     assert recorded.select(base="nope")["error"] == "unknown revision: nope"
     assert recorded.cli("affected", "--base", "nope")["error"] == "unknown revision: nope"
+
+
+def test_non_git_directory_is_a_clean_error(tmp_path):
+    from fastest.select import select
+
+    assert select(tmp_path / "map.sqlite", tmp_path)["mode"] == "error"
+    assert not (tmp_path / "map.sqlite").exists()  # nothing was created
+
+
+def test_unittest_style_classes_are_found_statically(recorded):
+    recorded.write(
+        "tests/test_u.py",
+        "import unittest\nfrom pkg.mod import a\n\nclass ModTests(unittest.TestCase):\n"
+        "    def test_a(self):\n        self.assertEqual(a(), 1)\n",
+    )
+    recorded.commit("unittest style")
+    assert recorded.record().returncode == 0
+    recorded.edit("tests/test_u.py", "assertEqual(a(), 1)", "assertEqual(a(), 1)  # edited")
+    sel = recorded.select()
+    assert sel["targets"] == ["tests/test_u.py::ModTests::test_a"] and sel["selected_files"] == {}
+
+
+def test_skip_receipt_is_tied_to_the_evidence(recorded):
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    out = recorded.cli("affected")
+    receipt = out["skip_receipt"]
+    assert receipt["skipped"] == 1 and receipt["evidence"]["runs"] == [1]
+    assert receipt["evidence"]["commits"] == [recorded.head()[:8]]
+    assert receipt["evidence"]["last_full_run"] == 1 and receipt["warnings"] == []
+    recorded.write("tests/conftest.py", "import pytest\n")
+    assert recorded.cli("affected")["skip_receipt"]["skipped"] == 0
 
 
 def test_cli_affected_reports_evidence(recorded):

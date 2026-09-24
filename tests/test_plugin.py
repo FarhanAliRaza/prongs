@@ -48,6 +48,13 @@ def test_interrupted_full_run_is_downgraded_to_partial(recorded):
     assert recorded.tests()[T_A][2] is None  # test_m never ran; not retired
 
 
+def test_empty_session_is_never_a_full_run(recorded):
+    (recorded.path / "tests/test_m.py").unlink()
+    assert recorded.record().returncode == 5  # no tests collected
+    assert recorded.runs()[-1][1] == "partial"
+    assert all(v[2] is None for v in recorded.tests().values())
+
+
 def test_dirty_files_are_snapshotted_with_content(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 2  # dirty")
     recorded.write("tests/test_extra.py", "def test_x():\n    assert True\n")  # untracked

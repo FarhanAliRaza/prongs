@@ -63,6 +63,9 @@ def classify_scope(config) -> str:
         or getattr(opt, "markexpr", None)
         or getattr(opt, "deselect", None)
         or getattr(opt, "lf", False)
+        # xdist: a worker runs a subset, the controller runs nothing
+        or hasattr(config, "workerinput")
+        or getattr(opt, "dist", "no") not in (None, "no")
     ):
         return "partial"
     source = getattr(config, "args_source", None)
@@ -153,8 +156,8 @@ class FastestCov:
         }
         n_observed = len(self.records) - ("__collection__" in self.records)
         scope = self.scope
-        if scope == "full" and n_observed < self.n_collected:
-            scope = "partial"  # -x, interrupt, xdist worker: not every item ran
+        if scope == "full" and (n_observed < self.n_collected or self.n_collected == 0):
+            scope = "partial"  # -x, interrupt, or nothing collected: no proof of completeness
         return {
             "started_at": self.started_at,
             "finished_at": time.time(),

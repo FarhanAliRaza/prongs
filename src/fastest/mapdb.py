@@ -92,22 +92,38 @@ RUN_COLUMNS = (
 )
 
 
+_OBJECTS = {
+    "meta", "files", "funcs", "runs", "blobs", "dep_sets", "dep_members", "tests",
+    "observations", "current_links",
+}
+
+
+def _is_current(con: sqlite3.Connection) -> bool:
+    names = {r[0] for r in con.execute("SELECT name FROM sqlite_master")}
+    if not _OBJECTS <= names:
+        return False
+    row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    return bool(row) and row[0] == str(SCHEMA_VERSION)
+
+
 def connect(path: str) -> sqlite3.Connection:
-    """Open (creating or migrating as needed) and return a connection."""
+    """Open and return a connection, creating or migrating the schema only
+    when it is missing or old: a read (select) never takes the write lock."""
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
-    con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=30000")
     if _is_v1(con):
         _migrate_v1(con)
-    con.executescript(SCHEMA)
-    con.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
-    )
-    con.commit()
+    if not _is_current(con):
+        con.execute("PRAGMA journal_mode=WAL")  # persistent: set once per file
+        con.executescript(SCHEMA)
+        con.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        con.commit()
     return con
 
 

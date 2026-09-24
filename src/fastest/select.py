@@ -101,11 +101,18 @@ def static_test_names(source: str) -> set[str]:
         tree = ast.parse(source)
     except SyntaxError:
         return set()
+
+    def base_name(b) -> str:
+        return b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
+
     names: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
             names.add(node.name)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+        elif isinstance(node, ast.ClassDef) and (
+            node.name.startswith("Test")
+            or any(base_name(b).endswith("TestCase") for b in node.bases)  # unittest style
+        ):
             for sub in node.body:
                 if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test"):
                     names.add(f"{node.name}::{sub.name}")
@@ -521,6 +528,8 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
 # --- selection ---------------------------------------------------------------
 
 def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None) -> dict:
+    if provenance.git_head(repo) is None:
+        return {"error": f"not a git repository with commits: {repo}", "mode": "error"}
     for rev in (base, head):
         if rev is not None and provenance.rev_parse(repo, rev) is None:
             return {"error": f"unknown revision: {rev}", "mode": "error"}
