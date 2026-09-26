@@ -18,7 +18,11 @@ selection is computed per observed tree:
   4. history on top (the second signal): a test whose outcome flipped in the
      last N rollups is selected ("recent status change"), and a test that
      both passed and failed on one tree is reported as flaky
-  5. conservative rules on top: unmapped tests, tests in changed test files
+  5. the map-staleness safety net: a changed function the map has never seen
+     selects every test that touches its file; a changed file it has never
+     seen, and that did not exist when the evidence was recorded, runs
+     everything; so does a map more than max_map_age commits behind HEAD
+  6. conservative rules on top: unmapped tests, tests in changed test files
      (a test module whose known tests can't all be found statically, or that
      has tests the map has never seen, is run as a whole file), and run-all
      when conftest / a tracked non-Python file / module-level or import-time
@@ -236,6 +240,8 @@ class Analysis:
     test_files: dict[str, str] = field(default_factory=dict)      # changed test file -> reason
     selected_files: dict[str, str] = field(default_factory=dict)  # run whole file -> reason
     vanished: set[str] = field(default_factory=set)  # known tests no longer found statically
+    production: set[str] = field(default_factory=set)  # changed, non-test .py files (not deleted)
+    unseen: dict[str, list[str]] = field(default_factory=dict)  # file -> changed funcs the map never saw
     unchanged: list[str] = field(default_factory=list)
     forced: list[str] = field(default_factory=list)
 
@@ -493,6 +499,8 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
         if name == "conftest.py" or "conftest" in name:
             an.run_all_reasons.append(f"conftest changed: {path}")
             continue
+        if not is_test_file(path) and ch["status"] != "D":
+            an.production.add(path)
         if ch.get("wholesale"):
             # a test module's import-time code is its own tests' concern
             # (conftest is the sanctioned shared hook and has its own rule),
@@ -639,10 +647,81 @@ def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str) -> d
     return out
 
 
+# --- the map-staleness safety net ----------------------------------------------
+
+def map_age(con, repo: Path, head: str | None) -> dict:
+    """How far HEAD (or --head) has moved on since the commit the last rollup
+    recorded: the receipt's map age."""
+    commit = mapdb.meta(con).get("rollup_commit") or None
+    age: dict = {"commit": commit[:8] if commit else None, "commits_behind_head": None}
+    if commit is None:
+        age["unknown"] = "the last rollup recorded no commit"
+    elif provenance.rev_parse(repo, commit) is None:
+        age["unknown"] = f"map commit {commit[:8]} is not in this repository"
+    else:
+        age["commits_behind_head"] = provenance.count_commits(repo, commit, head or "HEAD")
+    return age
+
+
+class EvidenceFiles:
+    """Whether a path existed in every tree the map's evidence was recorded
+    on (each contributing run's commit plus the dirty files it saw)."""
+
+    def __init__(self, repo: Path, contributing: list[dict]):
+        self.repo = repo
+        self.trees = [
+            (r["commit_sha"], {p: he for p, (_, he) in r["dirty_files"].items()})
+            for r in contributing
+        ]
+        self._at: dict[tuple[str, str], bool] = {}
+
+    def existed(self, path: str) -> bool:
+        if not self.trees:
+            return False
+        for commit, dirty in self.trees:
+            if path in dirty:
+                if dirty[path] is None:
+                    return False
+                continue
+            if commit is None:
+                return False
+            if (commit, path) not in self._at:
+                self._at[commit, path] = provenance.exists_at(self.repo, commit, path)
+            if not self._at[commit, path]:
+                return False
+        return True
+
+
+def unseen_changes(an: "Analysis", seen_funcs: set, seen_files: set, files: EvidenceFiles) -> None:
+    """A changed function the map has never seen selects nothing by coverage:
+    a silent miss for code added after the map was built (and for a new
+    method that overrides an inherited one). Broaden: to every test that
+    touches its file, or — when the map has never seen the file either and
+    the file did not exist when the evidence was recorded — to everything.
+    A file that did exist then and that no recorded run ever executed is
+    reachable only through some other change, which the diff shows."""
+    for path, qual in sorted(an.changed_funcs):
+        if (path, qual) not in seen_funcs and path in seen_files:
+            an.unseen.setdefault(path, []).append(qual)
+    for path in sorted(an.production - seen_files):
+        if not files.existed(path):
+            an.run_all_reasons.append(
+                f"changed file not in the map: {path} (it did not exist when the map's "
+                "evidence was recorded)"
+            )
+
+
+def broadening(path: str, quals: list[str]) -> str:
+    more = f" (+{len(quals) - 1} more)" if len(quals) > 1 else ""
+    return (f"changed function not in the map: {path}::{quals[0]}{more}; "
+            f"every test that touches {path} runs")
+
+
 # --- selection ---------------------------------------------------------------
 
 def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None, *,
-           history_window: int = config.DEFAULTS["history_window"]) -> dict:
+           history_window: int = config.DEFAULTS["history_window"],
+           max_map_age: int = config.DEFAULTS["max_map_age"]) -> dict:
     if provenance.git_head(repo) is None:
         return {"error": f"not a git repository with commits: {repo}", "mode": "error"}
     for rev in (base, head):
@@ -688,6 +767,19 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     flaky = {t: f | {"history": test_history(con, t)}
              for t, f in flaky_tests(con).items() if t in all_tests}
     history = {"window": history_window, "recent_changes": len(recent), "flaky": len(flaky)}
+    seen_funcs = set(con.execute(
+        "SELECT DISTINCT f.path, fn.qualname FROM funcs fn JOIN files f ON f.id = fn.file_id"
+    ))
+    seen_files = {p for p, _ in seen_funcs}
+    evidence_files = EvidenceFiles(repo, contributing)
+    ev["unmapped_tests"] = sum(1 for mapped, _ in all_tests.values() if not mapped)
+    ev["map_age"] = age = map_age(con, repo, head) | {"max_map_age": max_map_age}
+    stale: list[str] = []
+    if age["commits_behind_head"] is None:
+        stale.append(f"map age unknown: {age['unknown']}")
+    elif age["commits_behind_head"] > max_map_age:
+        stale.append(f"map is {age['commits_behind_head']} commits behind HEAD "
+                     f"(max_map_age {max_map_age})")
 
     trees = build_trees(repo, contributing, base, ev)
     untracked = provenance.dirty_files(repo) if head is None else {}
@@ -706,6 +798,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         for path in sorted(an.wholesale):
             if path in coll_files:
                 an.run_all_reasons.append(f"module-level change in import-time file: {path}")
+        unseen_changes(an, seen_funcs, seen_files, evidence_files)
         analyses.append(an)
 
     ev["trees"] = [t.summary() for t in trees]
@@ -713,7 +806,12 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "unchanged_since_observation": sorted({p for a in analyses for p in a.unchanged}),
         "forced_wholesale": sorted({p for a in analyses for p in a.forced}),
     }
-    run_all_reasons = sorted({r for a in analyses for r in a.run_all_reasons})
+    run_all_reasons = sorted({r for a in analyses for r in a.run_all_reasons} | set(stale))
+    unseen: dict[str, list[str]] = {}
+    for an in analyses:
+        for path, quals in an.unseen.items():
+            unseen[path] = sorted(set(unseen.get(path, [])) | set(quals))
+    broadened = [broadening(path, quals) for path, quals in sorted(unseen.items())]
     changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs})
     wholesale = sorted({p for a in analyses for p in a.wholesale})
     # known tests the selector expects not to exist any more: they are
@@ -741,6 +839,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "changed_functions": changed_funcs,
             "changed_files_wholesale": wholesale,
             "vanished": vanished,
+            "broadened": broadened,
             "flaky": flaky,
             "history": history,
             "evidence": ev,
@@ -777,6 +876,17 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             for (t,) in rows:
                 if t in in_tree:
                     selected.setdefault(t, f"imports/touches changed file {path}")
+        for path, quals in an.unseen.items():
+            reason = broadening(path, quals)
+            rows = con.execute(
+                "SELECT DISTINCT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
+                "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
+                "WHERE f.path=?",
+                (path,),
+            )
+            for (t,) in rows:
+                if t in in_tree:
+                    selected.setdefault(t, reason)
         for path, reason in an.test_files.items():
             for t in in_tree:
                 if t.startswith(path + "::"):
@@ -814,6 +924,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "n_skipped": len(skipped),
         "n_total": len(all_tests),
         "vanished": vanished,
+        "broadened": broadened,
         "flaky": flaky,
         "history": history,
         "evidence": ev,

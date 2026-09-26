@@ -3,6 +3,8 @@ FASTEST_<NAME> environment variables, overridden by CLI flags.
 
   history_window   a test whose outcome flipped in any of the last N rollups
                    is selected ("recent status change")
+  max_map_age      a map more than N commits behind HEAD (counted from the
+                   commit the last rollup recorded) runs everything
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from pathlib import Path
 
 DEFAULTS = {
     "history_window": 3,
+    "max_map_age": 50,
 }
 
 

@@ -46,6 +46,17 @@ def commits_behind(repo: Path, commit: str) -> int | None:
     return int(out.strip()) if out else None
 
 
+def count_commits(repo: Path, since: str, rev: str = "HEAD") -> int | None:
+    """Commits reachable from `rev` but not from `since` (None if either is
+    unknown): how far `rev` has moved on since `since`, merge-base or not."""
+    out = _git(repo, "rev-list", "--count", f"{since}..{rev}")
+    return int(out.strip()) if out else None
+
+
+def exists_at(repo: Path, rev: str, path: str) -> bool:
+    return _git(repo, "cat-file", "-e", f"{rev}:{path}") is not None
+
+
 MAX_BLOB = 4 << 20  # content above this is hashed but not stored
 
 

@@ -165,7 +165,7 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
 def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           pytest_args=(), baseline: dict[str, str] | None = None, isolate: bool = True,
           record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE,
-          history_window: int | None = None) -> dict:
+          history_window: int | None = None, max_map_age: int | None = None) -> dict:
     """Select, run everything, report every status change the selection
     skipped. Pending journal files are rolled up first, as `fastest run`
     would. The result's `statuses` (every test's status in the full run) is
@@ -175,8 +175,9 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
     db = journal.map_path(repo)
     if rollup:
         mapdb.rollup(db, journal.journal_dir(repo))
-    cfg = config.settings(repo, history_window=history_window)
-    sel = select(db, repo, base, history_window=cfg["history_window"])
+    cfg = config.settings(repo, history_window=history_window, max_map_age=max_map_age)
+    sel = select(db, repo, base, history_window=cfg["history_window"],
+                 max_map_age=cfg["max_map_age"])
     if "error" in sel:
         return {"error": sel["error"], "verdict": "error"}
     con = mapdb.connect(str(db))
@@ -192,6 +193,9 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
                 "n_selected": sel["n_selected"],
                 "n_skipped": sel["n_skipped"],
                 "run_all_reasons": sel.get("reasons", []),
+                "broadened": sel.get("broadened", []),
+                "map_age": sel["evidence"]["map_age"],
+                "unmapped_tests": sel["evidence"]["unmapped_tests"],
                 "changed_functions": sel["changed_functions"][:20],
             },
             "full_run": {

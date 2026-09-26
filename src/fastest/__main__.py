@@ -69,8 +69,10 @@ def cmd_affected(args) -> dict:
             "hint": "build one with: pytest --fastest-cov (then fastest rollup)",
             "pending_journal_files": len(journal.pending(jdir)),
         }
-    cfg = config.settings(repo, history_window=getattr(args, "history_window", None))
-    sel = select(db, repo, args.base, history_window=cfg["history_window"])
+    cfg = config.settings(repo, history_window=getattr(args, "history_window", None),
+                          max_map_age=getattr(args, "max_map_age", None))
+    sel = select(db, repo, args.base, history_window=cfg["history_window"],
+                 max_map_age=cfg["max_map_age"])
     if "error" in sel:
         return sel
     reasons = Counter(v.split(":")[0].split(" (")[0] for v in sel["selected"].values())
@@ -85,6 +87,7 @@ def cmd_affected(args) -> dict:
         "tests": sorted(sel["selected"]),
         "selected_files": sel.get("selected_files", {}),
         "vanished": sel.get("vanished", []),
+        "broadened": sel.get("broadened", []),
         # flaky tests still run; their history is the receipt, and a failure
         # of one is reported as flaky, not as a failure
         "flaky": {
@@ -103,15 +106,30 @@ def cmd_affected(args) -> dict:
 
 def skip_receipt(sel: dict) -> dict:
     """The auditable basis for every skip: the rule, and how fresh the
-    evidence behind it is. Not a proof — a transparent conservative policy."""
+    evidence behind it is — the map's age in commits behind HEAD and how
+    many tests it has no dependencies for. Not a proof — a transparent
+    conservative policy."""
     ev = sel["evidence"]
+    age = ev["map_age"]
+    freshness = {
+        "map_age": {
+            "commit": age["commit"],
+            "commits_behind_head": age["commits_behind_head"],
+            "max_map_age": age["max_map_age"],
+        } | ({"unknown": age["unknown"]} if "unknown" in age else {}),
+        "unmapped_tests": ev["unmapped_tests"],
+        "broadened": sel.get("broadened", []),
+    }
     if sel["mode"] == "run_all":
-        return {"skipped": 0, "rule": "nothing skipped: " + "; ".join(sel["reasons"])}
+        return {"skipped": 0, "rule": "nothing skipped: " + "; ".join(sel["reasons"])} | freshness
     return {
         "skipped": sel.get("n_skipped", 0),
         "rule": "a test is skipped only when, relative to the tree of the run that last "
                 "observed it, no changed function or file is in its recorded dependency "
-                "set; unmapped, new and statically-unfound tests always run",
+                "set; unmapped, new and statically-unfound tests, tests whose outcome "
+                "flipped recently, and every test touching a file with a changed function "
+                "the map has never seen always run",
+        **freshness,
         "evidence": {
             "runs": ev["contributing_runs"],
             "commits": [c[:8] for c in ev["evidence_commits"]],
@@ -442,7 +460,8 @@ def cmd_audit(args) -> dict:
                 "hint": "build one with: pytest --fastest-cov (then fastest rollup)"}
     raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
-                record=args.record, rollup=False, history_window=args.history_window)
+                record=args.record, rollup=False, history_window=args.history_window,
+                max_map_age=args.max_map_age)
     res.pop("statuses", None)  # per-test statuses are for harnesses, not the agent
     return res
 
@@ -469,6 +488,9 @@ def main():
         p.add_argument("--history-window", type=int, default=None, metavar="N",
                        help="select tests whose outcome flipped in the last N rollups "
                             "(default: [tool.fastest] history_window, else 3)")
+        p.add_argument("--max-map-age", type=int, default=None, metavar="N",
+                       help="run everything when the map is more than N commits behind HEAD "
+                            "(default: [tool.fastest] max_map_age, else 50)")
         if name == "run":
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
                            help="append this run to the journal, refreshing the tests it "
