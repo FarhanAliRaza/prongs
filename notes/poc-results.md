@@ -43,3 +43,35 @@ Everything below is measured, not projected. Code: `src/fastest/` (plugin, mapdb
 2. Fork-per-test execution mode (kills the pollution miss class; measure per-test fork cost).
 3. Phase 4 static collection parity.
 4. `affected`/`run` behind MCP or direct CLI in a real agent session end-to-end.
+5. Shared journal across worktrees (each worktree currently pays its own full instrumented run) — see the 2026-09-24 section below.
+
+# Journal + provenance — 2026-09-24
+
+The "adopt now" list from [[anthropic-tia-scaling]] implemented: append-only journal + derived roll-up, provenance (HEAD and dirty files with content) on every run, evidence in every receipt, selected runs feed the map. Code: `mapdb.py`, `provenance.py`, `plugin.py`, `select.py`, `__main__.py`; 38 tests in `tests/` driving the real recorder in a temp git repo (pass on 3.12 and 3.13); harness numbers in `results/`. Everything below is measured.
+
+## Scoreboard (httpx @ b5addb6, 1418 tests, py3.12, pytest 8.4.1)
+
+| Claim | Kill criterion | Result | Verdict |
+|---|---|---|---|
+| journal write path keeps the recorder cheap | >25% overhead | plain 14.14s vs instrumented 14.75s: **4.4%** (July: ~6%) | **PASS** |
+| per-tree selector never misses on real history | any miss | 8 commits / 7 pairs: **0 misses**; selected 0.1% median, 7.5% and 21.1% on the two larger commits, never run-all | **PASS** |
+| mutation testing | any first-order miss | 12 sampled mutations, 11 caused failures, **0 misses, 0 pollution**; 2 targeted teardown-path mutations (`Client.__exit__`, `AsyncClient.aclose`): **0 first-order misses, 7 second-order pollution** — every one passes alone under the mutation, and identical suite runs disagree on which tests are hit | **PASS** (finding 1) |
+| evidence is cheap | — | `affected` on a clean tree: **0.13s** wall (34k dependency links, 572 content-addressed sets, 1.2MB map) | — |
+
+## The agent loop, measured (httpx)
+
+edit `URL.host` → `affected` selects 516/1418 → `run` records them (12.9s; run #2, partial, `record_ok`) → `affected` → **1** (the one unmapped test) → edit `Headers.get` → **464** selected: the 516 already verified against `URL.host` are diffed only against the content run #2 saw, so only their `Headers.get` dependents come back, while tests last seen by the full run are diffed against both edits → `run` (8.4s) → `affected` → 1 → commit both → still 1, `commits_behind=1`. With the map frozen at the full run (the July design, or `--no-record` now) the third `affected` re-selects all 516 plus every `Headers.get` dependent.
+
+## Findings
+
+1. **The mutation kill criterion was conflating two classes.** First sample: 8 "misses" on 2 of 12 mutations, both teardown paths. Every missed test passes alone under the mutation, and two identical full-suite runs disagree on *which* tests fail (`PytestUnraisableExceptionWarning`, `ExceptionGroup`): a broken `__exit__`/`aclose` raises at GC time and pytest's unraisable-exception hook attributes it to whichever test is running. That is day-1 finding 2 (second-order fallout from an already-selected failure) made non-deterministic. `bench/mutate.py` now re-runs each miss alone under the same mutation and reports first-order misses (the kill criterion) separately from pollution; `--target path::qualname` reproduces a specific function. The fix for the pollution class remains fork-per-test isolation, not selection.
+2. **Per-tree evidence is what makes recording pay.** The first cut unioned the diff over all contributing runs and could only drop a file when *every* run had seen its current content, so the first re-edit of a dirty file escalated to `run_all` through the import-time rule — with recording on, one edit-run-edit cycle collapsed selection until the next full run. Storing the content of dirty `.py` files (content-addressed blobs — only the files being edited) and diffing each test against the tree of the run that last observed it turned that into the 516 → 464 → 1 sequence above.
+3. **Test-module changes never run everything.** Appending or deleting a test function used to count a blank line as a module-level change in an import-time file → `run_all`. Blank and comment lines are ignored, a test module's changes select that module, and a module whose known tests can't all be found statically (deleted, renamed; `unittest.TestCase` subclasses are recognised) is run as a whole file — a deleted test never becomes a nonexistent node id handed to pytest.
+4. **in == out is two checks, and both were missing.** `run` now reports `unrun_targets` and `complete` — a module skipped at collection or a vanished node id is "incomplete", not "0 failed" — and, with recording on, `record_ok` checks that the journal saw exactly what ran. `mapdb.connect` no longer writes on the read path; before, every `affected` took the write lock.
+5. **Scope classification is the retirement safety.** Only a `full` run — no positional or keyword restriction, not xdist, every collected item observed — retires tests missing from the modules it collected; `-x`, `--lf`, node ids, subdirectories, `--collect-only`, an empty session and xdist workers/controller all record as partial. Tests in modules that failed to collect keep their last evidence, which is exactly the evidence that surfaces the breakage.
+
+## Not done
+
+- Evidence resolves per *tree*, not per test, and the collection pseudo-test is a union across runs: an import-time change in any tree still runs all.
+- The daemon's warm-up doesn't record; the child does when `run` asks (recording is the default).
+- A journal shared across worktrees and agents (the seam for the paid layer in [[market-tia-service]]).

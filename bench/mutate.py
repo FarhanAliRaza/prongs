@@ -7,10 +7,16 @@ For N randomly chosen project functions (that appear in the coverage map):
   3. run the FULL suite; every newly-failing test must be in the selected set
   4. revert
 
-MISS = a test that failed under mutation but was not selected.
-Kill criterion: any miss.
+MISS = a test that failed under mutation but was not selected. Each miss is
+re-run alone under the same mutation: if it still fails it is a first-order
+miss (the selector's fault); if it passes alone it is second-order pollution
+from an already-selected failure (a broken teardown's unraisable exception
+landing on whichever test runs next, leaked state, ...) — reported
+separately, because fork-per-test isolation, not selection, is the fix.
+Kill criterion: any first-order miss.
 
 Usage: python bench/mutate.py testbeds/httpx --n 15 [--seed 7]
+       python bench/mutate.py testbeds/httpx --target httpx/_client.py::Client.__exit__
 """
 
 from __future__ import annotations
@@ -102,6 +108,8 @@ def main():
     ap.add_argument("--n", type=int, default=15)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--pytest-args", default="")
+    ap.add_argument("--target", action="append", default=[], metavar="PATH::QUALNAME",
+                    help="mutate exactly this function (repeatable) instead of sampling")
     args = ap.parse_args()
     repo = args.repo.resolve()
     py = repo / ".venv" / "bin" / "python"
@@ -113,12 +121,16 @@ def main():
     con = sqlite3.connect(db)
     rows = con.execute(
         "SELECT DISTINCT f.path, fn.qualname FROM funcs fn JOIN files f ON f.id=fn.file_id "
-        "JOIN links l ON l.func_id=fn.id WHERE f.path NOT LIKE 'tests%' "
+        "JOIN current_links l ON l.func_id=fn.id WHERE f.path NOT LIKE 'tests%' "
         "AND f.path NOT LIKE '%conftest%'"
     ).fetchall()
     con.close()
-    rng = random.Random(args.seed)
-    rng.shuffle(rows)
+    if args.target:
+        rows = [tuple(t.split("::", 1)) for t in args.target]
+        args.n = len(rows)
+    else:
+        rng = random.Random(args.seed)
+        rng.shuffle(rows)
 
     baseline = run_statuses(py, repo, extra, "base")
     print(f"baseline: {len(baseline)} tests, "
@@ -143,7 +155,12 @@ def main():
             t for t, s in baseline.items()
             if cur.get(t, "absent") != s and s != "failed"
         }
-        misses = sorted(new_fails - sel_set) if sel["mode"] == "select" else []
+        candidates = sorted(new_fails - sel_set) if sel["mode"] == "select" else []
+        # classify: does the miss reproduce alone, under the same mutation?
+        misses, pollution = [], []
+        for t in candidates:
+            alone = run_statuses(py, repo, extra + [t], "alone")
+            (misses if alone.get(t, "absent") != baseline[t] else pollution).append(t)
         dt = time.monotonic() - t0
         results.append({
             "target": f"{path}::{qual}",
@@ -151,24 +168,30 @@ def main():
             "n_selected": len(sel_set),
             "n_new_failures": len(new_fails),
             "misses": misses,
+            "pollution": pollution,
         })
-        flag = "  !!! MISS !!!" if misses else ""
+        flag = "  !!! MISS !!!" if misses else ("  (pollution only)" if pollution else "")
         print(
             f"[{tried}/{args.n}] {path}::{qual}: mode={sel['mode']} "
             f"selected {len(sel_set)}, status-changes {len(new_fails)}, "
-            f"misses {len(misses)}{flag}  ({dt:.0f}s)",
+            f"misses {len(misses)}, pollution {len(pollution)}{flag}  ({dt:.0f}s)",
             flush=True,
         )
         for m in misses:
-            print(f"      MISSED: {m}")
+            print(f"      MISSED (fails alone): {m}")
+        for m in pollution:
+            print(f"      polluted (passes alone): {m}")
     subprocess.run(["git", "checkout", "-q", "--", "."], cwd=repo)
 
     out = Path(__file__).parent.parent / "results" / f"mutate-{repo.name}.json"
     out.write_text(json.dumps(results, indent=2))
     total_misses = sum(len(r["misses"]) for r in results)
+    total_pollution = sum(len(r["pollution"]) for r in results)
     killed = sum(1 for r in results if r["n_new_failures"] > 0)
     print(f"\n=== {len(results)} mutations, {killed} caused failures, "
-          f"MISSES: {total_misses} {'<<< KILL CRITERION HIT' if total_misses else '(zero — pass)'}")
+          f"first-order MISSES: {total_misses} "
+          f"{'<<< KILL CRITERION HIT' if total_misses else '(zero — pass)'}, "
+          f"second-order pollution: {total_pollution}")
     print(f"wrote {out}")
 
 
