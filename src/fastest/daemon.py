@@ -47,22 +47,83 @@ def recv_msg(conn: socket.socket):
     return json.loads(data)
 
 
+# pytest exit codes that mean the session did not do what was asked: the
+# result list is not a verdict on the targets, whatever it contains
+ERROR_EXITS = {
+    2: "interrupted (collection errors)",
+    3: "internal error",
+    4: "usage error (bad arguments or node ids not found)",
+    5: "no tests collected",
+}
+
+
+def execution_response(code, wall_s: float, collector: "ResultCollector", output) -> dict:
+    """The executor's reply, same schema from the daemon child and the cold
+    subprocess. `output` is a callable returning pytest's captured text, read
+    only when the exit code means the run went wrong."""
+    resp = {
+        "exit": int(code),
+        "wall_s": round(wall_s, 4),
+        "results": collector.results,
+        "collect_errors": collector.collect_errors,
+        "collect_skipped": collector.collect_skipped,
+    }
+    if int(code) in ERROR_EXITS:
+        resp["error"] = f"pytest exit {int(code)}: {ERROR_EXITS[int(code)]}"
+    if int(code) not in (0, 1):
+        resp["pytest_output"] = output()[-3000:]
+    return resp
+
+
+def crash_line(longrepr) -> str | None:
+    """First line of pytest's crash message (what its short summary prints
+    per failure), when the report carries one."""
+    crash = getattr(longrepr, "reprcrash", None)
+    message = getattr(crash, "message", None)
+    return message.strip().splitlines()[0] if message and message.strip() else None
+
+
 class ResultCollector:
-    """pytest plugin: collect per-test results in the forked child."""
+    """pytest plugin: per-test results, one entry per test id. Setup errors,
+    subtest reports (pytest >= 9) and teardown errors are merged into their
+    test's entry, failure winning, so the entry count is the number of tests
+    that produced a result. Collection errors and module-level skips are
+    kept apart: no test id carries them."""
 
     def __init__(self):
-        self.results = []
+        self.results: list[dict] = []
+        self._by_id: dict[str, dict] = {}
+        self.collect_errors: list[dict] = []
+        self.collect_skipped: list[str] = []
 
     def pytest_runtest_logreport(self, report):
-        if report.when == "call" or (report.when == "setup" and report.outcome != "passed"):
-            entry = {
+        if report.passed and report.when != "call":
+            return  # setup/teardown that passed says nothing about the test
+        entry = self._by_id.get(report.nodeid)
+        if entry is None:
+            entry = self._by_id[report.nodeid] = {
                 "id": report.nodeid,
                 "status": report.outcome,
                 "duration_s": round(report.duration, 4),
             }
-            if report.failed:
-                entry["longrepr"] = str(report.longrepr)[-4000:]
             self.results.append(entry)
+        elif report.when == "call" and entry["status"] != "failed":
+            entry["status"] = report.outcome
+            entry["duration_s"] = round(report.duration, 4)
+        if report.failed and "longrepr" not in entry:
+            entry["status"] = "failed"
+            entry["longrepr"] = str(report.longrepr)[-4000:]
+            crash = crash_line(report.longrepr)
+            if crash:
+                entry["crash"] = crash[:500]
+
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.collect_errors.append(
+                {"id": report.nodeid, "longrepr": str(report.longrepr)[-2000:]}
+            )
+        elif report.skipped and report.nodeid:
+            self.collect_skipped.append(report.nodeid)
 
 
 class _Quiet:
@@ -301,15 +362,12 @@ def serve() -> None:
                     sys.stderr.flush()
                     os.dup2(saved1, 1)
                     os.dup2(saved2, 2)
-                resp = {
-                    "exit": int(code),
-                    "wall_s": round(time.monotonic() - t0, 4),
-                    "purged_modules": n_purged,
-                    "results": collector.results,
-                }
-                if code not in (0, 1):  # usage/internal error: attach output
+                def output() -> str:
                     buf.seek(0)
-                    resp["pytest_output"] = buf.read().decode(errors="replace")[-3000:]
+                    return buf.read().decode(errors="replace")
+
+                resp = execution_response(code, time.monotonic() - t0, collector, output)
+                resp["purged_modules"] = n_purged
                 send_msg(conn, resp)
             except BaseException as e:  # noqa: BLE001
                 try:

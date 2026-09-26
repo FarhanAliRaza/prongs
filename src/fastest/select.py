@@ -231,6 +231,7 @@ class Analysis:
     run_all_reasons: list[str] = field(default_factory=list)
     test_files: dict[str, str] = field(default_factory=dict)      # changed test file -> reason
     selected_files: dict[str, str] = field(default_factory=dict)  # run whole file -> reason
+    vanished: set[str] = field(default_factory=set)  # known tests no longer found statically
     unchanged: list[str] = field(default_factory=list)
     forced: list[str] = field(default_factory=list)
 
@@ -458,6 +459,11 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
             # be trusted, so run the file and let pytest decide what exists
             notes.append(f"{len(vanished)} known test(s) not found statically: "
                          f"{', '.join(vanished[:5])}" + (" ..." if len(vanished) > 5 else ""))
+            gone = set(vanished)
+            an.vanished |= {
+                t for t in all_tests
+                if t.startswith(path + "::") and t.split("::", 1)[1].split("[", 1)[0] in gone
+            }
         if notes:
             an.selected_files[path] = "; ".join(notes)
 
@@ -593,18 +599,31 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     run_all_reasons = sorted({r for a in analyses for r in a.run_all_reasons})
     changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs})
     wholesale = sorted({p for a in analyses for p in a.wholesale})
+    # known tests the selector expects not to exist any more: they are
+    # selected (their module runs whole), and cannot produce a result
+    vanished = sorted({t for a in analyses for t in a.vanished if t in all_tests})
 
     if run_all_reasons:
+        # a changed test module is still targeted whole, so its new tests run
+        # and its deleted ones never reach pytest as node ids
+        run_all_files: dict[str, str] = {}
+        for an in analyses:
+            run_all_files.update(an.selected_files)
         con.close()
         return {
             "mode": "run_all",
             "reasons": run_all_reasons,
             "selected": {t: "run_all" for t in sorted(all_tests)},
-            "selected_files": {},
-            "targets": sorted(all_tests),
+            "selected_files": run_all_files,
+            "targets": sorted(run_all_files) + sorted(
+                t for t in all_tests if t.split("::", 1)[0] not in run_all_files
+            ),
+            "n_selected": len(all_tests),
+            "n_skipped": 0,
             "n_total": len(all_tests),
             "changed_functions": changed_funcs,
             "changed_files_wholesale": wholesale,
+            "vanished": vanished,
             "evidence": ev,
         }
 
@@ -670,6 +689,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "n_selected": len(selected),
         "n_skipped": len(skipped),
         "n_total": len(all_tests),
+        "vanished": vanished,
         "evidence": ev,
     }
 

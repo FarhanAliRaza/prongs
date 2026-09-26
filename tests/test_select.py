@@ -187,8 +187,13 @@ def test_targets_that_never_ran_are_reported(recorded):
     out = recorded.cli("run")
     s = out["summary"]
     assert s["ran"] == 0 and s["failed"] == 0
-    assert s["status"] == "incomplete" and s["complete"] is False
+    # pytest cannot resolve node ids in a module skipped at import: exit 4
+    assert s["status"] == "error" and s["complete"] is False
+    assert out["error"].startswith("pytest exit 4")
+    assert out["collect_skipped"] == ["tests/test_m.py"]
     assert s["unrun_targets"] == [T_C, T_A, T_B]
+    assert out["conservation"]["conserved"] is False
+    assert out["conservation"]["not_executed"] == sorted([T_A, T_B, T_C])
     assert s["record_ok"] is True  # the journal saw exactly what ran: nothing
 
 
