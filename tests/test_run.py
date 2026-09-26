@@ -134,3 +134,24 @@ def test_group_failures_keeps_one_traceback_per_root_cause():
     assert [(g["error"], g["representative"], g["also_failed"]) for g in group_failures(fs)] == [
         ("RuntimeError: boom", "t1", ["t2"]), ("KeyError: 'id'", "t3", []),
     ]
+
+
+def test_a_crash_in_pytest_start_up_is_an_error(recorded):
+    # pytest-django runs django.setup() in this hook: a broken model import
+    # escapes pytest.main() itself, with no exit code at all
+    recorded.write(
+        "crashplugin.py",
+        "def pytest_load_initial_conftests(early_config, parser, args):\n"
+        "    raise RuntimeError('broken app setup')\n",
+    )
+    recorded.write(
+        "pyproject.toml",
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "-p crashplugin"\n',
+    )
+    out = recorded.cli("run")
+    assert out["summary"]["status"] == "error" and out["summary"]["ran"] == 0
+    assert out["error"] == "pytest crashed before running tests: RuntimeError: broken app setup"
+    assert "broken app setup" in out["pytest_output"]
+    audit = recorded.cli("audit")  # the full run exits 1, like a test failure
+    assert audit["verdict"] == "error" and audit["misses"] == []
+    assert audit["error"].startswith("full run recorded nothing")

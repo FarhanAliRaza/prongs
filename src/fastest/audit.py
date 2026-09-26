@@ -78,10 +78,13 @@ def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=()
             "collect_errors": run.get("collect_errors", {}),
             "collect_skipped": run.get("collect_skipped", []),
             "journal": key if record and path else None,
+            # no journal file: pytest died before its session finished (a
+            # start-up crash exits 1 like a test failure), so nothing ran
+            "recorded_anything": path is not None,
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    if p.returncode not in (0, 1):
+    if p.returncode not in (0, 1) or not out["recorded_anything"]:
         out["output"] = (p.stdout + p.stderr)[-2000:]
     return out
 
@@ -199,11 +202,13 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
             "baseline": {"source": "map" if baseline is None else "given",
                          "n_tests": len(base_statuses)},
         }
-        if run["exit"] not in (0, 1):
+        if run["exit"] not in (0, 1) or not run["recorded_anything"]:
             # the full run itself went wrong: its statuses are no verdict
             out["full_run"]["output"] = run.get("output", "")
             out.update(verdict="error", misses=[], pollution=[], flaky=[],
-                       statuses=run["statuses"], error=f"full run exited {run['exit']}")
+                       statuses=run["statuses"],
+                       error=f"full run exited {run['exit']}" if run["recorded_anything"]
+                       else "full run recorded nothing: pytest died before its session finished")
             return out
         changes = status_changes(base_statuses, run, repo)
         chosen = planned(sel, base_statuses)

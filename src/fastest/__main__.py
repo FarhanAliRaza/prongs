@@ -153,16 +153,28 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
     buf = io.StringIO()
     saved = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = buf  # stdout is the JSON document; nothing else may print
+    crash = None
     try:
         code = pytest.main(
             targets + extra_args + ["-q", "--no-header", "-p", "no:cacheprovider"],
             plugins=[collector],
         )
+    except (Exception, SystemExit) as e:
+        # a plugin raised during pytest's own start-up (pytest-django's
+        # django.setup() importing broken models, say): pytest.main never
+        # returned an exit code, and nothing ran
+        import traceback
+
+        buf.write(traceback.format_exc())
+        crash, code = e, 3
     finally:
         sys.stdout, sys.stderr = saved
     # exit 2-5 is an error result, exactly as from the daemon: a collection
     # failure that ran nothing must never read as "passed"
-    return execution_response(code, time.monotonic() - t0, collector, buf.getvalue)
+    resp = execution_response(code, time.monotonic() - t0, collector, buf.getvalue)
+    if crash is not None:
+        resp["error"] = f"pytest crashed before running tests: {type(crash).__name__}: {crash}"
+    return resp
 
 
 _HEX = re.compile(r"0x[0-9a-fA-F]+")
