@@ -119,6 +119,19 @@ def _dep_key(dep) -> tuple[str, str, int]:
     return tuple(dep)  # type: ignore[return-value]
 
 
+def _intern_func(con: sqlite3.Connection, funcs: dict, dep: tuple, rootpath: str) -> int | None:
+    filename, qualname, lineno = dep
+    if not is_project_file(filename, rootpath):
+        return None
+    k = (os.path.relpath(filename, rootpath), qualname, lineno)
+    fid = funcs.get(k)
+    if fid is None:
+        fid = funcs[k] = con.execute(
+            "INSERT INTO funcs(path, qualname, lineno) VALUES (?,?,?) RETURNING id", k,
+        ).fetchone()[0]
+    return fid
+
+
 def append(jdir, rootpath: str, records: dict, run: dict, key: str | None = None) -> dict:
     """Write one run as one journal file and return {'key', 'path', 'mode',
     'n_tests', 'n_funcs', 'n_links'}.
@@ -145,7 +158,8 @@ def append(jdir, rootpath: str, records: dict, run: dict, key: str | None = None
         con.execute("PRAGMA journal_mode=OFF")  # a failed write is discarded whole
         con.execute("PRAGMA synchronous=OFF")
         con.executescript(SCHEMA)
-        funcs: dict[tuple, int] = {}
+        funcs: dict[tuple, int] = {}  # (relative path, qualname, lineno) -> id
+        seen: dict = {}  # dependency as recorded -> id, or None when not project code
         links: list[tuple[int, int]] = []
         n_tests = 0
         with con:
@@ -157,17 +171,12 @@ def append(jdir, rootpath: str, records: dict, run: dict, key: str | None = None
                 ids = None
                 if deps is not None:
                     ids = set()
-                    for filename, qualname, lineno in (_dep_key(d) for d in deps):
-                        if not is_project_file(filename, rootpath):
-                            continue
-                        k = (os.path.relpath(filename, rootpath), qualname, lineno)
-                        fid = funcs.get(k)
-                        if fid is None:
-                            fid = funcs[k] = con.execute(
-                                "INSERT INTO funcs(path, qualname, lineno) VALUES (?,?,?) "
-                                "RETURNING id", k,
-                            ).fetchone()[0]
-                        ids.add(fid)
+                    for dep in deps:  # the same code object recurs across tests: look it up first
+                        fid = seen.get(dep, 0)
+                        if fid == 0:
+                            fid = seen[dep] = _intern_func(con, funcs, _dep_key(dep), rootpath)
+                        if fid is not None:
+                            ids.add(fid)
                 tid = con.execute(
                     "INSERT INTO tests(test_id, status, duration, mapped) VALUES (?,?,?,?) "
                     "RETURNING id",
