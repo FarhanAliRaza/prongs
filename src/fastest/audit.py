@@ -18,7 +18,9 @@
      (a skipped cleanup, an unraisable exception landing on a later test),
      which fork-per-test isolation fixes, not selection
 
-Every miss carries the receipt that skipped it. bench/mutate.py and
+Every miss carries the receipt that skipped it; a known-flaky test that
+flips is reported under `flaky` with its history, not as a miss.
+bench/mutate.py and
 bench/replay.py are loops around audit(): mutate or check out, then audit.
 """
 
@@ -32,7 +34,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from fastest import journal, mapdb, provenance
+from fastest import config, journal, mapdb, provenance
 from fastest.select import select
 
 NOT_AN_OUTCOME = {"unknown", "collection"}  # statuses that are never compared
@@ -159,7 +161,8 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
 
 def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           pytest_args=(), baseline: dict[str, str] | None = None, isolate: bool = True,
-          record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE) -> dict:
+          record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE,
+          history_window: int | None = None) -> dict:
     """Select, run everything, report every status change the selection
     skipped. Pending journal files are rolled up first, as `fastest run`
     would. The result's `statuses` (every test's status in the full run) is
@@ -169,7 +172,8 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
     db = journal.map_path(repo)
     if rollup:
         mapdb.rollup(db, journal.journal_dir(repo))
-    sel = select(db, repo, base)
+    cfg = config.settings(repo, history_window=history_window)
+    sel = select(db, repo, base, history_window=cfg["history_window"])
     if "error" in sel:
         return {"error": sel["error"], "verdict": "error"}
     con = mapdb.connect(str(db))
@@ -198,13 +202,19 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
         if run["exit"] not in (0, 1):
             # the full run itself went wrong: its statuses are no verdict
             out["full_run"]["output"] = run.get("output", "")
-            out.update(verdict="error", misses=[], pollution=[], statuses=run["statuses"],
-                       error=f"full run exited {run['exit']}")
+            out.update(verdict="error", misses=[], pollution=[], flaky=[],
+                       statuses=run["statuses"], error=f"full run exited {run['exit']}")
             return out
         changes = status_changes(base_statuses, run, repo)
         chosen = planned(sel, base_statuses)
         unselected = sorted(t for t in changes if t not in chosen)
-        misses, pollution = [], []
+        misses, pollution, flaky = [], [], []
+        for t in [t for t in unselected if t in sel["flaky"]]:
+            # a known flake flipping is noise, not a selection miss
+            before, after = changes[t]
+            flaky.append({"test": t, "before": before, "after": after,
+                          "history": sel["flaky"][t]["history"]})
+        unselected = [t for t in unselected if t not in sel["flaky"]]
         for i, t in enumerate(unselected):
             before, after = changes[t]
             entry = {"test": t, "before": before, "after": after,
@@ -221,10 +231,12 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
     finally:
         con.close()
     out.update(
-        status_changes={"total": len(changes), "selected": len(changes) - len(unselected),
-                        "unselected": len(unselected)},
+        status_changes={"total": len(changes),
+                        "selected": len(changes) - len(unselected) - len(flaky),
+                        "unselected": len(unselected) + len(flaky)},
         misses=misses,
         pollution=pollution,
+        flaky=flaky,
         verdict="miss" if misses else "pass",
         wall_s=round(time.monotonic() - t0, 2),
         statuses=run["statuses"],

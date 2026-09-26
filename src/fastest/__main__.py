@@ -46,7 +46,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from fastest import journal, provenance
+from fastest import config, journal, provenance
 from fastest.select import select
 
 
@@ -69,7 +69,8 @@ def cmd_affected(args) -> dict:
             "hint": "build one with: pytest --fastest-cov (then fastest rollup)",
             "pending_journal_files": len(journal.pending(jdir)),
         }
-    sel = select(db, repo, args.base)
+    cfg = config.settings(repo, history_window=getattr(args, "history_window", None))
+    sel = select(db, repo, args.base, history_window=cfg["history_window"])
     if "error" in sel:
         return sel
     reasons = Counter(v.split(":")[0].split(" (")[0] for v in sel["selected"].values())
@@ -84,6 +85,13 @@ def cmd_affected(args) -> dict:
         "tests": sorted(sel["selected"]),
         "selected_files": sel.get("selected_files", {}),
         "vanished": sel.get("vanished", []),
+        # flaky tests still run; their history is the receipt, and a failure
+        # of one is reported as flaky, not as a failure
+        "flaky": {
+            t: f for t, f in sel["flaky"].items()
+            if t in sel["selected"] or t.split("::", 1)[0] in sel.get("selected_files", {})
+        },
+        "history": sel["history"],
         "targets": sel["targets"],
         "evidence": sel["evidence"] | {"journal": {
             "rolled_up_now": rolled["rolled_up"] if rolled else 0,
@@ -272,6 +280,33 @@ def append_results(repo: Path, jdir: Path, key: str, targets: list[str], results
     )
 
 
+def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict) -> dict[str, dict]:
+    """test_id -> entry for every flaky test that ran: known flaky from
+    history (passed and failed on one tree), or failing now on a tree where
+    it has passed before. Reported under `flaky` with its history, never as
+    a failure."""
+    from fastest import mapdb
+    from fastest.select import contradicted_on_tree
+
+    known = aff.get("flaky", {})
+    failed = [r["id"] for r in results if r["status"] == "failed" and r["id"] not in known]
+    con = mapdb.connect(str(journal.map_path(repo)))
+    try:
+        caught = contradicted_on_tree(con, failed, tree, provenance.recorder_fingerprint())
+    finally:
+        con.close()
+    out = {}
+    for r in results:
+        f = known.get(r["id"]) or caught.get(r["id"])
+        if f:
+            out[r["id"]] = {
+                "test": r["id"], "status": r["status"],
+                "why": f"passed {f['passed']}x and failed {f['failed']}x on tree {f['tree']}",
+                "history": f["history"],
+            }
+    return out
+
+
 def cmd_run(args) -> dict:
     t0 = time.monotonic()
     repo = Path.cwd()
@@ -305,7 +340,7 @@ def cmd_run(args) -> dict:
         ["--fastest-cov", "--fastest-journal", str(jdir), "--fastest-journal-key", key]
         if mode == "coverage" else []
     )
-    snap, started = (provenance.snapshot(repo), time.time()) if mode == "results" else (None, None)
+    snap, started = provenance.snapshot(repo), time.time()  # the tree this run executes
     resp = run_via_daemon(aff["targets"], extra)
     out["executor"] = "daemon" if resp else "subprocess"
     if resp and (resp.get("stale") or "error" in resp):
@@ -322,8 +357,11 @@ def cmd_run(args) -> dict:
     results = resp.get("results", [])
     if mode == "results":
         append_results(repo, jdir, key, aff["targets"], results, resp, snap, started)
-    failures = [r for r in results if r["status"] == "failed"]
+    flaky = flaky_results(repo, aff, results, snap)
+    failures = [r for r in results if r["status"] == "failed" and r["id"] not in flaky]
     out["failures"] = group_failures(failures)  # passes are summarized, not listed
+    if flaky:
+        out["flaky"] = list(flaky.values())
     ran = len(results)
     out["conservation"] = conservation(aff, results)
     error = resp.get("error")
@@ -359,6 +397,7 @@ def cmd_run(args) -> dict:
         "status": status,
         "passed": sum(1 for r in results if r["status"] == "passed"),
         "failed": len(failures),
+        "flaky": {"ran": len(flaky), "failed": sum(f["status"] == "failed" for f in flaky.values())},
         "ran": ran,
         "unrun_targets": unrun,
         "complete": not unrun and not error,
@@ -391,7 +430,7 @@ def cmd_audit(args) -> dict:
                 "hint": "build one with: pytest --fastest-cov (then fastest rollup)"}
     raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
-                record=args.record, rollup=False)
+                record=args.record, rollup=False, history_window=args.history_window)
     res.pop("statuses", None)  # per-test statuses are for harnesses, not the agent
     return res
 
@@ -415,6 +454,9 @@ def main():
                        help="diff base (default: the commits the evidence was observed at)")
         p.add_argument("--rollup", action=argparse.BooleanOptionalAction, default=True,
                        help="fold pending journal files into the map first (default: on)")
+        p.add_argument("--history-window", type=int, default=None, metavar="N",
+                       help="select tests whose outcome flipped in the last N rollups "
+                            "(default: [tool.fastest] history_window, else 3)")
         if name == "run":
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
                            help="append this run to the journal, refreshing the tests it "

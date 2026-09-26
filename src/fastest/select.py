@@ -15,7 +15,10 @@ selection is computed per observed tree:
      and a file that differs is diffed at function level, not wholesale
   3. map changed lines to (file, qualname) functions via AST spans, look them
      up in the inverted map, restricted to the tests that tree observed
-  4. conservative rules on top: unmapped tests, tests in changed test files
+  4. history on top (the second signal): a test whose outcome flipped in the
+     last N rollups is selected ("recent status change"), and a test that
+     both passed and failed on one tree is reported as flaky
+  5. conservative rules on top: unmapped tests, tests in changed test files
      (a test module whose known tests can't all be found statically, or that
      has tests the map has never seen, is run as a whole file), and run-all
      when conftest / a tracked non-Python file / module-level or import-time
@@ -41,7 +44,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastest import journal, mapdb, provenance
+from fastest import config, journal, mapdb, provenance
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -544,9 +547,102 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
     return an
 
 
+# --- history: the second signal ----------------------------------------------
+
+def recent_status_changes(con, window: int) -> dict[str, str]:
+    """test_id -> reason, for every live test whose outcome flipped (passed
+    <-> failed, against its previous outcome) in one of the last `window`
+    rollups. Coverage cannot see a test broken by another test's leftovers
+    (poc-results finding 2: a selected failure skipped its cleanup and five
+    tests that never touch the changed code failed after it); history can,
+    once a run has observed the flip, and keeps selecting the test until
+    `window` rollups pass without one."""
+    top = con.execute("SELECT MAX(rollup_seq) FROM runs").fetchone()[0]
+    if window <= 0 or top is None:
+        return {}
+    rows = con.execute(
+        "WITH h AS ("
+        " SELECT h.test_id, h.run_id, r.rollup_seq, h.status,"
+        "  LAG(h.status) OVER (PARTITION BY h.test_id ORDER BY h.run_id) AS prev"
+        " FROM history h JOIN runs r ON r.id = h.run_id"
+        " WHERE h.status IN ('passed', 'failed') AND h.test_id IN ("
+        "  SELECT h2.test_id FROM history h2 JOIN runs r2 ON r2.id = h2.run_id"
+        "  WHERE r2.rollup_seq > ?))"
+        " SELECT t.test_id, h.prev, h.status, h.run_id FROM h JOIN tests t ON t.id = h.test_id"
+        " WHERE h.rollup_seq > ? AND h.prev IS NOT NULL AND h.prev != h.status"
+        " AND t.retired_run IS NULL ORDER BY h.run_id",
+        (top - window, top - window),
+    ).fetchall()
+    return {  # the latest flip wins
+        test_id: f"recent status change: {prev} -> {status} in run #{run_id}"
+        for test_id, prev, status, run_id in rows
+    }
+
+
+def _tree(commit: str | None, dirty: str | None) -> str:
+    return (commit or "?")[:8] + ("" if dirty in (None, "{}") else " + dirty files")
+
+
+def flaky_tests(con) -> dict[str, dict]:
+    """test_id -> evidence, for every live test that both passed and failed
+    on one tree: the same commit, the same dirty content, the same recorder
+    (python, pytest), in runs the tree did not change under. Same code, both
+    outcomes: the difference is not in the code."""
+    rows = con.execute(
+        "SELECT t.test_id, r.commit_sha, r.dirty_files, SUM(h.status = 'passed'), "
+        "SUM(h.status = 'failed'), MAX(h.run_id) "
+        "FROM history h JOIN runs r ON r.id = h.run_id JOIN tests t ON t.id = h.test_id "
+        "WHERE h.status IN ('passed', 'failed') AND r.tree_changed = 0 "
+        "AND r.commit_sha IS NOT NULL AND t.retired_run IS NULL "
+        "GROUP BY h.test_id, r.commit_sha, r.dirty_files, r.recorder "
+        "HAVING SUM(h.status = 'passed') > 0 AND SUM(h.status = 'failed') > 0"
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for test_id, commit, dirty, n_pass, n_fail, last in rows:
+        if test_id not in out or last > out[test_id]["last_run"]:
+            out[test_id] = {"tree": _tree(commit, dirty), "passed": n_pass, "failed": n_fail,
+                            "last_run": last}
+    return out
+
+
+def test_history(con, test_id: str, limit: int = 10) -> list[dict]:
+    """A test's latest outcomes, oldest first: the receipt for a flake."""
+    rows = con.execute(
+        "SELECT h.run_id, r.commit_sha, r.dirty_files, h.status FROM history h "
+        "JOIN runs r ON r.id = h.run_id JOIN tests t ON t.id = h.test_id "
+        "WHERE t.test_id = ? ORDER BY h.run_id DESC LIMIT ?", (test_id, limit),
+    ).fetchall()
+    return [{"run": run_id, "tree": _tree(sha, dirty), "status": status}
+            for run_id, sha, dirty, status in reversed(rows)]
+
+
+def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str) -> dict[str, dict]:
+    """Failures that contradict a pass recorded on this very tree (a
+    provenance snapshot: commit + dirty content) with this recorder: a flake,
+    caught the first time it contradicts itself rather than after the next
+    rollup."""
+    if not failed or tree.get("commit") is None:
+        return {}
+    dirty = json.dumps({p: [h, h] for p, h in tree["dirty"].items()}, sort_keys=True)
+    out = {}
+    for t in failed:
+        passes = con.execute(
+            "SELECT COUNT(*) FROM history h JOIN runs r ON r.id = h.run_id "
+            "JOIN tests tt ON tt.id = h.test_id WHERE tt.test_id = ? AND h.status = 'passed' "
+            "AND r.commit_sha = ? AND r.dirty_files = ? AND r.recorder = ? "
+            "AND r.tree_changed = 0",
+            (t, tree["commit"], dirty, recorder),
+        ).fetchone()[0]
+        if passes:
+            out[t] = {"tree": _tree(tree["commit"], dirty), "passed": passes, "failed": 1,
+                      "history": test_history(con, t)}
+    return out
+
+
 # --- selection ---------------------------------------------------------------
 
-def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None) -> dict:
+def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None, *,
+           history_window: int = config.DEFAULTS["history_window"]) -> dict:
     if provenance.git_head(repo) is None:
         return {"error": f"not a git repository with commits: {repo}", "mode": "error"}
     for rev in (base, head):
@@ -586,6 +682,12 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             missing_modules.add(mod)
     ev["missing_modules"] = sorted(missing_modules)
     coll_funcs, coll_files = collection_deps(con)
+    recent = {
+        t: r for t, r in recent_status_changes(con, history_window).items() if t in all_tests
+    }
+    flaky = {t: f | {"history": test_history(con, t)}
+             for t, f in flaky_tests(con).items() if t in all_tests}
+    history = {"window": history_window, "recent_changes": len(recent), "flaky": len(flaky)}
 
     trees = build_trees(repo, contributing, base, ev)
     untracked = provenance.dirty_files(repo) if head is None else {}
@@ -639,6 +741,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "changed_functions": changed_funcs,
             "changed_files_wholesale": wholesale,
             "vanished": vanished,
+            "flaky": flaky,
+            "history": history,
             "evidence": ev,
         }
 
@@ -679,6 +783,11 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
                     selected.setdefault(t, reason)
         selected_files.update(an.selected_files)
 
+    # history, the second signal: a test whose outcome flipped recently runs
+    # again, whatever its coverage says (cross-test pollution, flakes)
+    for t, reason in recent.items():
+        selected.setdefault(t, reason)
+
     # conservative: unmapped tests always run
     for t, (mapped, _) in all_tests.items():
         if not mapped:
@@ -705,6 +814,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "n_skipped": len(skipped),
         "n_total": len(all_tests),
         "vanished": vanished,
+        "flaky": flaky,
+        "history": history,
         "evidence": ev,
     }
 
