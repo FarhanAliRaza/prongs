@@ -2,11 +2,12 @@
 
 `fastest audit [--base REV]`:
 
-  1. select exactly as `fastest run` would (--base REV, else the evidence)
+  1. select exactly as `fastest run` would (--base REV, else the evidence),
+     after rolling up pending journal files
   2. run the FULL suite in a subprocess with the recorder on (FASTEST_COV=1)
-     into a temporary database, so an audit never feeds the map it audits
-     (record=True appends the run to the real journal instead; history
-     replay uses that to walk commits)
+     into a temporary journal, so an audit never feeds the map it audits
+     (record=True appends the run to the real journal instead; history replay
+     uses that to walk commits)
   3. diff every live test's status against the baseline: the status the base
      map recorded, or statuses the caller supplies (replay passes the
      previous commit's full run when the map is deliberately left behind)
@@ -25,14 +26,13 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-from fastest import mapdb, provenance
+from fastest import journal, mapdb, provenance
 from fastest.select import select
 
 NOT_AN_OUTCOME = {"unknown", "collection"}  # statuses that are never compared
@@ -48,47 +48,18 @@ def pytest_cmd(python: str, pytest_args=(), targets=()) -> list[str]:
     ]
 
 
-def _last_run_id(db: Path) -> int:
-    if not db.exists():
-        return 0
-    con = sqlite3.connect(db)
-    try:
-        return con.execute("SELECT COALESCE(MAX(id), 0) FROM runs").fetchone()[0]
-    except sqlite3.OperationalError:
-        return 0
-    finally:
-        con.close()
-
-
-def _run_statuses(db: Path, after_run: int) -> dict[str, str]:
-    """{test_id: status} observed by the newest run after `after_run`."""
-    if not db.exists():
-        return {}  # pytest died before the recorder wrote anything
-    con = sqlite3.connect(db)
-    try:
-        run_id = con.execute("SELECT MAX(id) FROM runs WHERE id > ?", (after_run,)).fetchone()[0]
-        if run_id is None:
-            return {}
-        return {
-            t: s for t, s in con.execute(
-                "SELECT t.test_id, o.status FROM observations o JOIN tests t ON t.id=o.test_id "
-                "WHERE o.run_id=?", (run_id,)
-            ) if t != mapdb.COLLECTION
-        }
-    finally:
-        con.close()
-
-
 def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=(),
             record: bool = False) -> dict:
     """Run pytest with the recorder on and return what it observed:
-    {'exit', 'wall_s', 'statuses': {test_id: status}, ['output']}. The
-    statuses come from the recorder's own database, never from parsing
-    pytest's output (poc-results finding 4)."""
+    {'exit', 'wall_s', 'statuses': {test_id: status}, 'collect_errors',
+    'collect_skipped', 'journal', ['output']}. Everything comes from the run's
+    own journal file, never from parsing pytest's output (poc-results finding
+    4). Unless `record`, that file goes to a temporary directory and is
+    discarded."""
     tmp = Path(tempfile.mkdtemp(prefix="fastest-audit-"))
-    db = repo / ".fastest" / "map.sqlite" if record else tmp / "map.sqlite"
-    before = _last_run_id(db)
-    env = dict(os.environ, FASTEST_COV="1", FASTEST_DB=str(db))
+    jdir = journal.journal_dir(repo) if record else tmp
+    key = journal.new_key()
+    env = dict(os.environ, FASTEST_COV="1", FASTEST_JOURNAL=str(jdir), FASTEST_JOURNAL_KEY=key)
     t0 = time.monotonic()
     try:
         p = subprocess.run(
@@ -96,10 +67,18 @@ def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=()
             capture_output=True, text=True,
         )
         wall = time.monotonic() - t0
-        statuses = _run_statuses(db, before)
+        path = journal.find(jdir, key)  # absent: pytest died before the recorder wrote
+        run = journal.read_run(path) if path else {}
+        out = {
+            "exit": p.returncode,
+            "wall_s": round(wall, 2),
+            "statuses": journal.statuses(path) if path else {},
+            "collect_errors": run.get("collect_errors", {}),
+            "collect_skipped": run.get("collect_skipped", []),
+            "journal": key if record and path else None,
+        }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    out = {"exit": p.returncode, "wall_s": round(wall, 2), "statuses": statuses}
     if p.returncode not in (0, 1):
         out["output"] = (p.stdout + p.stderr)[-2000:]
     return out
@@ -109,16 +88,20 @@ def map_statuses(con) -> dict[str, str]:
     """{test_id: status} for every live test in the map."""
     return dict(con.execute(
         "SELECT test_id, status FROM tests WHERE retired_run IS NULL "
-        "AND deps_set IS NOT NULL AND test_id != ?", (mapdb.COLLECTION,),
+        "AND last_run IS NOT NULL AND test_id != ?", (mapdb.COLLECTION,),
     ))
 
 
-def status_changes(baseline: dict[str, str], current: dict[str, str], repo: Path) -> dict:
+def status_changes(baseline: dict[str, str], run: dict, repo: Path) -> dict:
     """{test_id: (before, after)} for every test whose outcome differs. A test
-    missing from the current run is 'error' when its whole module produced
-    no result (it failed to collect); it is not a change when its module ran
-    without it (renamed or deleted) or no longer exists."""
+    missing from the run is 'skipped' when its module was skipped at import,
+    'error' when its module failed to collect or produced no result at all;
+    it is no change when its module ran without it (renamed or deleted) or
+    no longer exists."""
+    current = run["statuses"]
     ran_modules = {t.split("::", 1)[0] for t in current}
+    errored = set(run.get("collect_errors", {}))
+    skipped = set(run.get("collect_skipped", []))
     out: dict[str, tuple[str, str]] = {}
     for t, before in baseline.items():
         if before in NOT_AN_OUTCOME:
@@ -126,9 +109,14 @@ def status_changes(baseline: dict[str, str], current: dict[str, str], repo: Path
         mod = t.split("::", 1)[0]
         after = current.get(t)
         if after is None:
-            if mod in ran_modules or not (repo / mod).exists():
+            if not (repo / mod).exists():
                 continue
-            after = "error"
+            if mod in skipped:
+                after = "skipped"
+            elif mod in ran_modules and mod not in errored:
+                continue
+            else:
+                after = "error"
         if after not in NOT_AN_OUTCOME and after != before:
             out[t] = (before, after)
     return out
@@ -146,21 +134,21 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
     applied to, and which of the test's recorded dependencies sit in the
     files the diff touched (the ones it was cleared against)."""
     row = con.execute(
-        "SELECT last_run, deps_set FROM tests WHERE test_id=?", (test_id,)
+        "SELECT deps_run, deps_set FROM tests WHERE test_id=?", (test_id,)
     ).fetchone()
     if row is None:
         return {"rule": "not in the map"}
-    last_run, deps_set = row
+    deps_run, deps_set = row
     deps = con.execute(
         "SELECT f.path, fn.qualname FROM dep_members m JOIN funcs fn ON fn.id=m.func_id "
         "JOIN files f ON f.id=fn.file_id WHERE m.set_id=?", (deps_set,),
     ).fetchall() if deps_set is not None else []
-    run = con.execute("SELECT commit_sha, scope FROM runs WHERE id=?", (last_run,)).fetchone()
+    run = con.execute("SELECT commit_sha, scope FROM runs WHERE id=?", (deps_run,)).fetchone()
     changed = sel.get("changed_functions", [])
     touched = {f.split("::", 1)[0] for f in changed} | set(sel.get("changed_files_wholesale", []))
     return {
         "rule": "no overlap between this test's coverage map and the diff",
-        "observed_by_run": last_run,
+        "observed_by_run": deps_run,
         "observed_at": (run[0] or "")[:8] if run else None,
         "n_deps": len(deps),
         "deps_in_changed_files": sorted(f"{p}::{q}" for p, q in deps if p in touched)[:10],
@@ -171,13 +159,16 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
 
 def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           pytest_args=(), baseline: dict[str, str] | None = None, isolate: bool = True,
-          record: bool = False, max_isolate: int = MAX_ISOLATE) -> dict:
+          record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE) -> dict:
     """Select, run everything, report every status change the selection
-    skipped. The result's `statuses` (every test's status in the full run)
-    is for harnesses that chain audits; the CLI drops it."""
+    skipped. Pending journal files are rolled up first, as `fastest run`
+    would. The result's `statuses` (every test's status in the full run) is
+    for harnesses that chain audits; the CLI drops it."""
     t0 = time.monotonic()
     repo = Path(repo).resolve()
-    db = repo / ".fastest" / "map.sqlite"
+    db = journal.map_path(repo)
+    if rollup:
+        mapdb.rollup(db, journal.journal_dir(repo))
     sel = select(db, repo, base)
     if "error" in sel:
         return {"error": sel["error"], "verdict": "error"}
@@ -198,7 +189,8 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
             },
             "full_run": {
                 "exit": run["exit"], "wall_s": run["wall_s"],
-                "n_results": len(run["statuses"]), "recorded": record,
+                "n_results": len(run["statuses"]), "journal": run["journal"],
+                "collect_errors": run["collect_errors"],
             },
             "baseline": {"source": "map" if baseline is None else "given",
                          "n_tests": len(base_statuses)},
@@ -209,7 +201,7 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
             out.update(verdict="error", misses=[], pollution=[], statuses=run["statuses"],
                        error=f"full run exited {run['exit']}")
             return out
-        changes = status_changes(base_statuses, run["statuses"], repo)
+        changes = status_changes(base_statuses, run, repo)
         chosen = planned(sel, base_statuses)
         unselected = sorted(t for t in changes if t not in chosen)
         misses, pollution = [], []

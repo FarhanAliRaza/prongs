@@ -1,7 +1,8 @@
 """Phase 2: diff -> affected test selection, with receipts and evidence.
 
-Reads the roll-up in map.sqlite (tests + current_links; never the journal
-directly). A test's evidence is the tree of the run that last observed it, so
+Reads the roll-up in map.sqlite (tests + current_links) and never writes:
+journal files reach it only through `fastest rollup`. A test's evidence is
+the tree of the run whose coverage it last recorded (`deps_run`), so
 selection is computed per observed tree:
 
   1. group the contributing runs (last full run and everything after it, plus
@@ -40,7 +41,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastest import mapdb, provenance
+from fastest import journal, mapdb, provenance
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -242,6 +243,7 @@ def _brief(run: dict | None) -> dict | None:
     return {
         "id": run["id"],
         "scope": run["scope"],
+        "mode": run["mode"],
         "commit": run["commit_sha"],
         "finished_at": run["finished_at"],
         "age_s": round(time.time() - run["finished_at"], 1) if run["finished_at"] else None,
@@ -250,6 +252,16 @@ def _brief(run: dict | None) -> dict | None:
         "dirty_files": len(run["dirty_files"]),
         "tree_changed": run["tree_changed"],
         "recorder": run["recorder"],
+    }
+
+
+def _rollup_meta(con) -> dict:
+    """Where the last `fastest rollup` left the map."""
+    m = mapdb.meta(con)
+    return {
+        "seq": int(m["rollup_seq"]) if m.get("rollup_seq") else None,
+        "run": int(m["rollup_run"]) if m.get("rollup_run") else None,
+        "commit": m.get("rollup_commit") or None,
     }
 
 
@@ -262,7 +274,7 @@ def evidence_summary(con, repo: Path) -> tuple[dict, list[dict]]:
     refreshed = None
     if full:
         refreshed = con.execute(
-            "SELECT COUNT(*) FROM tests WHERE retired_run IS NULL AND last_run > ? "
+            "SELECT COUNT(*) FROM tests WHERE retired_run IS NULL AND deps_run > ? "
             "AND test_id != ?",
             (full["id"], mapdb.COLLECTION),
         ).fetchone()[0]
@@ -279,6 +291,7 @@ def evidence_summary(con, repo: Path) -> tuple[dict, list[dict]]:
             if full and full["commit_sha"] else None
         ),
         "tests_refreshed_since_full": refreshed,
+        "rollup": _rollup_meta(con),
         "warnings": [],
     }
     if not full:
@@ -557,16 +570,18 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         def module_exists(mod: str) -> bool:
             return mod in tree_paths
 
-    all_tests: dict[str, tuple[int, int]] = {}  # test_id -> (mapped, last_run)
+    # test_id -> (mapped, deps_run). A test only ever seen by results-only
+    # runs has no dependency evidence at all: it is unmapped, so it always runs
+    all_tests: dict[str, tuple[int, int | None]] = {}
     missing_modules: set[str] = set()
-    for test_id, mapped, last_run in con.execute(
-        "SELECT test_id, mapped, last_run FROM tests WHERE retired_run IS NULL "
-        "AND deps_set IS NOT NULL AND test_id != ?",
+    for test_id, mapped, deps_run in con.execute(
+        "SELECT test_id, CASE WHEN deps_set IS NULL THEN 0 ELSE mapped END, deps_run "
+        "FROM tests WHERE retired_run IS NULL AND last_run IS NOT NULL AND test_id != ?",
         (mapdb.COLLECTION,),
     ):
         mod = test_id.split("::", 1)[0]
         if module_exists(mod):
-            all_tests[test_id] = (mapped, last_run)
+            all_tests[test_id] = (mapped, deps_run)
         else:
             missing_modules.add(mod)
     ev["missing_modules"] = sorted(missing_modules)
@@ -635,8 +650,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             in_tree = set(all_tests)
         else:
             in_tree = {
-                t for t, (_, last_run) in all_tests.items()
-                if last_run in tree.run_ids or last_run not in known_runs
+                t for t, (_, deps_run) in all_tests.items()
+                if deps_run in tree.run_ids or deps_run not in known_runs
             }
         for path, qual in an.changed_funcs:
             rows = con.execute(
@@ -702,7 +717,7 @@ def main():
     ap.add_argument("--head", default=None)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    db = args.db or args.repo / ".fastest" / "map.sqlite"
+    db = args.db or journal.map_path(args.repo)  # read-only: `fastest rollup` first
     result = select(db, args.repo.resolve(), args.base, args.head)
     if args.json:
         print(json.dumps(result, indent=2))

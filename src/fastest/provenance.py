@@ -11,6 +11,7 @@ assumes.
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 import subprocess
 import sys
@@ -82,17 +83,35 @@ def blob_hash_at(repo: Path, rev: str, path: str) -> str | None:
     return bytes_hash(p.stdout)
 
 
+def _own_state(repo: Path) -> tuple[str, ...]:
+    """Path prefixes under the repository that hold fastest's own state (the
+    map, the journal). They are never part of the tree a run observed: a
+    project that does not ignore .fastest/ would otherwise see every run's
+    journal file as a change to its tree."""
+    prefixes = {".fastest/"}
+    for var in ("FASTEST_DIR", "FASTEST_JOURNAL"):
+        value = os.environ.get(var)
+        if value:
+            try:
+                rel = (repo / value).resolve().relative_to(repo.resolve())
+            except ValueError:
+                continue  # outside the repository: git never reports it
+            prefixes.add(rel.as_posix().rstrip("/") + "/")
+    return tuple(prefixes)
+
+
 def dirty_files(repo: Path, contents: dict[str, bytes] | None = None) -> dict[str, str | None]:
     """path -> content hash for every file that differs from HEAD.
 
-    Covers staged, unstaged and untracked (non-ignored) files. Deleted files
-    hash to None. Renames report the new path. When `contents` is given, the
-    bytes of each Python file (the only kind the selector line-diffs) are
-    stored in it by hash.
+    Covers staged, unstaged and untracked (non-ignored) files, except
+    fastest's own state. Deleted files hash to None. Renames report the new
+    path. When `contents` is given, the bytes of each Python file (the only
+    kind the selector line-diffs) are stored in it by hash.
     """
     out = _git(repo, "status", "--porcelain", "-z", "--untracked-files=all")
     if not out:
         return {}
+    own = _own_state(repo)
     result: dict[str, str | None] = {}
     tokens = out.split("\0")
     i = 0
@@ -104,6 +123,8 @@ def dirty_files(repo: Path, contents: dict[str, bytes] | None = None) -> dict[st
         status, path = entry[:2], entry[3:]
         if status[0] in "RC":  # rename/copy: the original path follows
             i += 1
+        if path.startswith(own):
+            continue
         h, data = read_and_hash(repo / path)
         result[path] = h
         if contents is not None and data is not None and path.endswith(".py"):
@@ -117,6 +138,21 @@ def snapshot(repo: Path) -> dict:
     contents: dict[str, bytes] = {}
     dirty = dirty_files(repo, contents)
     return {"commit": git_head(repo), "dirty": dirty, "contents": contents}
+
+
+def between(start: dict, end: dict) -> dict:
+    """What a run observed, from snapshots taken at its start and end: the
+    commit, every dirty path with its hash at start and end, the content of
+    the dirty .py files, and whether the tree changed under the run."""
+    return {
+        "commit": start["commit"],
+        "dirty_files": {
+            p: [start["dirty"].get(p), end["dirty"].get(p)]
+            for p in start["dirty"].keys() | end["dirty"].keys()
+        },
+        "blobs": end["contents"],  # what the run actually saw of dirty files
+        "tree_changed": start["commit"] != end["commit"] or start["dirty"] != end["dirty"],
+    }
 
 
 def recorder_fingerprint() -> str:

@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from fastest import mapdb, provenance  # noqa: E402
+from fastest import journal, mapdb, provenance  # noqa: E402
 from fastest.audit import audit  # noqa: E402
 
 
@@ -103,7 +103,8 @@ def main():
     repo = args.repo.resolve()
     py = str(repo / ".venv" / "bin" / "python")
     extra = shlex.split(args.pytest_args)
-    db = repo / ".fastest" / "map.sqlite"
+    db = journal.map_path(repo)
+    mapdb.rollup(db, journal.journal_dir(repo))
     assert db.exists(), "build the map first (pytest --fastest-cov)"
     if subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repo).returncode != 0:
         sys.exit(f"{repo} has uncommitted changes; mutate needs a clean tree (git stash)")

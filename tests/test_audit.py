@@ -64,5 +64,6 @@ def test_audit_separates_pollution_from_misses(recorded):
 def test_audit_record_appends_the_full_run(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
     out = recorded.cli("audit", "--record")
-    assert out["verdict"] == "pass" and out["full_run"]["recorded"] is True
+    assert out["verdict"] == "pass"
+    assert recorded.journal_files() == [out["full_run"]["journal"] + ".sqlite"]  # pending
     assert [r[1] for r in recorded.runs()] == ["full", "full"]

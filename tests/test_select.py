@@ -37,7 +37,9 @@ def test_recorded_partial_run_is_credited_exactly(recorded):
     s = out["summary"]
     assert s["status"] == "passed" and s["ran"] == 2 and s["complete"] is True
     assert s["unrun_targets"] == [] and s["record_ok"] is True
-    assert s["recorded"] == {"run_id": 2, "scope": "partial", "n_observed": 2}
+    key = s["recorded"].pop("journal")
+    assert s["recorded"] == {"mode": "coverage", "scope": "partial", "n_observed": 2}
+    assert recorded.journal_files() == [f"{key}.sqlite"]  # appended, not yet rolled up
     assert [r[1] for r in recorded.runs()] == ["full", "partial"]
 
     sel = recorded.select()

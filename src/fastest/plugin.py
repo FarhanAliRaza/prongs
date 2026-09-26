@@ -1,4 +1,4 @@
-"""fastest recorder plugin (PoC Phase 1, v3: journal + provenance).
+"""fastest recorder plugin (PoC Phase 1, v4: one journal file per run).
 
 Records, per test, the set of (file, qualname) project functions the test
 entered, using sys.monitoring PY_START events. Non-project code objects
@@ -7,18 +7,23 @@ re-armed — we never call restart_events() — so framework internals cost
 zero callbacks after the first test. Project functions stay armed and are
 deduped into a per-test set (a set.add per project call).
 
-Every session is appended to the journal as one run (see mapdb): a full
-run, a partial run (node ids, -k, -m, --lf, an interrupted session, an xdist
-worker) or a collect-only run. Partial runs are safe by construction — they
-refresh exactly the tests they observed and union their import-time code
-into the collection set — so the map can be fed from selected runs.
+Every session appends one journal file (see journal.py) and never touches
+the map: `fastest rollup` folds journal files into it. A run is full, partial
+(node ids, -k, -m, --lf, an interrupted session, an xdist worker) or
+collect-only. Partial runs are safe by construction — the roll-up refreshes
+exactly the tests they observed and unions their import-time code into the
+collection set — so the map can be fed from selected runs, and concurrent
+sessions (worktrees, xdist workers) each write their own file.
 
 Provenance: HEAD and every file that differed from it are snapshotted at
 session start and again at finish, with content hashes, so the selector can
 diff against the tree the evidence actually saw.
 
 Opt-in: only active when --fastest-cov is passed (or FASTEST_COV=1), so
-installing the package does not perturb baseline runs.
+installing the package does not perturb baseline runs. The journal directory
+is --fastest-journal, else $FASTEST_JOURNAL, else <state dir>/journal; the
+file is named by --fastest-journal-key (or $FASTEST_JOURNAL_KEY) when the
+caller needs to find it again.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from fastest import provenance
+from fastest import journal, provenance
 
 MON = sys.monitoring
 TOOL_ID = MON.COVERAGE_ID
@@ -41,8 +46,10 @@ def pytest_addoption(parser):
         "--fastest-cov",
         action="store_true",
         default=False,
-        help="record per-test coverage into the .fastest/map.sqlite journal",
+        help="record per-test coverage and outcomes as a journal file (.fastest/journal/)",
     )
+    parser.addoption("--fastest-journal", default=None, help="journal directory for --fastest-cov")
+    parser.addoption("--fastest-journal-key", default=None, help="name of this run's journal file")
 
 
 def pytest_configure(config):
@@ -98,6 +105,8 @@ class FastestCov:
         self._current: set = set()
         self._interesting: dict = {}  # code -> bool, classified once
         self._statuses: dict[str, str] = {}
+        self.collect_errors: dict[str, str] = {}
+        self.collect_skipped: list[str] = []
         self.n_collected = 0
         self.started_at = time.time()
         self.scope = classify_scope(config)
@@ -119,12 +128,19 @@ class FastestCov:
             return MON.DISABLE
         self._current.add(code)
 
+    def pytest_collectreport(self, report):
+        if report.failed:
+            lines = [ln for ln in str(report.longrepr).splitlines() if ln.strip()]
+            self.collect_errors[report.nodeid] = lines[-1][:300] if lines else "collection error"
+        elif report.skipped and report.nodeid:
+            self.collect_skipped.append(report.nodeid)
+
     def pytest_collection_finish(self, session):
         # everything executed so far ran at import/collection time (module
         # bodies, decorators, class-level declarations): a pseudo-context.
         # A diff touching any of it invalidates the whole suite.
         self.n_collected = len(session.items)
-        self.records["__collection__"] = (0.0, "collection", frozenset(self._current))
+        self.records[journal.COLLECTION] = (0.0, "collection", frozenset(self._current))
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(self, item, nextitem):
@@ -148,13 +164,7 @@ class FastestCov:
 
     def run_info(self) -> dict:
         """Provenance for this session, taken at finish."""
-        end = provenance.snapshot(Path(self.rootpath))
-        start = self.snapshot_start
-        dirty = {
-            p: [start["dirty"].get(p), end["dirty"].get(p)]
-            for p in start["dirty"].keys() | end["dirty"].keys()
-        }
-        n_observed = len(self.records) - ("__collection__" in self.records)
+        n_observed = len(self.records) - (journal.COLLECTION in self.records)
         scope = self.scope
         if scope == "full" and (n_observed < self.n_collected or self.n_collected == 0):
             scope = "partial"  # -x, interrupt, or nothing collected: no proof of completeness
@@ -162,29 +172,27 @@ class FastestCov:
             "started_at": self.started_at,
             "finished_at": time.time(),
             "scope": scope,
-            "commit": start["commit"],
-            "dirty_files": dirty,
-            "blobs": end["contents"],  # what the run actually saw of dirty files
-            "tree_changed": start["commit"] != end["commit"] or start["dirty"] != end["dirty"],
+            "mode": "coverage",
+            "worktree": self.rootpath.rstrip(os.sep),
+            **provenance.between(self.snapshot_start, provenance.snapshot(Path(self.rootpath))),
             "recorder": provenance.recorder_fingerprint(),
             "args": list(self.config.invocation_params.args),
             "n_collected": self.n_collected,
+            "collect_errors": self.collect_errors,
+            "collect_skipped": self.collect_skipped,
         }
 
     def pytest_sessionfinish(self, session):
         MON.set_events(TOOL_ID, 0)
         MON.free_tool_id(TOOL_ID)
         t0 = time.monotonic()
-        from fastest.mapdb import record_run
-
-        path = os.environ.get("FASTEST_DB") or os.path.join(
-            str(session.config.rootpath), ".fastest", "map.sqlite"
-        )
+        config = session.config
+        jdir = config.getoption("fastest_journal") or journal.journal_dir(config.rootpath)
+        key = config.getoption("fastest_journal_key") or os.environ.get("FASTEST_JOURNAL_KEY")
         info = self.run_info()
-        res = record_run(path, self.rootpath, self.records, info)
+        res = journal.append(jdir, self.rootpath, self.records, info, key=key)
         sys.stderr.write(
-            f"\n[fastest] run #{res['run_id']} ({info['scope']}"
+            f"\n[fastest] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"
-            f" -> {res['n_funcs']} funcs, {res['n_new_sets']} new dep sets"
-            f" ({time.monotonic() - t0:.2f}s) -> {path}\n"
+            f" -> {res['n_funcs']} funcs ({time.monotonic() - t0:.2f}s) -> {res['path']}\n"
         )

@@ -1,28 +1,35 @@
-"""SQLite storage for the per-test dependency map.
+"""SQLite storage for the per-test dependency map: the roll-up of the journal.
 
-Two halves, per the listener / roll-up split in notes/anthropic-tia-scaling.md.
+Runs are recorded as journal files (journal.py): append-only, one file per
+run, any number of writers. map.sqlite is derived from them by rollup(), the
+only writer of the map, and is read by the selector:
 
-Journal — append-only, any writer, never updated after the fact:
-  runs          one row per recorded pytest session: provenance (commit, the
-                files that differed from HEAD with content hashes at start and
-                end of the run, recorder fingerprint), scope, timing, counts
-  observations  one row per (run, test): outcome, duration, dependency set
+  runs          one row per rolled-up run: its journal key, provenance (commit,
+                the files that differed from HEAD with content hashes at start
+                and end of the run, recorder fingerprint), scope, mode,
+                worktree, counts, and the rollup that folded it
+  history       one row per (run, test): outcome, duration, and the dependency
+                set when the run recorded coverage (NULL when it did not) —
+                the per-test result history
   dep_sets      content-addressed sets of project functions, shared between
-  dep_members   observations, so an unchanged dependency set costs one row
-
-Roll-up — derived from the journal by fold_run(), rebuildable from scratch
-with rebuild_rollup():
-  tests         current view per test: latest observation, dependency set,
-                first/last run, counters, retirement
-  current_links view over tests x dep_members: the inverted map the selector
-                reads. Nothing but the fold reads observations.
+  dep_members   history rows, so an unchanged dependency set costs one row
+  blobs         content of files that were dirty at observation
+  tests         current view per test: latest outcome and duration, the
+                dependency set and the run it came from (`deps_run`: the tree
+                that evidence was observed on), first/last run, counters,
+                retirement
+  current_links view over tests x dep_members: the inverted map
+  meta          schema version; the last rollup's sequence number, run and
+                commit
 
 Interned: files, funcs ((file, qualname, lineno) -> int).
 
-Concurrency: WAL plus one write transaction per run. Several writers (agent
-worktrees, xdist workers, a daemon child and a CI job) serialize on the
-SQLite write lock and never clobber each other, because a run only ever
-appends and the fold is idempotent per run.
+rollup() folds every pending journal file in one write transaction, then
+moves the files to journal/consumed/. Runs are keyed by their journal key, so
+a rollup interrupted between its commit and the move never folds a run twice;
+concurrent rollups serialize on the write lock and readers are never blocked
+(WAL). fold_run() is the one fold, used by rollup() and, from history alone,
+by rebuild_rollup().
 """
 
 from __future__ import annotations
@@ -33,9 +40,12 @@ import os
 import sqlite3
 import struct
 import time
+from pathlib import Path
 
-SCHEMA_VERSION = 2
-COLLECTION = "__collection__"  # pseudo-test: code executed at import/collection time
+from fastest import journal
+
+SCHEMA_VERSION = 3
+COLLECTION = journal.COLLECTION  # pseudo-test: code executed at import/collection time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -48,15 +58,21 @@ CREATE TABLE IF NOT EXISTS funcs (
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
+    journal_key TEXT,        -- the journal file it was folded from
     started_at REAL, finished_at REAL,
     scope TEXT,              -- 'full' | 'partial' | 'collect'
+    mode TEXT,               -- 'coverage' | 'results'
     commit_sha TEXT,         -- HEAD when the run started; NULL outside git
+    worktree TEXT,           -- the checkout that ran it
     dirty_files TEXT,        -- JSON {path: [hash_at_start, hash_at_end]}
     tree_changed INTEGER,    -- HEAD moved or the dirty set changed mid-run
     recorder TEXT,           -- recorder fingerprint (fastest/python/pytest)
     args TEXT,               -- JSON: pytest invocation args
-    n_collected INTEGER, n_observed INTEGER
+    n_collected INTEGER, n_observed INTEGER,
+    collect_errors TEXT,     -- JSON {node id: last line of the error}
+    rollup_seq INTEGER       -- the rollup that folded it
 );
+CREATE UNIQUE INDEX IF NOT EXISTS runs_by_key ON runs(journal_key);
 CREATE TABLE IF NOT EXISTS blobs (   -- content of files that were dirty at observation
     hash TEXT PRIMARY KEY, content BLOB
 );
@@ -70,16 +86,17 @@ CREATE TABLE IF NOT EXISTS dep_members (
 CREATE INDEX IF NOT EXISTS dep_members_by_func ON dep_members(func_id);
 CREATE TABLE IF NOT EXISTS tests (
     id INTEGER PRIMARY KEY, test_id TEXT UNIQUE,
-    status TEXT, duration REAL, mapped INTEGER, deps_set INTEGER,
+    status TEXT, duration REAL, mapped INTEGER, deps_set INTEGER, deps_run INTEGER,
     first_run INTEGER, last_run INTEGER, retired_run INTEGER,
     n_obs INTEGER NOT NULL DEFAULT 0, n_failed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tests_by_set ON tests(deps_set);
-CREATE TABLE IF NOT EXISTS observations (
-    run_id INTEGER, test_id INTEGER, status TEXT, duration REAL, deps_set INTEGER,
+CREATE TABLE IF NOT EXISTS history (
+    run_id INTEGER, test_id INTEGER, status TEXT, duration REAL,
+    deps_set INTEGER,        -- NULL: the run recorded no coverage
     PRIMARY KEY (run_id, test_id)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS observations_by_test ON observations(test_id);
+CREATE INDEX IF NOT EXISTS history_by_test ON history(test_id);
 CREATE VIEW IF NOT EXISTS current_links AS
     SELECT t.id AS test_id, m.func_id
     FROM tests t JOIN dep_members m ON m.set_id = t.deps_set
@@ -87,14 +104,15 @@ CREATE VIEW IF NOT EXISTS current_links AS
 """
 
 RUN_COLUMNS = (
-    "id", "started_at", "finished_at", "scope", "commit_sha", "dirty_files",
-    "tree_changed", "recorder", "args", "n_collected", "n_observed",
+    "id", "journal_key", "started_at", "finished_at", "scope", "mode", "commit_sha",
+    "worktree", "dirty_files", "tree_changed", "recorder", "args", "n_collected",
+    "n_observed", "collect_errors", "rollup_seq",
 )
 
 
 _OBJECTS = {
     "meta", "files", "funcs", "runs", "blobs", "dep_sets", "dep_members", "tests",
-    "observations", "current_links",
+    "history", "current_links",
 }
 
 
@@ -116,6 +134,8 @@ def connect(path: str) -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout=30000")
     if _is_v1(con):
         _migrate_v1(con)
+    elif _is_v2(con):
+        _migrate_v2(con)
     if not _is_current(con):
         con.execute("PRAGMA journal_mode=WAL")  # persistent: set once per file
         con.executescript(SCHEMA)
@@ -127,48 +147,38 @@ def connect(path: str) -> sqlite3.Connection:
     return con
 
 
+def meta(con: sqlite3.Connection) -> dict[str, str]:
+    return dict(con.execute("SELECT key, value FROM meta"))
+
+
 # --- interning ---------------------------------------------------------------
 
-def is_project_file(filename: str, rootpath: str) -> bool:
-    return (
-        filename.startswith(rootpath)
-        and "site-packages" not in filename
-        and not filename.startswith("<")
-    )
-
-
-def _dep_key(dep) -> tuple[str, str, int]:
-    """Accept code objects (the recorder) or (filename, qualname, lineno) tuples."""
-    if hasattr(dep, "co_filename"):
-        return (dep.co_filename, dep.co_qualname, dep.co_firstlineno)
-    return tuple(dep)  # type: ignore[return-value]
-
-
 class _Interner:
-    def __init__(self, con: sqlite3.Connection, rootpath: str):
-        self.con, self.rootpath = con, rootpath
+    """(path relative to the worktree, qualname, lineno) -> funcs.id"""
+
+    def __init__(self, con: sqlite3.Connection):
+        self.con = con
         self._files: dict[str, int] = {}
         self._funcs: dict[tuple, int] = {}
 
-    def file_id(self, filename: str) -> int:
-        fid = self._files.get(filename)
+    def file_id(self, path: str) -> int:
+        fid = self._files.get(path)
         if fid is None:
-            rel = os.path.relpath(filename, self.rootpath)
-            fid = self._files[filename] = self.con.execute(
+            fid = self._files[path] = self.con.execute(
                 "INSERT INTO files(path) VALUES(?) "
                 "ON CONFLICT DO UPDATE SET path=path RETURNING id",
-                (rel,),
+                (path,),
             ).fetchone()[0]
         return fid
 
-    def func_id(self, key: tuple[str, str, int]) -> int:
+    def func_id(self, path: str, qualname: str, lineno: int) -> int:
+        key = (path, qualname, lineno)
         fid = self._funcs.get(key)
         if fid is None:
-            filename, qualname, lineno = key
             fid = self._funcs[key] = self.con.execute(
                 "INSERT INTO funcs(file_id, qualname, lineno) VALUES(?,?,?) "
                 "ON CONFLICT DO UPDATE SET qualname=qualname RETURNING id",
-                (self.file_id(filename), qualname, lineno),
+                (self.file_id(path), qualname, lineno),
             ).fetchone()[0]
         return fid
 
@@ -204,73 +214,130 @@ def set_members(con: sqlite3.Connection, set_id: int) -> list[int]:
     )]
 
 
-# --- journal -----------------------------------------------------------------
+# --- rollup ------------------------------------------------------------------
 
-def record_run(path: str, rootpath: str, records: dict, run: dict) -> dict:
-    """Append one run and its observations, then fold it into the roll-up.
+def rollup(path, jdir) -> dict:
+    """Fold every pending journal file into the map in one write transaction,
+    in the order the runs finished; then record the rolled-up commit and run
+    in meta and move the files to consumed/. With nothing pending the map is
+    not even opened.
 
-    records: {test_id: (duration, status, deps)} where deps is an iterable of
-             code objects or (filename, qualname, lineno) tuples; the
-             COLLECTION pseudo-test carries import/collection-time code.
-    run:     {'started_at', 'finished_at', 'scope', 'commit', 'dirty_files',
-              'blobs', 'tree_changed', 'recorder', 'args', 'n_collected'}
-             where blobs is {hash: bytes} for the dirty files' observed content.
-    Returns {'run_id', 'n_tests', 'n_funcs', 'n_new_sets'}.
-    """
-    con = connect(path)
+    Returns {'rolled_up', 'rollup_seq', 'runs': [{'run_id', 'key', 'mode',
+    'scope', 'n_tests', 'n_new_sets'}], 'already_folded', 'corrupt',
+    'commit', 'n_funcs', 'wall_s'}."""
+    t0 = time.monotonic()
+    out: dict = {"rolled_up": 0, "rollup_seq": None, "runs": [], "already_folded": 0,
+                 "corrupt": [], "commit": None}
+    if not journal.pending(jdir):
+        return out | {"wall_s": round(time.monotonic() - t0, 3)}
+    con = connect(str(path))
+    folded, done, bad = [], [], []
     try:
-        with con:
+        con.execute("BEGIN IMMEDIATE")  # one rollup at a time
+        entries = []
+        for f in journal.pending(jdir):  # listed again under the lock
+            try:
+                run = journal.read_run(f)
+            except (sqlite3.DatabaseError, ValueError, FileNotFoundError):
+                bad.append(f)
+                continue
+            if run["format"] != journal.FORMAT:
+                bad.append(f)
+                continue
+            entries.append((run["finished_at"] or 0.0, run["key"], f, run))
+        entries.sort(key=lambda e: e[:2])
+        seq = int(meta(con).get("rollup_seq") or 0) + 1
+        for _, key, f, run in entries:
+            if con.execute("SELECT 1 FROM runs WHERE journal_key=?", (key,)).fetchone():
+                done.append(f)  # folded by a rollup that died before moving it
+                continue
+            src = journal.open_ro(f)
+            try:
+                folded.append((f, run, _fold_file(con, src, run, seq)))
+            finally:
+                src.close()
+        if folded:
+            _, last_run, last = folded[-1]
             con.executemany(
-                "INSERT OR IGNORE INTO blobs(hash, content) VALUES (?,?)",
-                [(h, c) for h, c in (run.get("blobs") or {}).items() if c is not None],
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+                [("rollup_seq", str(seq)), ("rollup_run", str(last["run_id"])),
+                 ("rollup_commit", last_run["commit_sha"] or ""),
+                 ("rolled_up_at", repr(time.time())),
+                 ("rootpath", (last_run["worktree"] or "") + os.sep)],
             )
-            run_id = con.execute(
-                "INSERT INTO runs(started_at, finished_at, scope, commit_sha, dirty_files, "
-                "tree_changed, recorder, args, n_collected) VALUES (?,?,?,?,?,?,?,?,?) "
-                "RETURNING id",
-                (
-                    run.get("started_at"), run.get("finished_at", time.time()),
-                    run.get("scope", "partial"), run.get("commit"),
-                    json.dumps(run.get("dirty_files") or {}, sort_keys=True),
-                    int(bool(run.get("tree_changed"))), run.get("recorder"),
-                    json.dumps(list(run.get("args") or [])), run.get("n_collected"),
-                ),
-            ).fetchone()[0]
-            interner = _Interner(con, rootpath)
-            n_tests = n_new_sets = 0
-            for test_id, (duration, status, deps) in records.items():
-                keys = (_dep_key(d) for d in deps)
-                func_ids = [
-                    interner.func_id(k) for k in keys if is_project_file(k[0], rootpath)
-                ]
-                set_id, created = intern_set(con, func_ids)
-                n_new_sets += created
-                con.execute(
-                    "INSERT INTO observations(run_id, test_id, status, duration, deps_set) "
-                    "VALUES (?,?,?,?,?)",
-                    (run_id, intern_test(con, test_id), status, duration, set_id),
-                )
-                n_tests += test_id != COLLECTION
-            fold_run(con, run_id)
-            con.execute("UPDATE runs SET n_observed=? WHERE id=?", (n_tests, run_id))
-            con.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('rootpath', ?)", (rootpath,)
-            )
-            n_funcs = con.execute("SELECT COUNT(*) FROM funcs").fetchone()[0]
+            out["rollup_seq"], out["commit"] = seq, last_run["commit_sha"]
+        out["n_funcs"] = con.execute("SELECT COUNT(*) FROM funcs").fetchone()[0]
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
     finally:
         con.close()
-    return {"run_id": run_id, "n_tests": n_tests, "n_funcs": n_funcs, "n_new_sets": n_new_sets}
+    journal.consume(jdir, [f for f, _, _ in folded] + done)
+    journal.quarantine(jdir, bad)
+    out.update(
+        rolled_up=len(folded), runs=[stats for _, _, stats in folded],
+        already_folded=len(done), corrupt=[Path(f).name for f in bad],
+        wall_s=round(time.monotonic() - t0, 3),
+    )
+    return out
 
 
-# --- roll-up -----------------------------------------------------------------
+def _fold_file(con: sqlite3.Connection, src: sqlite3.Connection, run: dict, seq: int) -> dict:
+    """Append one journal file's run and history rows, then fold it."""
+    run_id = con.execute(
+        "INSERT INTO runs(journal_key, started_at, finished_at, scope, mode, commit_sha, "
+        "worktree, dirty_files, tree_changed, recorder, args, n_collected, n_observed, "
+        "collect_errors, rollup_seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+        (
+            run["key"], run["started_at"], run["finished_at"], run["scope"], run["mode"],
+            run["commit_sha"], run["worktree"], json.dumps(run["dirty_files"], sort_keys=True),
+            int(run["tree_changed"]), run["recorder"], json.dumps(run["args"]),
+            run["n_collected"], run["n_observed"],
+            json.dumps(run["collect_errors"], sort_keys=True), seq,
+        ),
+    ).fetchone()[0]
+    con.executemany(
+        "INSERT OR IGNORE INTO blobs(hash, content) VALUES (?,?)",
+        src.execute("SELECT hash, content FROM blobs"),
+    )
+    interner = _Interner(con)
+    func_ids = {
+        jid: interner.func_id(p, q, ln)
+        for jid, p, q, ln in src.execute("SELECT id, path, qualname, lineno FROM funcs")
+    }
+    deps: dict[int, list[int]] = {}
+    for t, f in src.execute("SELECT test, func FROM links"):
+        deps.setdefault(t, []).append(func_ids[f])
+    rows, n_tests, n_new = [], 0, 0
+    for jid, test_id, status, duration, mapped in src.execute(
+        "SELECT id, test_id, status, duration, mapped FROM tests"
+    ):
+        set_id = None
+        if mapped is not None:  # coverage recorded: the test's dependency set
+            set_id, created = intern_set(con, deps.get(jid, ()))
+            n_new += created
+        rows.append((run_id, intern_test(con, test_id), status, duration, set_id))
+        n_tests += test_id != COLLECTION
+    con.executemany(
+        "INSERT INTO history(run_id, test_id, status, duration, deps_set) VALUES (?,?,?,?,?)",
+        rows,
+    )
+    fold_run(con, run_id)
+    return {"run_id": run_id, "key": run["key"], "mode": run["mode"], "scope": run["scope"],
+            "n_tests": n_tests, "n_new_sets": n_new}
+
 
 def fold_run(con: sqlite3.Connection, run_id: int) -> None:
-    """Fold one run's observations into the current view. Runs must be folded
-    in id order; rebuild_rollup() replays them all through this same function.
+    """Fold one run's history rows into the current view. Runs must be folded
+    in id order; rebuild_rollup() replays them all through this function.
 
     Rules:
-      * an observed test takes the run's outcome, duration and dependency set,
-        and is un-retired;
+      * an observed test takes the run's outcome and duration and is
+        un-retired; its dependency set, and the run that set came from
+        (`deps_run`), change only when the run recorded coverage — a
+        results-only observation never moves a test's evidence to a tree
+        whose dependencies nobody observed;
       * a 'full' run retires tests that were not observed although their module
         was (deleted/renamed tests); tests in modules that did not collect at
         all keep their last evidence, which is what surfaces the breakage;
@@ -281,8 +348,8 @@ def fold_run(con: sqlite3.Connection, run_id: int) -> None:
     scope = con.execute("SELECT scope FROM runs WHERE id=?", (run_id,)).fetchone()[0]
     coll_tid = intern_test(con, COLLECTION)
     rows = con.execute(
-        "SELECT o.test_id, o.status, o.duration, o.deps_set, s.size "
-        "FROM observations o JOIN dep_sets s ON s.id=o.deps_set WHERE o.run_id=?",
+        "SELECT h.test_id, h.status, h.duration, h.deps_set, s.size "
+        "FROM history h LEFT JOIN dep_sets s ON s.id=h.deps_set WHERE h.run_id=?",
         (run_id,),
     ).fetchall()
     coll_set = None
@@ -290,11 +357,19 @@ def fold_run(con: sqlite3.Connection, run_id: int) -> None:
         if tid == coll_tid:
             coll_set = set_id
             continue
+        if set_id is None:
+            con.execute(
+                "UPDATE tests SET status=?, duration=?, last_run=?, retired_run=NULL, "
+                "first_run=COALESCE(first_run, ?), n_obs=n_obs+1, n_failed=n_failed+? "
+                "WHERE id=?",
+                (status, duration, run_id, run_id, int(status == "failed"), tid),
+            )
+            continue
         con.execute(
-            "UPDATE tests SET status=?, duration=?, mapped=?, deps_set=?, last_run=?, "
-            "retired_run=NULL, first_run=COALESCE(first_run, ?), n_obs=n_obs+1, "
-            "n_failed=n_failed+? WHERE id=?",
-            (status, duration, int(size > 0), set_id, run_id, run_id,
+            "UPDATE tests SET status=?, duration=?, mapped=?, deps_set=?, deps_run=?, "
+            "last_run=?, retired_run=NULL, first_run=COALESCE(first_run, ?), "
+            "n_obs=n_obs+1, n_failed=n_failed+? WHERE id=?",
+            (status, duration, int(size > 0), set_id, run_id, run_id, run_id,
              int(status == "failed"), tid),
         )
     if scope == "full":
@@ -317,18 +392,19 @@ def fold_run(con: sqlite3.Connection, run_id: int) -> None:
                     con, set_members(con, current) + set_members(con, coll_set)
                 )
         con.execute(
-            "UPDATE tests SET deps_set=?, last_run=?, status='collection', mapped=1, "
-            "first_run=COALESCE(first_run, ?) WHERE id=?",
-            (new_set, run_id, run_id, coll_tid),
+            "UPDATE tests SET deps_set=?, deps_run=?, last_run=?, status='collection', "
+            "mapped=1, first_run=COALESCE(first_run, ?) WHERE id=?",
+            (new_set, run_id, run_id, run_id, coll_tid),
         )
 
 
 def rebuild_rollup(con: sqlite3.Connection) -> int:
-    """Recompute the whole current view from the journal. Returns runs folded."""
+    """Recompute the whole current view from history. Returns runs folded."""
     with con:
         con.execute(
             "UPDATE tests SET status=NULL, duration=NULL, mapped=NULL, deps_set=NULL, "
-            "first_run=NULL, last_run=NULL, retired_run=NULL, n_obs=0, n_failed=0"
+            "deps_run=NULL, first_run=NULL, last_run=NULL, retired_run=NULL, n_obs=0, "
+            "n_failed=0"
         )
         run_ids = [r for (r,) in con.execute("SELECT id FROM runs ORDER BY id")]
         for run_id in run_ids:
@@ -342,6 +418,7 @@ def _run_dict(row) -> dict:
     d = dict(zip(RUN_COLUMNS, row))
     d["dirty_files"] = json.loads(d["dirty_files"] or "{}")
     d["args"] = json.loads(d["args"] or "[]")
+    d["collect_errors"] = json.loads(d["collect_errors"] or "{}")
     d["tree_changed"] = bool(d["tree_changed"])
     return d
 
@@ -364,16 +441,17 @@ def last_full_run(con: sqlite3.Connection) -> dict | None:
 
 
 def contributing_runs(con: sqlite3.Connection) -> list[dict]:
-    """Runs whose evidence is still live: the last full run and everything
-    after it (or every run, if no full run has been recorded), plus any older
-    run that is still the last observation of a live test (a module that did
-    not collect in the full run keeps its earlier evidence)."""
+    """Runs whose coverage evidence is still live: the last full run and every
+    coverage run after it (or every coverage run, if no full run has been
+    recorded), plus any older run that is still some live test's `deps_run`
+    (a module that did not collect in the full run keeps its earlier
+    evidence). Results-only runs carry no evidence to diff against."""
     full = last_full_run(con)
-    live = runs(con, since_id=full["id"] if full else None)
+    live = [r for r in runs(con, since_id=full["id"] if full else None) if r["mode"] != "results"]
     ids = {r["id"] for r in live}
     older = [r for (r,) in con.execute(
-        "SELECT DISTINCT last_run FROM tests WHERE retired_run IS NULL "
-        "AND last_run IS NOT NULL AND last_run < ?", (min(ids) if ids else 0,)
+        "SELECT DISTINCT deps_run FROM tests WHERE retired_run IS NULL "
+        "AND deps_run IS NOT NULL AND deps_run < ?", (min(ids) if ids else 0,)
     )]
     if older:
         placeholders = ",".join("?" * len(older))
@@ -402,8 +480,47 @@ def _is_v1(con: sqlite3.Connection) -> bool:
     return "deps_set" not in cols
 
 
+def _is_v2(con: sqlite3.Connection) -> bool:
+    names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return "observations" in names and "history" not in names
+
+
+def _migrate_v2(con: sqlite3.Connection) -> None:
+    """v2 (journal tables inside the map, folded by each writer) -> v3 (the map
+    is the roll-up of journal files): observations become history, every v2
+    run had coverage and counts as its own rollup."""
+    con.executescript("""
+        BEGIN;
+        ALTER TABLE runs ADD COLUMN journal_key TEXT;
+        ALTER TABLE runs ADD COLUMN mode TEXT;
+        ALTER TABLE runs ADD COLUMN worktree TEXT;
+        ALTER TABLE runs ADD COLUMN collect_errors TEXT;
+        ALTER TABLE runs ADD COLUMN rollup_seq INTEGER;
+        UPDATE runs SET mode='coverage', rollup_seq=id, collect_errors='{}',
+            worktree=(SELECT rtrim(value, '/') FROM meta WHERE key='rootpath');
+        ALTER TABLE observations RENAME TO history;
+        DROP INDEX IF EXISTS observations_by_test;
+        ALTER TABLE tests ADD COLUMN deps_run INTEGER;
+        UPDATE tests SET deps_run=last_run WHERE deps_set IS NOT NULL;
+        COMMIT;
+    """)
+    con.executescript(SCHEMA)
+    with con:
+        last = con.execute("SELECT id, commit_sha FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        if last:
+            con.executemany(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+                [("rollup_seq", str(last[0])), ("rollup_run", str(last[0])),
+                 ("rollup_commit", last[1] or "")],
+            )
+        con.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+
+
 def _migrate_v1(con: sqlite3.Connection) -> None:
-    """v1 (one replaced-in-place map) -> v2: the old map becomes run #1, a
+    """v1 (one replaced-in-place map) -> v3: the old map becomes run #1, a
     full run of unknown commit, so nothing observed is lost."""
     con.executescript(
         "ALTER TABLE tests RENAME TO tests_v1; ALTER TABLE links RENAME TO links_v1;"
@@ -412,9 +529,11 @@ def _migrate_v1(con: sqlite3.Connection) -> None:
     now = time.time()
     with con:
         run_id = con.execute(
-            "INSERT INTO runs(started_at, finished_at, scope, commit_sha, dirty_files, "
-            "tree_changed, recorder, args) VALUES (?,?,?,?,?,?,?,?) RETURNING id",
-            (now, now, "full", None, "{}", 0, "migrated-from-schema-v1", "[]"),
+            "INSERT INTO runs(started_at, finished_at, scope, mode, commit_sha, dirty_files, "
+            "tree_changed, recorder, args, collect_errors, rollup_seq) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id",
+            (now, now, "full", "coverage", None, "{}", 0, "migrated-from-schema-v1", "[]",
+             "{}", 1),
         ).fetchone()[0]
         n = 0
         for tid_v1, test_id, duration, status in con.execute(
@@ -425,7 +544,7 @@ def _migrate_v1(con: sqlite3.Connection) -> None:
             )]
             set_id, _ = intern_set(con, func_ids)
             con.execute(
-                "INSERT INTO observations(run_id, test_id, status, duration, deps_set) "
+                "INSERT INTO history(run_id, test_id, status, duration, deps_set) "
                 "VALUES (?,?,?,?,?)",
                 (run_id, intern_test(con, test_id), status, duration, set_id),
             )
@@ -433,5 +552,9 @@ def _migrate_v1(con: sqlite3.Connection) -> None:
         fold_run(con, run_id)
         con.execute(
             "UPDATE runs SET n_observed=?, n_collected=? WHERE id=?", (n, n, run_id)
+        )
+        con.executemany(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+            [("rollup_seq", "1"), ("rollup_run", str(run_id)), ("rollup_commit", "")],
         )
     con.executescript("DROP TABLE tests_v1; DROP TABLE links_v1;")

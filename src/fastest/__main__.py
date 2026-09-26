@@ -1,10 +1,13 @@
 """Agent-facing CLI (PoC Phase 5).
 
   python -m fastest affected [--base REV]             what would run, and why — JSON
-  python -m fastest run [--base REV] [--no-record]    select + execute + JSON results
+  python -m fastest run [--base REV] [--no-cov]       select + execute + JSON results
+                        [--no-record]
   python -m fastest audit [--base REV]                select, then run everything and
                                                       report every status change the
                                                       selection skipped, with receipts
+  python -m fastest rollup                            fold pending journal files into
+                                                      the map
   python -m fastest daemon                            start the warm daemon
   python -m fastest stop                              stop the daemon
 
@@ -14,15 +17,21 @@ spawning pytest. Output is a single JSON document on stdout, built for a
 token budget: tracebacks truncated, failures grouped by exception line, skip
 receipts aggregated by reason.
 
+Every run appends one journal file and nothing but `rollup` writes the map;
+affected, run and audit roll pending files up before they select (--no-rollup
+to skip), so a run counts as soon as the next command reads the map. A run
+records coverage unless --no-cov, which still appends its outcomes and
+durations; --no-record appends nothing.
+
 Every result carries `evidence`: which runs and commits the map comes from,
-how far behind HEAD it is, and the trees the diff was taken against (the
-evidence's own, unless --base is given). A run is appended to the journal as
-a partial run, refreshing exactly the tests it executed, unless --no-record.
-Every run result carries a `conservation` block — collected, selected,
-run_all, skipped and executed counts, and whether they balance — and a
-status that is 'error' when pytest exits 2-5 or a module fails to collect,
-'inconsistent' when the counts do not balance, never 'passed' for a run
-that silently did less than asked.
+how far behind HEAD it is, the trees the diff was taken against (the
+evidence's own, unless --base is given), and how much of the journal is
+still pending. Every run result carries a `conservation` block — collected,
+selected, run_all, skipped and executed counts, and whether they balance —
+and a status that is 'error' when pytest exits 2-5 or a module fails to
+collect, 'inconsistent' when the counts do not balance, never 'passed' for a
+run that silently did less than asked; `recorded` and `record_ok` show that
+the journal saw exactly what ran.
 """
 
 from __future__ import annotations
@@ -37,16 +46,28 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from fastest import journal, provenance
 from fastest.select import select
+
+
+def roll_up(repo: Path) -> dict:
+    """Fold pending journal files into the map: lazily, before every
+    selection, so a run's evidence counts as soon as the next command reads
+    the map. The selector itself only reads."""
+    from fastest import mapdb
+
+    return mapdb.rollup(journal.map_path(repo), journal.journal_dir(repo))
 
 
 def cmd_affected(args) -> dict:
     repo = Path.cwd()
-    db = repo / ".fastest" / "map.sqlite"
+    db, jdir = journal.map_path(repo), journal.journal_dir(repo)
+    rolled = roll_up(repo) if getattr(args, "rollup", True) else None
     if not db.exists():
         return {
             "error": "no coverage map",
-            "hint": "build one with: pytest --fastest-cov",
+            "hint": "build one with: pytest --fastest-cov (then fastest rollup)",
+            "pending_journal_files": len(journal.pending(jdir)),
         }
     sel = select(db, repo, args.base)
     if "error" in sel:
@@ -64,7 +85,10 @@ def cmd_affected(args) -> dict:
         "selected_files": sel.get("selected_files", {}),
         "vanished": sel.get("vanished", []),
         "targets": sel["targets"],
-        "evidence": sel["evidence"],
+        "evidence": sel["evidence"] | {"journal": {
+            "rolled_up_now": rolled["rolled_up"] if rolled else 0,
+            "pending": len(journal.pending(jdir)),
+        }},
         "skip_receipt": skip_receipt(sel),
     }
 
@@ -219,15 +243,33 @@ def conservation(aff: dict, results: list[dict]) -> dict:
     return block
 
 
-def latest_recorded_run(repo: Path) -> dict | None:
-    from fastest import mapdb
+def recorded_run(repo: Path, key: str) -> dict | None:
+    """The journal file a run wrote under `key`, pending or already rolled up."""
+    path = journal.find(journal.journal_dir(repo), key)
+    return journal.read_run(path) if path else None
 
-    con = mapdb.connect(str(repo / ".fastest" / "map.sqlite"))
-    try:
-        runs = mapdb.runs(con)
-    finally:
-        con.close()
-    return runs[-1] if runs else None
+
+def append_results(repo: Path, jdir: Path, key: str, targets: list[str], results: list[dict],
+                   resp: dict, snap: dict, started: float) -> None:
+    """A run without coverage still appends: outcomes and durations, no
+    dependency evidence, with the same provenance a recorded run carries."""
+    journal.append(
+        jdir, str(repo) + os.sep,
+        {r["id"]: (r["duration_s"], r["status"], None) for r in results},
+        {
+            "started_at": started, "finished_at": time.time(), "scope": "partial",
+            "mode": "results", "worktree": str(repo),
+            **provenance.between(snap, provenance.snapshot(repo)),
+            "recorder": provenance.recorder_fingerprint(), "args": targets,
+            "n_collected": None,
+            "collect_errors": {
+                e["id"]: (e["longrepr"].strip().splitlines() or ["collection error"])[-1][:300]
+                for e in resp.get("collect_errors", [])
+            },
+            "collect_skipped": resp.get("collect_skipped", []),
+        },
+        key=key,
+    )
 
 
 def cmd_run(args) -> dict:
@@ -254,8 +296,16 @@ def cmd_run(args) -> dict:
         }
         return out
 
-    extra = ["--fastest-cov"] if args.record else []
-    before = latest_recorded_run(repo) if args.record else None
+    # every run appends to the journal (unless --no-record): with coverage the
+    # recorder writes the file; without, this process writes the outcomes
+    mode = ("coverage" if args.cov else "results") if args.record else None
+    key = journal.new_key() if mode else None
+    jdir = journal.journal_dir(repo)
+    extra = (
+        ["--fastest-cov", "--fastest-journal", str(jdir), "--fastest-journal-key", key]
+        if mode == "coverage" else []
+    )
+    snap, started = (provenance.snapshot(repo), time.time()) if mode == "results" else (None, None)
     resp = run_via_daemon(aff["targets"], extra)
     out["executor"] = "daemon" if resp else "subprocess"
     if resp and (resp.get("stale") or "error" in resp):
@@ -270,6 +320,8 @@ def cmd_run(args) -> dict:
     if resp is None:
         resp = run_via_subprocess(aff["targets"], extra)
     results = resp.get("results", [])
+    if mode == "results":
+        append_results(repo, jdir, key, aff["targets"], results, resp, snap, started)
     failures = [r for r in results if r["status"] == "failed"]
     out["failures"] = group_failures(failures)  # passes are summarized, not listed
     ran = len(results)
@@ -316,16 +368,15 @@ def cmd_run(args) -> dict:
     }
     if "pytest_output" in resp:
         out["pytest_output"] = resp["pytest_output"]
-    if args.record:
+    if key:
         # in == out, part 2: the run we executed must be the run the journal saw
-        after = latest_recorded_run(repo)
-        recorded = after if after and (before is None or after["id"] != before["id"]) else None
+        rec = recorded_run(repo, key)
         out["summary"]["recorded"] = (
-            {"run_id": recorded["id"], "scope": recorded["scope"],
-             "n_observed": recorded["n_observed"]}
-            if recorded else None
+            {"journal": key, "mode": rec["mode"], "scope": rec["scope"],
+             "n_observed": rec["n_observed"]}
+            if rec else None
         )
-        out["summary"]["record_ok"] = bool(recorded) and recorded["n_observed"] == ran
+        out["summary"]["record_ok"] = bool(rec) and rec["n_observed"] == ran
     return out
 
 
@@ -333,12 +384,23 @@ def cmd_audit(args) -> dict:
     from fastest.audit import audit
 
     repo = Path.cwd()
-    if not (repo / ".fastest" / "map.sqlite").exists():
-        return {"error": "no coverage map", "hint": "build one with: pytest --fastest-cov"}
+    if args.rollup:
+        roll_up(repo)
+    if not journal.map_path(repo).exists():
+        return {"error": "no coverage map",
+                "hint": "build one with: pytest --fastest-cov (then fastest rollup)"}
     raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
-                record=args.record)
+                record=args.record, rollup=False)
     res.pop("statuses", None)  # per-test statuses are for harnesses, not the agent
+    return res
+
+
+def cmd_rollup(args) -> dict:
+    repo = Path.cwd()
+    res = roll_up(repo)
+    res["map"] = str(journal.map_path(repo))
+    res["pending"] = len(journal.pending(journal.journal_dir(repo)))
     return res
 
 
@@ -351,10 +413,15 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--base", default=None,
                        help="diff base (default: the commits the evidence was observed at)")
+        p.add_argument("--rollup", action=argparse.BooleanOptionalAction, default=True,
+                       help="fold pending journal files into the map first (default: on)")
         if name == "run":
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
                            help="append this run to the journal, refreshing the tests it "
                                 "runs (default: on)")
+            p.add_argument("--cov", action=argparse.BooleanOptionalAction, default=True,
+                           help="record per-test coverage; --no-cov still appends outcomes "
+                                "and durations (default: on)")
         if name == "audit":
             p.add_argument("--pytest-args", default=None,
                            help="extra pytest arguments for the full run "
@@ -365,6 +432,7 @@ def main():
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=False,
                            help="append the full run to the journal instead of a temporary "
                                 "database (default: off — an audit never feeds the map)")
+    sub.add_parser("rollup")
     sub.add_parser("daemon")
     sub.add_parser("stop")
     args = ap.parse_args()
@@ -387,6 +455,8 @@ def main():
         print(json.dumps(cmd_run(args), indent=2))
     elif args.cmd == "audit":
         print(json.dumps(cmd_audit(args), indent=2))
+    elif args.cmd == "rollup":
+        print(json.dumps(cmd_rollup(args), indent=2))
 
 
 if __name__ == "__main__":

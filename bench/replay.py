@@ -24,11 +24,13 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from fastest import journal  # noqa: E402
 from fastest.audit import audit, observe  # noqa: E402
 
 
@@ -39,9 +41,12 @@ def git(repo: Path, *args: str) -> str:
 
 
 def build_map(repo: Path, py: str, extra: list[str]) -> int:
-    """A fresh map from one full recorded run of the checked-out commit."""
-    for p in (repo / ".fastest").glob("map.sqlite*"):
+    """A fresh map from one full recorded run of the checked-out commit (the
+    next audit rolls its journal file up)."""
+    db = journal.map_path(repo)
+    for p in db.parent.glob(db.name + "*"):
         p.unlink()
+    shutil.rmtree(journal.journal_dir(repo), ignore_errors=True)
     return subprocess.run(
         [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--fastest-cov", *extra],
         cwd=repo, capture_output=True, text=True,
