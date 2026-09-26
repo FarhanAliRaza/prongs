@@ -52,9 +52,32 @@ def pytest_addoption(parser):
     parser.addoption("--fastest-journal-key", default=None, help="name of this run's journal file")
 
 
-def pytest_configure(config):
-    if config.getoption("--fastest-cov") or os.environ.get("FASTEST_COV") == "1":
+def _enabled(config) -> bool:
+    ns = getattr(config, "known_args_namespace", None)  # all an early config has parsed
+    return (
+        bool(getattr(ns, "fastest_cov", False))
+        or bool(getattr(config.option, "fastest_cov", False))
+        or os.environ.get("FASTEST_COV") == "1"
+    )
+
+
+def _start(config) -> None:
+    if _enabled(config) and not config.pluginmanager.has_plugin("fastest-cov"):
         config.pluginmanager.register(FastestCov(config), "fastest-cov")
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_load_initial_conftests(early_config, parser, args):
+    # start recording before any other plugin's start-up code runs:
+    # pytest-django calls django.setup() in this hook and DRF-style conftests
+    # in pytest_configure, and the models, settings and registries they
+    # import are import-time code every test depends on
+    _start(early_config)
+    return (yield)
+
+
+def pytest_configure(config):
+    _start(config)  # plugins loaded too late for the early hook (-p, in-process)
 
 
 def classify_scope(config) -> str:
@@ -109,7 +132,6 @@ class FastestCov:
         self.collect_skipped: list[str] = []
         self.n_collected = 0
         self.started_at = time.time()
-        self.scope = classify_scope(config)
         self.snapshot_start = provenance.snapshot(config.rootpath)
         MON.use_tool_id(TOOL_ID, "fastest")
         MON.register_callback(TOOL_ID, MON.events.PY_START, self._on_start)
@@ -136,9 +158,9 @@ class FastestCov:
             self.collect_skipped.append(report.nodeid)
 
     def pytest_collection_finish(self, session):
-        # everything executed so far ran at import/collection time (module
-        # bodies, decorators, class-level declarations): a pseudo-context.
-        # A diff touching any of it invalidates the whole suite.
+        # everything executed so far ran at start-up or import/collection time
+        # (app setup, module bodies, decorators, class-level declarations): a
+        # pseudo-context. A diff touching any of it invalidates the whole suite.
         self.n_collected = len(session.items)
         self.records[journal.COLLECTION] = (0.0, "collection", frozenset(self._current))
 
@@ -165,7 +187,7 @@ class FastestCov:
     def run_info(self) -> dict:
         """Provenance for this session, taken at finish."""
         n_observed = len(self.records) - (journal.COLLECTION in self.records)
-        scope = self.scope
+        scope = classify_scope(self.config)  # at finish: the config is complete
         if scope == "full" and (n_observed < self.n_collected or self.n_collected == 0):
             scope = "partial"  # -x, interrupt, or nothing collected: no proof of completeness
         return {
