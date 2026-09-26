@@ -12,7 +12,11 @@ audit() splits the unselected changes: a first-order miss still differs when
 run alone (the selector's fault — the kill criterion); second-order pollution
 passes alone (fallout from an already-selected failure, e.g. a broken
 teardown's unraisable exception landing on whichever test runs next), which
-fork-per-test isolation fixes, not selection.
+fork-per-test isolation fixes, not selection. Each first-order miss is then
+run alone once more with the mutation reverted: if it fails there too, the
+mutation is not what moved it (environment drift — wagtail's upload tests
+fail on any run after the first, because the files the first run uploaded
+are still in the ignored test-media directory).
 
 The map must have been built at HEAD on a clean tree (pytest --fastest-cov):
 its recorded statuses are the baseline.
@@ -35,7 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from fastest import journal, mapdb, provenance  # noqa: E402
-from fastest.audit import audit  # noqa: E402
+from fastest.audit import audit, run_alone  # noqa: E402
 
 
 def mutate_function(repo: Path, path: str, qual: str) -> bool:
@@ -132,7 +136,16 @@ def main():
             if not mutate_function(repo, path, qual):
                 continue
             tried += 1
-            res = audit(repo, "HEAD", python=py, pytest_args=extra)
+
+            def control(tests, path=path, qual=qual):
+                """The misses run alone on the unmutated code, same checkout."""
+                subprocess.run(["git", "checkout", "-q", "--", "."], cwd=repo)
+                try:
+                    return run_alone(repo, py, extra, tests)
+                finally:
+                    mutate_function(repo, path, qual)
+
+            res = audit(repo, "HEAD", python=py, pytest_args=extra, control=control)
             if res.get("verdict") == "error":
                 print(f"[{tried}/{args.n}] {path}::{qual}: audit error: {res.get('error')}")
                 results.append({"target": f"{path}::{qual}", "error": res.get("error")})
@@ -144,6 +157,7 @@ def main():
                 "n_status_changes": res["status_changes"]["total"],
                 "misses": [m["test"] for m in res["misses"]],
                 "pollution": [p["test"] for p in res["pollution"]],
+                "drift": [d["test"] for d in res["drift"]],
                 "miss_receipts": res["misses"],
                 "wall_s": res["wall_s"],
             }
@@ -153,7 +167,8 @@ def main():
             print(
                 f"[{tried}/{args.n}] {path}::{qual}: mode={rec['mode']} "
                 f"selected {rec['n_selected']}, status-changes {rec['n_status_changes']}, "
-                f"misses {len(rec['misses'])}, pollution {len(rec['pollution'])}{flag}"
+                f"misses {len(rec['misses'])}, pollution {len(rec['pollution'])}, "
+                f"drift {len(rec['drift'])}{flag}"
                 f"  ({rec['wall_s']:.0f}s)",
                 flush=True,
             )
@@ -161,6 +176,8 @@ def main():
                 print(f"      MISSED (fails alone): {m}")
             for m in rec["pollution"]:
                 print(f"      polluted (passes alone): {m}")
+            for m in rec["drift"]:
+                print(f"      drift (fails alone without the mutation too): {m}")
     finally:
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=repo)
 
@@ -170,11 +187,12 @@ def main():
     ok = [r for r in results if "error" not in r]
     total_misses = sum(len(r["misses"]) for r in ok)
     total_pollution = sum(len(r["pollution"]) for r in ok)
+    total_drift = sum(len(r["drift"]) for r in ok)
     killed = sum(1 for r in ok if r["n_status_changes"] > 0)
     print(f"\n=== {len(results)} mutations ({len(results) - len(ok)} audit errors), "
           f"{killed} caused failures, first-order MISSES: {total_misses} "
           f"{'<<< KILL CRITERION HIT' if total_misses else '(zero — pass)'}, "
-          f"second-order pollution: {total_pollution}")
+          f"second-order pollution: {total_pollution}, environment drift: {total_drift}")
     print(f"wrote {out}")
 
 

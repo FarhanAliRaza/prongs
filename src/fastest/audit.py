@@ -17,6 +17,11 @@
      its baseline -> second-order pollution from an already-selected failure
      (a skipped cleanup, an unraisable exception landing on a later test),
      which fork-per-test isolation fixes, not selection
+  5. with a `control` (harnesses that own the working tree supply one), each
+     first-order miss is also run alone on the base code, in the same
+     checkout: if it differs from its baseline there too, the change did not
+     move it — the environment did (state a previous run left behind in an
+     ignored directory, a clock) — and it is reported as drift, not a miss
 
 Every miss carries the receipt that skipped it; a known-flaky test that
 flips is reported under `flaky` with its history, not as a miss.
@@ -87,6 +92,14 @@ def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=()
     if p.returncode not in (0, 1) or not out["recorded_anything"]:
         out["output"] = (p.stdout + p.stderr)[-2000:]
     return out
+
+
+def run_alone(repo: Path, python: str, pytest_args, tests) -> dict[str, str]:
+    """Each test in its own pytest session: {test_id: status, or 'absent'}."""
+    return {
+        t: observe(repo, python, pytest_args, targets=[t])["statuses"].get(t, "absent")
+        for t in tests
+    }
 
 
 def map_statuses(con) -> dict[str, str]:
@@ -165,11 +178,14 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
 def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           pytest_args=(), baseline: dict[str, str] | None = None, isolate: bool = True,
           record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE,
-          history_window: int | None = None, max_map_age: int | None = None) -> dict:
+          history_window: int | None = None, max_map_age: int | None = None,
+          control=None) -> dict:
     """Select, run everything, report every status change the selection
     skipped. Pending journal files are rolled up first, as `fastest run`
-    would. The result's `statuses` (every test's status in the full run) is
-    for harnesses that chain audits; the CLI drops it."""
+    would. `control(tests)`, if given, returns each test's status run alone
+    on the base code (see step 5). The result's `statuses` (every test's
+    status in the full run) is for harnesses that chain audits; the CLI
+    drops it."""
     t0 = time.monotonic()
     repo = Path(repo).resolve()
     db = journal.map_path(repo)
@@ -209,7 +225,7 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
         if run["exit"] not in (0, 1) or not run["recorded_anything"]:
             # the full run itself went wrong: its statuses are no verdict
             out["full_run"]["output"] = run.get("output", "")
-            out.update(verdict="error", misses=[], pollution=[], flaky=[],
+            out.update(verdict="error", misses=[], pollution=[], flaky=[], drift=[],
                        statuses=run["statuses"],
                        error=f"full run exited {run['exit']}" if run["recorded_anything"]
                        else "full run recorded nothing: pytest died before its session finished")
@@ -237,6 +253,14 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
             elif isolate:
                 entry["alone"] = None  # over the isolation cap: counted as a miss
             misses.append(entry)
+        drift = []
+        if control and misses:
+            on_base = control([m["test"] for m in misses if m.get("alone") is not None])
+            for m in [m for m in misses if m["test"] in on_base]:
+                m["on_base"] = on_base[m["test"]]
+                if m["on_base"] != m["before"]:  # it moved without the change
+                    drift.append(m)
+            misses = [m for m in misses if m not in drift]
     finally:
         con.close()
     out.update(
@@ -246,6 +270,7 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
         misses=misses,
         pollution=pollution,
         flaky=flaky,
+        drift=drift,
         verdict="miss" if misses else "pass",
         wall_s=round(time.monotonic() - t0, 2),
         statuses=run["statuses"],

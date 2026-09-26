@@ -4,6 +4,10 @@ re-run alone, it is either first-order (still changed) or pollution."""
 
 from __future__ import annotations
 
+import sys
+
+from fastest.audit import audit, run_alone
+
 
 def test_audit_passes_when_every_status_change_was_selected(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 3")  # breaks test_b and test_c
@@ -67,3 +71,37 @@ def test_audit_record_appends_the_full_run(recorded):
     assert out["verdict"] == "pass"
     assert recorded.journal_files() == [out["full_run"]["journal"] + ".sqlite"]  # pending
     assert [r[1] for r in recorded.runs()] == ["full", "full"]
+
+
+def test_a_control_run_separates_environment_drift_from_misses(recorded):
+    # a test that passes only on a fresh checkout: the state it leaves behind
+    # sits in an ignored directory no diff and no coverage map can see
+    recorded.write(".gitignore", ".fastest/\n__pycache__/\nstate/\n")
+    recorded.write(
+        "tests/test_once.py",
+        "import pathlib\n\n"
+        "def test_once():\n"
+        "    p = pathlib.Path('state/ran')\n"
+        "    first = not p.exists()\n"
+        "    p.parent.mkdir(exist_ok=True)\n"
+        "    p.touch()\n"
+        "    assert first\n",
+    )
+    recorded.commit("a run-once test")
+    assert recorded.record().returncode == 0
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    assert recorded.cli("audit")["misses"][0]["test"] == "tests/test_once.py::test_once"
+
+    def control(tests):  # the same tests, alone, on the unedited code
+        recorded.git("stash", "-q")
+        try:
+            return run_alone(recorded.path, sys.executable, (), tests)
+        finally:
+            recorded.git("stash", "pop", "-q")
+
+    out = audit(recorded.path, control=control)
+    assert out["verdict"] == "pass" and out["misses"] == []
+    (d,) = out["drift"]
+    assert (d["test"], d["before"], d["after"], d["alone"], d["on_base"]) == (
+        "tests/test_once.py::test_once", "passed", "failed", "failed", "failed"
+    )

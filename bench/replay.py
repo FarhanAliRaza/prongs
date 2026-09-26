@@ -31,7 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from fastest import journal  # noqa: E402
-from fastest.audit import audit, observe  # noqa: E402
+from fastest.audit import audit, observe, run_alone  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -95,7 +95,15 @@ def main():
                 prev = sha
                 print(f"  [{i}] {sha[:8]} baseline re-established")
                 continue
-            res = audit(repo, prev, python=py, pytest_args=extra,
+            def control(tests, prev=prev, sha=sha):
+                """The misses run alone on the parent commit, same checkout."""
+                git(repo, "checkout", "-q", prev)
+                try:
+                    return run_alone(repo, py, extra, tests)
+                finally:
+                    git(repo, "checkout", "-q", sha)
+
+            res = audit(repo, prev, python=py, pytest_args=extra, control=control,
                         baseline=baseline if args.stale else None, record=not args.stale)
             if res.get("verdict") == "error":
                 print(f"  [{i}] {sha[:8]} audit error ({res.get('error')}), skipping pair")
@@ -114,6 +122,9 @@ def main():
                 "status_changes": res["status_changes"],
                 "misses": res["misses"],
                 "pollution": [p["test"] for p in res["pollution"]],
+                "drift": [d["test"] for d in res["drift"]],
+                "broadened": sel["broadened"],
+                "map_age_receipt": sel["map_age"],
                 "wall_s": res["wall_s"],
             }
             results.append(rec)
@@ -122,11 +133,13 @@ def main():
                 f"  [{i}/{len(commits) - 1}] {prev[:8]}..{sha[:8]}: mode={rec['mode']} "
                 f"selected {rec['n_selected']}/{rec['n_total']} ({rec['pct']}%) "
                 f"status-changes={rec['status_changes']['total']} "
-                f"pollution={len(rec['pollution'])}{flag}",
+                f"pollution={len(rec['pollution'])} drift={len(rec['drift'])}{flag}",
                 flush=True,
             )
             for reason in rec["run_all_reasons"]:
                 print(f"        run-all: {reason}")
+            for reason in rec["broadened"]:
+                print(f"        broadened: {reason}")
             for m in rec["misses"]:
                 print(f"        MISSED: {m['test']} ({m['before']} -> {m['after']})")
             if args.stale:
