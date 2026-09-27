@@ -685,7 +685,15 @@ def main():
                     "rollup": cmd_rollup, "ci": cmd_ci}
         out = commands[args.cmd](args)
         print(json.dumps(out, indent=2))
-        sys.exit(exit_code(args.cmd, out))
+        code = exit_code(args.cmd, out)
+        if args.cmd == "run":
+            # the run's files are closed and its JSON is out; tearing down the
+            # in-process pytest session's objects is all that is left, and on
+            # DRF (1,626 tests) that took 0.5s of a 9s run
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(code)
+        sys.exit(code)
 
 
 if __name__ == "__main__":
