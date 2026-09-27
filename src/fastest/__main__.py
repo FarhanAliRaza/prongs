@@ -32,6 +32,14 @@ and a status that is 'error' when pytest exits 2-5 or a module fails to
 collect, 'inconsistent' when the counts do not balance, never 'passed' for a
 run that silently did less than asked; `recorded` and `record_ok` show that
 the journal saw exactly what ran.
+
+Exit codes, for CI gates (the JSON document carries the detail):
+
+  0  run: passed or nothing to run; audit: no miss; others: done
+  1  run: tests failed; audit: a first-order miss
+  2  error: pytest could not do what was asked (exit 2-5, a collection
+     error, a crash), an unknown revision, no map to audit
+  3  run: inconsistent — the conservation books do not balance
 """
 
 from __future__ import annotations
@@ -474,6 +482,21 @@ def cmd_rollup(args) -> dict:
     return res
 
 
+EXIT_OK, EXIT_FAILED, EXIT_ERROR, EXIT_INCONSISTENT = 0, 1, 2, 3
+RUN_EXIT = {"passed": EXIT_OK, "nothing_to_run": EXIT_OK, "failed": EXIT_FAILED,
+            "error": EXIT_ERROR, "inconsistent": EXIT_INCONSISTENT}
+
+
+def exit_code(cmd: str, out: dict) -> int:
+    """The process exit code for a command's JSON result: what a CI step
+    gates on."""
+    if cmd == "run" and "summary" in out:
+        return RUN_EXIT[out["summary"]["status"]]
+    if cmd == "audit" and "verdict" in out:
+        return {"pass": EXIT_OK, "miss": EXIT_FAILED}.get(out["verdict"], EXIT_ERROR)
+    return EXIT_ERROR if "error" in out else EXIT_OK
+
+
 def main():
     import argparse
 
@@ -525,14 +548,12 @@ def main():
         c.connect(SOCK)
         send_msg(c, {"op": "stop"})
         recv_msg(c)
-    elif args.cmd == "affected":
-        print(json.dumps(cmd_affected(args), indent=2))
-    elif args.cmd == "run":
-        print(json.dumps(cmd_run(args), indent=2))
-    elif args.cmd == "audit":
-        print(json.dumps(cmd_audit(args), indent=2))
-    elif args.cmd == "rollup":
-        print(json.dumps(cmd_rollup(args), indent=2))
+    else:
+        commands = {"affected": cmd_affected, "run": cmd_run, "audit": cmd_audit,
+                    "rollup": cmd_rollup}
+        out = commands[args.cmd](args)
+        print(json.dumps(out, indent=2))
+        sys.exit(exit_code(args.cmd, out))
 
 
 if __name__ == "__main__":

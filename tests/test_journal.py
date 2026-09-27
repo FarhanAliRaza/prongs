@@ -66,7 +66,7 @@ def test_history_keeps_a_row_per_test_per_run(recorded):
 
 def test_a_run_without_coverage_still_appends_outcomes(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 3")  # breaks test_b and test_c
-    out = recorded.cli("run", "--no-cov")
+    out = recorded.cli("run", "--no-cov", code=1)
     s = out["summary"]
     assert s["status"] == "failed" and s["record_ok"] is True
     assert s["recorded"]["mode"] == "results" and s["recorded"]["n_observed"] == 2
@@ -138,7 +138,7 @@ def test_an_unreadable_journal_file_is_quarantined(tmp_path):
 
 
 def test_affected_rolls_up_lazily_and_reports_the_journal(recorded):
-    out = recorded.cli("affected", "--no-rollup")
+    out = recorded.cli("affected", "--no-rollup", code=2)
     assert out["error"] == "no coverage map" and out["pending_journal_files"] == 1
     out = recorded.cli("affected")
     assert out["evidence"]["journal"] == {"rolled_up_now": 1, "pending": 0}

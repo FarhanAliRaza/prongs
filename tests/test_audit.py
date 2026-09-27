@@ -33,7 +33,7 @@ def test_audit_reports_a_first_order_miss_with_its_receipt(recorded):
     recorded.write("tests/data.txt", "ok")
     assert recorded.record().returncode == 0
     recorded.write("tests/data.txt", "changed")
-    out = recorded.cli("audit", "--base", "HEAD")
+    out = recorded.cli("audit", "--base", "HEAD", code=1)
     assert out["selection"]["n_selected"] == 0 and out["verdict"] == "miss"
     (miss,) = out["misses"]
     assert miss["test"] == "tests/test_data.py::test_data"
@@ -90,7 +90,7 @@ def test_a_control_run_separates_environment_drift_from_misses(recorded):
     recorded.commit("a run-once test")
     assert recorded.record().returncode == 0
     recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
-    assert recorded.cli("audit")["misses"][0]["test"] == "tests/test_once.py::test_once"
+    assert recorded.cli("audit", code=1)["misses"][0]["test"] == "tests/test_once.py::test_once"
 
     def control(tests):  # the same tests, alone, on the unedited code
         recorded.git("stash", "-q")

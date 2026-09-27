@@ -34,7 +34,7 @@ def test_nothing_to_run_still_balances(recorded):
 
 def test_collection_failure_is_an_error_not_a_pass(recorded):
     recorded.edit("tests/test_m.py", "import a, b, c", "import a, b, c, missing")
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=2)
     s = out["summary"]
     assert s["status"] == "error" and s["ran"] == 0 and s["complete"] is False
     # 2 (collection interrupted) or 4 (its node ids cannot be resolved)
@@ -52,7 +52,7 @@ def test_tests_that_silently_did_not_run_make_the_run_inconsistent(recorded):
         "def pytest_collection_modifyitems(config, items):\n"
         "    items[:] = [i for i in items if i.name != 'test_b']\n",
     )
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=3)
     assert out["selection"]["mode"] == "run_all"
     assert out["summary"]["status"] == "inconsistent" and "error" not in out
     c = out["conservation"]
@@ -92,14 +92,14 @@ def test_failures_are_grouped_by_exception_line(recorded):
     recorded.commit("tb=short and list tests")
     assert recorded.record().returncode == 0
     recorded.edit("pkg/mod.py", "return 1", "return 5")
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=1)
     assert out["summary"]["failed"] == 4
     reps = {g["representative"] for g in out["failures"]}
     assert reps == {T_A, T_C, "tests/test_lists.py::test_l1", "tests/test_lists.py::test_l2"}
     assert all("Use -v" not in g["error"] for g in out["failures"])
     # one root cause, four tests: one group
     recorded.edit("pkg/mod.py", "return 5", "raise RuntimeError('boom')")
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=1)
     (g,) = out["failures"]
     assert g["error"] == "RuntimeError: boom" and len(g["also_failed"]) == 3
 
@@ -148,10 +148,10 @@ def test_a_crash_in_pytest_start_up_is_an_error(recorded):
         "pyproject.toml",
         '[tool.pytest.ini_options]\ntestpaths = ["tests"]\naddopts = "-p crashplugin"\n',
     )
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=2)
     assert out["summary"]["status"] == "error" and out["summary"]["ran"] == 0
     assert out["error"] == "pytest crashed before running tests: RuntimeError: broken app setup"
     assert "broken app setup" in out["pytest_output"]
-    audit = recorded.cli("audit")  # the full run exits 1, like a test failure
+    audit = recorded.cli("audit", code=2)  # the full run exits 1, like a test failure
     assert audit["verdict"] == "error" and audit["misses"] == []
     assert audit["error"].startswith("full run recorded nothing")

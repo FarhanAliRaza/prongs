@@ -74,9 +74,10 @@ class Repo:
         """Real pytest with the recorder on, in the repo."""
         return self._run("pytest", "--fastest-cov", "-q", "-p", "no:cacheprovider", *args)
 
-    def cli(self, *args: str) -> dict:
+    def cli(self, *args: str, code: int = 0) -> dict:
+        """The CLI's JSON result; the exit code (a CI gate) must be `code`."""
         p = self._run("fastest", *args)
-        assert p.returncode == 0, p.stderr
+        assert p.returncode == code, (p.returncode, p.stderr, p.stdout[-2000:])
         return json.loads(p.stdout)
 
     def rollup(self) -> dict:

@@ -186,7 +186,7 @@ def test_targets_that_never_ran_are_reported(recorded):
         "tests/test_m.py",
         "import pytest\npytest.skip('whole module', allow_module_level=True)\n" + recorded.read("tests/test_m.py"),
     )
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=2)
     s = out["summary"]
     assert s["ran"] == 0 and s["failed"] == 0
     # pytest cannot resolve node ids in a module skipped at import: exit 4
@@ -201,7 +201,7 @@ def test_targets_that_never_ran_are_reported(recorded):
 
 def test_unknown_revision_is_a_clean_error(recorded):
     assert recorded.select(base="nope")["error"] == "unknown revision: nope"
-    assert recorded.cli("affected", "--base", "nope")["error"] == "unknown revision: nope"
+    assert recorded.cli("affected", "--base", "nope", code=2)["error"] == "unknown revision: nope"
 
 
 def test_non_git_directory_is_a_clean_error(tmp_path):
