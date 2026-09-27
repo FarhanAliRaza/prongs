@@ -37,7 +37,9 @@ def test_recorded_partial_run_is_credited_exactly(recorded):
     s = out["summary"]
     assert s["status"] == "passed" and s["ran"] == 2 and s["complete"] is True
     assert s["unrun_targets"] == [] and s["record_ok"] is True
-    assert s["recorded"] == {"run_id": 2, "scope": "partial", "n_observed": 2}
+    key = s["recorded"].pop("journal")
+    assert s["recorded"] == {"mode": "coverage", "scope": "partial", "n_observed": 2}
+    assert recorded.journal_files() == [f"{key}.sqlite"]  # appended, not yet rolled up
     assert [r[1] for r in recorded.runs()] == ["full", "partial"]
 
     sel = recorded.select()
@@ -98,11 +100,13 @@ def test_test_module_changes_never_escalate_to_run_all(recorded):
     assert sel["selected_files"] == {"tests/test_m.py": "1 known test(s) not found statically: test_b"}
     assert set(sel["selected"]) == {T_A, T_B, T_C}
     assert all(r.startswith("test file changed") for r in sel["selected"].values())
-    # editing a test body targets exactly that file's known tests
+    # editing a test body selects that file's known tests: all of them here,
+    # so pytest gets the file, not one id per test
     recorded.git("checkout", "--", "tests/test_m.py")
     recorded.edit("tests/test_m.py", "assert a() == 1", "assert a() == 1  # edited")
     sel = recorded.select()
-    assert sel["targets"] == [T_C, T_A, T_B] and sel["selected_files"] == {}
+    assert set(sel["selected"]) == {T_A, T_B, T_C} and sel["selected_files"] == {}
+    assert sel["targets"] == ["tests/test_m.py"]
 
 
 def test_import_time_change_in_production_code_runs_all(recorded):
@@ -110,7 +114,7 @@ def test_import_time_change_in_production_code_runs_all(recorded):
     sel = recorded.select()
     assert sel["mode"] == "run_all"
     assert sel["reasons"] == ["module-level change in import-time file: pkg/mod.py"]
-    assert sel["targets"] == [T_C, T_A, T_B] and sel["selected"][T_A] == "run_all"
+    assert sel["targets"] == ["tests/test_m.py"] and sel["selected"][T_A] == "run_all"
 
 
 def test_conftest_change_runs_all(recorded):
@@ -184,17 +188,22 @@ def test_targets_that_never_ran_are_reported(recorded):
         "tests/test_m.py",
         "import pytest\npytest.skip('whole module', allow_module_level=True)\n" + recorded.read("tests/test_m.py"),
     )
-    out = recorded.cli("run")
+    out = recorded.cli("run", code=2)
     s = out["summary"]
     assert s["ran"] == 0 and s["failed"] == 0
-    assert s["status"] == "incomplete" and s["complete"] is False
-    assert s["unrun_targets"] == [T_C, T_A, T_B]
+    # the module is skipped at import, so pytest collects nothing: exit 5
+    assert s["status"] == "error" and s["complete"] is False
+    assert out["error"].startswith("pytest exit 5")
+    assert out["collect_skipped"] == ["tests/test_m.py"]
+    assert s["unrun_targets"] == ["tests/test_m.py"]
+    assert out["conservation"]["conserved"] is False
+    assert out["conservation"]["not_executed"] == sorted([T_A, T_B, T_C])
     assert s["record_ok"] is True  # the journal saw exactly what ran: nothing
 
 
 def test_unknown_revision_is_a_clean_error(recorded):
     assert recorded.select(base="nope")["error"] == "unknown revision: nope"
-    assert recorded.cli("affected", "--base", "nope")["error"] == "unknown revision: nope"
+    assert recorded.cli("affected", "--base", "nope", code=2)["error"] == "unknown revision: nope"
 
 
 def test_non_git_directory_is_a_clean_error(tmp_path):
@@ -214,7 +223,8 @@ def test_unittest_style_classes_are_found_statically(recorded):
     assert recorded.record().returncode == 0
     recorded.edit("tests/test_u.py", "assertEqual(a(), 1)", "assertEqual(a(), 1)  # edited")
     sel = recorded.select()
-    assert sel["targets"] == ["tests/test_u.py::ModTests::test_a"] and sel["selected_files"] == {}
+    assert sel["selected"] == {"tests/test_u.py::ModTests::test_a": "test file changed: tests/test_u.py"}
+    assert sel["targets"] == ["tests/test_u.py"] and sel["selected_files"] == {}
 
 
 def test_skip_receipt_is_tied_to_the_evidence(recorded):

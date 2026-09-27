@@ -1,0 +1,110 @@
+# fastest in GitHub Actions: a pull request runs only the tests its change can
+# affect; a push to the default branch (and a nightly run) runs everything with
+# the recorder on and refreshes the map every later job selects from.
+#
+# How the map travels between jobs (src/fastest/ci.py has the rules):
+#
+#   push / nightly   restore the newest map from the cache, fold the journal
+#                    files recent pull-request jobs uploaded (their outcomes
+#                    feed flaky detection), run the full suite recorded, save
+#                    the new map to the cache
+#   pull request     restore the newest map (a cache saved on the default
+#                    branch is visible to pull requests), run the affected
+#                    tests (`fastest run` exits 1 on a failure, 2 on an error,
+#                    3 when its books do not balance), upload this job's
+#                    journal files for the next push job to fold
+#
+# With no map yet (the first run, an evicted cache), `fastest run` runs
+# everything and records it, so the gate never depends on the cache.
+#
+# Artifacts live under $RUNNER_TEMP, outside the checkout: files the job
+# writes into the working tree would show up as changes in the tree every
+# recorded run describes.
+#
+# Not run on GitHub itself: these are the commands bench/ci.py replays locally
+# with fresh clones and artifact directories. Adapt the install step, and the
+# branch name, to your project.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"  # a full run even when main is quiet
+
+permissions:
+  contents: read
+  actions: read  # gh run list / download: the pull-request journal artifacts
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the commits the map was recorded on; with the default depth of 1,
+          # `fastest ci restore` deepens the clone until they are there
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          pip install -e . pytest                             # your project
+          pip install "git+https://github.com/FarhanAliRaza/fastest"  # fastest
+
+      - name: Restore the map
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/fastest-ci/map
+          key: fastest-map-${{ github.sha }}
+          restore-keys: fastest-map-
+
+      - name: Collect pull-request journals
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/fastest-ci/journals"
+          for id in $(gh run list --workflow "${{ github.workflow }}" --event pull_request \
+                        --status completed --limit 50 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$id" --pattern 'fastest-journals-*' \
+              --dir "$RUNNER_TEMP/fastest-ci/journals/$id" || true  # expired or none
+          done
+
+      - name: Restore
+        run: python -m fastest ci restore "$RUNNER_TEMP/fastest-ci"
+
+      - name: Tests (the affected ones)
+        if: github.event_name == 'pull_request'
+        shell: bash  # pipefail: the step fails with fastest, not with tee
+        run: python -m fastest run | tee "$RUNNER_TEMP/fastest-result.json"
+
+      - name: Tests (all of them, recorded)
+        if: github.event_name != 'pull_request'
+        run: python -m pytest --fastest-cov
+
+      - name: Save this job's journals
+        if: always() && github.event_name == 'pull_request'
+        run: python -m fastest ci save --no-map "$RUNNER_TEMP/fastest-out"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name == 'pull_request'
+        with:
+          name: fastest-journals-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fastest-out
+          retention-days: 14
+
+      - name: Save the map
+        if: always() && github.event_name != 'pull_request'
+        run: python -m fastest ci save --no-journals "$RUNNER_TEMP/fastest-ci/map"
+
+      - uses: actions/cache/save@v4
+        if: always() && github.event_name != 'pull_request'
+        with:
+          path: ${{ runner.temp }}/fastest-ci/map  # the path the restore step used
+          key: fastest-map-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

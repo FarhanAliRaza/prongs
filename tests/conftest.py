@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from fastest import journal, mapdb
 from fastest.select import select
 
 MOD = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return a() + b()\n"
@@ -26,8 +27,9 @@ T_A, T_B, T_C = "tests/test_m.py::test_a", "tests/test_m.py::test_b", "tests/tes
 
 
 class Repo:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, env: dict | None = None):
         self.path = path
+        self.env = env or {}  # extra environment for the recorder and the CLI
 
     # --- files & git ---------------------------------------------------------
     def write(self, rel: str, text: str) -> None:
@@ -59,7 +61,11 @@ class Repo:
     # --- fastest -------------------------------------------------------------
     def _run(self, *argv: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-        env.pop("PYTEST_ADDOPTS", None)
+        for var in ("PYTEST_ADDOPTS", "FASTEST_COV", "FASTEST_DIR", "FASTEST_JOURNAL",
+                    "FASTEST_JOURNAL_KEY"):
+            if var not in self.env:
+                env.pop(var, None)
+        env.update(self.env)
         return subprocess.run(
             [sys.executable, "-m", *argv], cwd=self.path, capture_output=True, text=True, env=env
         )
@@ -68,18 +74,29 @@ class Repo:
         """Real pytest with the recorder on, in the repo."""
         return self._run("pytest", "--fastest-cov", "-q", "-p", "no:cacheprovider", *args)
 
-    def cli(self, *args: str) -> dict:
+    def cli(self, *args: str, code: int = 0) -> dict:
+        """The CLI's JSON result; the exit code (a CI gate) must be `code`."""
         p = self._run("fastest", *args)
-        assert p.returncode == 0, p.stderr
+        assert p.returncode == code, (p.returncode, p.stderr, p.stdout[-2000:])
         return json.loads(p.stdout)
 
+    def rollup(self) -> dict:
+        """What the CLI does before every selection: fold pending journal files."""
+        return mapdb.rollup(journal.map_path(self.path), journal.journal_dir(self.path))
+
+    def journal_files(self, sub: str = "") -> list[str]:
+        d = journal.journal_dir(self.path) / sub
+        return sorted(p.name for p in d.glob("*.sqlite")) if d.is_dir() else []
+
     def select(self, base: str | None = None, head: str | None = None) -> dict:
-        return select(self.path / ".fastest" / "map.sqlite", self.path, base, head)
+        self.rollup()
+        return select(journal.map_path(self.path), self.path, base, head)
 
     def db(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path / ".fastest" / "map.sqlite")
+        return sqlite3.connect(journal.map_path(self.path))
 
     def runs(self) -> list[tuple]:
+        self.rollup()
         con = self.db()
         try:
             return con.execute(
@@ -90,6 +107,7 @@ class Repo:
             con.close()
 
     def tests(self) -> dict[str, tuple]:
+        self.rollup()
         con = self.db()
         try:
             return {

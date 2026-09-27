@@ -81,3 +81,18 @@ def test_file_written_during_the_run_is_flagged(recorded):
     assert json.loads(run[3])["pkg/generated.py"][0] is None  # absent at start, present at end
     sel = recorded.select()
     assert "changed while it ran" in " ".join(sel["evidence"]["warnings"])
+
+
+def test_code_run_at_start_up_is_import_time_evidence(repo):
+    # a conftest that sets the app up in pytest_configure (DRF does; pytest-
+    # django does it even earlier) runs before plugins configure: the recorder
+    # must already be listening, or a settings change escapes the run-all rule
+    repo.write("pkg/settings.py", "DEFAULTS = {'x': 1}\n")
+    repo.write("tests/conftest.py", "def pytest_configure(config):\n    import pkg.settings\n")
+    repo.write("tests/test_s.py", "from pkg.settings import DEFAULTS\n\ndef test_x():\n    assert DEFAULTS['x'] == 1\n")
+    repo.commit("settings read at start-up")
+    assert repo.record().returncode == 0
+    repo.edit("pkg/settings.py", "'x': 1", "'x': 2")
+    sel = repo.select()
+    assert sel["mode"] == "run_all"
+    assert sel["reasons"] == ["module-level change in import-time file: pkg/settings.py"]
