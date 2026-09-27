@@ -183,3 +183,19 @@ def test_restore_with_no_artifact_is_a_first_run(repo, tmp_path):
     assert out["selection"]["mode"] == "run_all" and out["summary"]["ran"] == 3
     saved = repo.cli("ci", "save", str(tmp_path / "artifact"))
     assert saved["map"]["tests"] == 3 and saved["map"]["runs"] == 1
+
+
+def test_save_replaces_the_artifact_it_is_given(recorded, tmp_path):
+    # a cache step saves the map into the directory it restored from: what
+    # the new save does not write must go, or it rides along forever
+    art = tmp_path / "artifact"
+    recorded.cli("ci", "save", str(art))
+    assert sorted(p.name for p in (art / "journal").iterdir()) != []
+    recorded.cli("ci", "save", "--no-journals", str(art))
+    assert sorted(p.name for p in art.iterdir()) == ["manifest.json", "map.sqlite"]
+    # and it never clears a directory that is not an artifact
+    (tmp_path / "mine").mkdir()
+    (tmp_path / "mine" / "notes.txt").write_text("keep")
+    out = recorded.cli("ci", "save", str(tmp_path / "mine"), code=2)
+    assert "holds no artifact" in out["error"]
+    assert (tmp_path / "mine" / "notes.txt").read_text() == "keep"

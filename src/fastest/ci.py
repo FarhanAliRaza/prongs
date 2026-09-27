@@ -112,8 +112,16 @@ def _keys(path: Path) -> set[str]:
 def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = True) -> dict:
     """Write an artifact directory: a snapshot of the map (pending journal
     files rolled up first) and the journal files this checkout wrote — own
-    files, pending or consumed, that no `restore` imported."""
+    files, pending or consumed, that no `restore` imported. An earlier
+    artifact in `out` is replaced whole; any other non-empty directory is
+    refused."""
     repo, out = Path(repo), Path(out)
+    if (out / MANIFEST).is_file():  # replacing an earlier save (a cache step's directory)
+        (out / MAP).unlink(missing_ok=True)
+        shutil.rmtree(out / JOURNAL, ignore_errors=True)
+    elif out.is_dir() and any(out.iterdir()):
+        return {"error": f"{out} is not empty and holds no artifact: save into a new "
+                         "directory, or into an earlier artifact to replace it"}
     out.mkdir(parents=True, exist_ok=True)
     jdir = journal.journal_dir(repo)
     manifest: dict = {

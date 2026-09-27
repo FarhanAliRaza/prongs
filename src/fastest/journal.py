@@ -269,6 +269,8 @@ def find(jdir, key: str) -> Path | None:
 
 
 def _move(paths, dest: Path) -> None:
+    if not paths:
+        return
     dest.mkdir(parents=True, exist_ok=True)
     for p in paths:
         try:
