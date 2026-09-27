@@ -187,6 +187,14 @@ def skip_receipt(sel: dict) -> dict:
     }
 
 
+# Python's own traceback for each failure, not pytest's long or short style:
+# those parse the source file of every frame again for every failure, which
+# is most of a run that breaks many tests (httpx, 685 failures: 38.9s with
+# pytest's default, 7.0s native). The crash line failures are grouped by,
+# and pytest's assertion explanations, are in both.
+TRACEBACKS = "--tb=native"
+
+
 def run_via_daemon(targets: list[str], extra_args: list[str]) -> dict | None:
     from fastest.daemon import SOCK, recv_msg, send_msg
     import socket
@@ -417,8 +425,8 @@ def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
             status = None
             if warm:
                 key = journal.new_key()
-                extra = (["--fastest-cov", "--fastest-journal", str(jdir),
-                          "--fastest-journal-key", key] if record else [])
+                extra = ["--tb=no"] + (["--fastest-cov", "--fastest-journal", str(jdir),
+                                        "--fastest-journal-key", key] if record else [])
                 resp = run_via_daemon([entry["test"]], extra)
                 if resp and not resp.get("stale") and "error" not in resp:
                     status = next((r["status"] for r in resp.get("results", [])
@@ -462,7 +470,7 @@ def cmd_run(args) -> dict:
     mode = ("coverage" if args.cov else "results") if args.record else None
     key = journal.new_key() if mode else None
     jdir = journal.journal_dir(repo)
-    extra = (
+    extra = [TRACEBACKS] + (
         ["--fastest-cov", "--fastest-journal", str(jdir), "--fastest-journal-key", key]
         if mode == "coverage" else []
     )
