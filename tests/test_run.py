@@ -176,3 +176,13 @@ def test_a_crash_in_pytest_start_up_is_an_error(recorded):
     audit = recorded.cli("audit", code=2)  # the full run exits 1, like a test failure
     assert audit["verdict"] == "error" and audit["misses"] == []
     assert audit["error"].startswith("full run recorded nothing")
+
+
+def test_a_crash_after_the_tests_ran_is_an_error_that_keeps_their_results(recorded):
+    # httpx under filterwarnings=error: resources a broken __exit__ leaked
+    # surface at the very end as an ExceptionGroup out of pytest.main()
+    recorded.write("tests/conftest.py",
+                   "def pytest_unconfigure(config):\n    raise RuntimeError('late')\n")
+    out = recorded.cli("run", code=2)
+    assert out["error"] == "pytest crashed after 3 test(s) ran: RuntimeError: late"
+    assert out["summary"]["status"] == "error" and out["summary"]["ran"] == 3

@@ -236,7 +236,12 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
     # failure that ran nothing must never read as "passed"
     resp = execution_response(code, time.monotonic() - t0, collector, buf.getvalue)
     if crash is not None:
-        resp["error"] = f"pytest crashed before running tests: {type(crash).__name__}: {crash}"
+        # before any test (a plugin's start-up) or after them (an exception
+        # out of unconfigure: under filterwarnings=error, the leaked resources
+        # of a broken close() arrive as an ExceptionGroup at the very end)
+        when = (f"after {len(collector.results)} test(s) ran" if collector.results
+                else "before running tests")
+        resp["error"] = f"pytest crashed {when}: {type(crash).__name__}: {crash}"
     return resp
 
 
