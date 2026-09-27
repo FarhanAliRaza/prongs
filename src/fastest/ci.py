@@ -35,7 +35,8 @@ The flow (examples/github-actions.yml has it as a workflow):
     commit is an ancestor of HEAD is this line of history's own evidence; any
     other (another branch's CI job, a pull request's test merge commit) is
     foreign and folds as history only — outcomes for flaky detection,
-    never evidence (see mapdb)
+    never evidence (see mapdb). A journal's commit is never fetched: one
+    the clone lacks once the evidence history is in is another branch's
   * it skips runs the map already holds, since rollup folds by journal key
     and a journal artifact is often downloaded more than once
   * it records the keys it imported (.fastest/ci/restored.json), so `save`
@@ -312,12 +313,13 @@ def restore(repo: Path, paths, *, fetch: bool = True, remote: str = "origin") ->
             present.add(run["key"])
             candidates.append((f, run))
 
-    # 3. history: the map's evidence commits, and the journals' (to tell
-    # lineage: a commit that stays missing belongs to another branch)
+    # 3. history: only the map's evidence commits are worth fetching. A
+    # journal's commit decides its lineage, and one this clone lacks after
+    # that is another branch's (a pull request's test merge commit, which a
+    # main-branch clone never has): chasing it would unshallow for nothing
     evidence = _evidence_commits(db) if db.exists() else set()
-    out["history"] = ensure_history(
-        repo, evidence | {run["commit_sha"] for _, run in candidates}, remote=remote, fetch=fetch)
-    lost = sorted(evidence & set(out["history"]["still_missing"]))
+    out["history"] = ensure_history(repo, evidence, remote=remote, fetch=fetch)
+    lost = out["history"]["still_missing"]
     if lost:
         out["warnings"].append(
             f"{len(lost)} commit(s) the map's evidence was observed on are not in this "

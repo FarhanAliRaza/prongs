@@ -199,3 +199,25 @@ def test_save_replaces_the_artifact_it_is_given(recorded, tmp_path):
     out = recorded.cli("ci", "save", str(tmp_path / "mine"), code=2)
     assert "holds no artifact" in out["error"]
     assert (tmp_path / "mine" / "notes.txt").read_text() == "keep"
+
+
+def test_a_foreign_journal_never_makes_restore_fetch_history(recorded, tmp_path):
+    # a pull request's journal names a commit (its test merge commit) that a
+    # clone of the main branch never has: only the map's evidence commits
+    # are worth fetching, and a shallow main-branch clone must not be
+    # unshallowed chasing the other
+    main_art = tmp_path / "main-artifact"
+    recorded.cli("ci", "save", str(main_art))
+    pr = clone(recorded, tmp_path / "pr")
+    pr.cli("ci", "restore", str(main_art))
+    pr.edit("pkg/mod.py", "return 2", "return 2  # pr")
+    pr.commit("a pull request's commit, pushed nowhere")
+    pr.cli("run")
+    pr_art = tmp_path / "pr-artifact"
+    pr.cli("ci", "save", "--no-map", str(pr_art))
+    docs(recorded, 2)
+    main = clone(recorded, tmp_path / "main", "--depth", "1")
+    res = main.cli("ci", "restore", str(main_art), str(pr_art))
+    assert len(res["journals"]["foreign"]) == 1
+    assert [f["args"][0] for f in res["history"]["fetches"]] == ["--deepen=64"]
+    assert res["history"]["still_missing"] == [] and res["warnings"] == []
