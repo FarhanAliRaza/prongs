@@ -22,7 +22,11 @@ import struct
 import sys
 import time
 
-SOCK = ".bolttest/daemon.sock"
+def sock_path() -> str:
+    """The daemon's socket, in the state directory (BOLTTEST_DIR applies)."""
+    from bolttest.journal import state_dir
+
+    return str(state_dir(".") / "daemon.sock")
 
 
 def send_msg(conn: socket.socket, obj) -> None:
@@ -298,7 +302,8 @@ class StaleWarmImage(Exception):
 
 
 def serve() -> None:
-    os.makedirs(".bolttest", exist_ok=True)
+    SOCK = sock_path()
+    os.makedirs(os.path.dirname(SOCK), exist_ok=True)
     rootpath = os.getcwd() + os.sep
     apply_compat_shims()
     dt = warm()
@@ -383,6 +388,7 @@ def serve() -> None:
 
 
 def run(node_ids: list[str]) -> None:
+    SOCK = sock_path()
     t0 = time.monotonic()
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     for _ in range(100):  # daemon may still be warming up
@@ -406,7 +412,7 @@ if __name__ == "__main__":
         run(sys.argv[2:])
     elif sys.argv[1] == "stop":
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.connect(SOCK)
+        c.connect(sock_path())
         send_msg(c, {"op": "stop"})
         recv_msg(c)
         c.close()

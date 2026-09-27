@@ -119,7 +119,7 @@ A run that silently did less than asked is never reported as `passed`.
 
 ## Commands
 
-All commands print one JSON document on stdout, except `daemon` and `stop`.
+All commands print one JSON document on stdout, except `daemon`.
 
 | Command | Purpose |
 |---|---|
@@ -201,7 +201,7 @@ flaky_retries = 2    # re-run a failing flaky test alone up to N times
 | `BOLTTEST_DIR` | State directory, relative to the repository root (default `.bolttest`); point worktrees at one directory to pool runs |
 | `BOLTTEST_JOURNAL` | Journal directory only (default `<state dir>/journal`) |
 | `BOLTTEST_JOURNAL_KEY` | Name of the recorded run's journal file |
-| `BOLTTEST_RUN_ARGS` | Extra pytest arguments for `audit` runs, flaky retries, and daemon children |
+| `BOLTTEST_RUN_ARGS` | Extra pytest arguments for every pytest run bolttest starts: `run`, `audit`, flaky retries, and daemon children |
 | `BOLTTEST_WARM_ARGS` | Extra pytest arguments for the daemon's warm-up collection |
 | `BOLTTEST_WARM_DB_TEST` | A test node id the daemon runs once at warm-up, so forked children inherit the test database |
 

@@ -1,4 +1,4 @@
-"""Agent-facing CLI (PoC Phase 5).
+"""Agent-facing CLI.
 
   python -m bolttest affected [--base REV]             what would run, and why — JSON
   python -m bolttest run [--base REV] [--no-cov]       select + execute + JSON results
@@ -196,9 +196,10 @@ TRACEBACKS = "--tb=native"
 
 
 def run_via_daemon(targets: list[str], extra_args: list[str]) -> dict | None:
-    from bolttest.daemon import SOCK, recv_msg, send_msg
+    from bolttest.daemon import recv_msg, send_msg, sock_path
     import socket
 
+    SOCK = sock_path()
     if not os.path.exists(SOCK):
         return None
     try:
@@ -220,6 +221,8 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
     import pytest
 
     collector = ResultCollector()
+    # the same extra arguments the daemon's children get (daemon.serve)
+    run_args = shlex.split(os.environ.get("BOLTTEST_RUN_ARGS", ""))
     t0 = time.monotonic()
     buf = io.StringIO()
     saved = sys.stdout, sys.stderr
@@ -227,7 +230,7 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
     crash = None
     try:
         code = pytest.main(
-            targets + extra_args + ["-q", "--no-header", "-p", "no:cacheprovider"],
+            run_args + targets + extra_args + ["-q", "--no-header", "-p", "no:cacheprovider"],
             plugins=[collector],
         )
     except (Exception, SystemExit) as e:
@@ -686,13 +689,23 @@ def main():
 
         serve()
     elif args.cmd == "stop":
-        from bolttest.daemon import SOCK, send_msg, recv_msg
+        from bolttest.daemon import recv_msg, send_msg, sock_path
         import socket
 
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.connect(SOCK)
-        send_msg(c, {"op": "stop"})
-        recv_msg(c)
+        sock = sock_path()
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(sock)
+            send_msg(c, {"op": "stop"})
+            recv_msg(c)
+            c.close()
+            out = {"stopped": True}
+        except (FileNotFoundError, ConnectionRefusedError):
+            # no daemon; a socket file left by one that died is cleared
+            if os.path.exists(sock):
+                os.unlink(sock)
+            out = {"stopped": False, "reason": "no daemon running"}
+        print(json.dumps(out, indent=2))
     else:
         commands = {"affected": cmd_affected, "run": cmd_run, "audit": cmd_audit,
                     "rollup": cmd_rollup, "ci": cmd_ci}

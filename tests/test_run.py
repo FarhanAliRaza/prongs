@@ -186,3 +186,17 @@ def test_a_crash_after_the_tests_ran_is_an_error_that_keeps_their_results(record
     out = recorded.cli("run", code=2)
     assert out["error"] == "pytest crashed after 3 test(s) ran: RuntimeError: late"
     assert out["summary"]["status"] == "error" and out["summary"]["ran"] == 3
+
+
+def test_stop_without_a_daemon_reports_it(recorded):
+    out = recorded.cli("stop")
+    assert out == {"stopped": False, "reason": "no daemon running"}
+
+
+def test_run_args_reach_a_cold_run(recorded):
+    # an option pytest rejects: the run must fail as an error, proving the
+    # arguments reached the in-process pytest, not just the daemon's children
+    recorded.env["BOLTTEST_RUN_ARGS"] = "--no-such-option"
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    out = recorded.cli("run", code=2)
+    assert out["summary"]["status"] == "error"
