@@ -48,7 +48,7 @@ import struct
 import time
 from pathlib import Path
 
-from fastest import journal
+from bolttest import journal
 
 SCHEMA_VERSION = 4
 COLLECTION = journal.COLLECTION  # pseudo-test: code executed at import/collection time
@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS runs (
     worktree TEXT,           -- the checkout that ran it
     dirty_files TEXT,        -- JSON {path: [hash_at_start, hash_at_end]}
     tree_changed INTEGER,    -- HEAD moved or the dirty set changed mid-run
-    recorder TEXT,           -- recorder fingerprint (fastest/python/pytest)
+    recorder TEXT,           -- recorder fingerprint (bolttest/python/pytest)
     args TEXT,               -- JSON: pytest invocation args
     n_collected INTEGER, n_observed INTEGER,
     collect_errors TEXT,     -- JSON {node id: last line of the error}

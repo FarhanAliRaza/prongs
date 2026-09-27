@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from fastest import journal, mapdb
-from fastest.select import select
+from bolttest import journal, mapdb
+from bolttest.select import select
 
 MOD = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return a() + b()\n"
 TESTS = (
@@ -58,11 +58,11 @@ class Repo:
     def head(self) -> str:
         return self.git("rev-parse", "HEAD")
 
-    # --- fastest -------------------------------------------------------------
+    # --- bolttest -------------------------------------------------------------
     def _run(self, *argv: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-        for var in ("PYTEST_ADDOPTS", "FASTEST_COV", "FASTEST_DIR", "FASTEST_JOURNAL",
-                    "FASTEST_JOURNAL_KEY"):
+        for var in ("PYTEST_ADDOPTS", "BOLTTEST_COV", "BOLTTEST_DIR", "BOLTTEST_JOURNAL",
+                    "BOLTTEST_JOURNAL_KEY"):
             if var not in self.env:
                 env.pop(var, None)
         env.update(self.env)
@@ -72,11 +72,11 @@ class Repo:
 
     def record(self, *args: str) -> subprocess.CompletedProcess:
         """Real pytest with the recorder on, in the repo."""
-        return self._run("pytest", "--fastest-cov", "-q", "-p", "no:cacheprovider", *args)
+        return self._run("pytest", "--bolttest-cov", "-q", "-p", "no:cacheprovider", *args)
 
     def cli(self, *args: str, code: int = 0) -> dict:
         """The CLI's JSON result; the exit code (a CI gate) must be `code`."""
-        p = self._run("fastest", *args)
+        p = self._run("bolttest", *args)
         assert p.returncode == code, (p.returncode, p.stderr, p.stdout[-2000:])
         return json.loads(p.stdout)
 
@@ -126,7 +126,7 @@ def repo(tmp_path: Path) -> Repo:
     r.write("pkg/mod.py", MOD)
     r.write("tests/test_m.py", TESTS)
     r.write("pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
-    r.write(".gitignore", ".fastest/\n__pycache__/\n")
+    r.write(".gitignore", ".bolttest/\n__pycache__/\n")
     r.git("init", "-q")
     r.git("config", "user.email", "t@example.com")
     r.git("config", "user.name", "t")

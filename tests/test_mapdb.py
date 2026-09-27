@@ -8,8 +8,8 @@ import sqlite3
 
 import pytest
 
-from fastest import journal, mapdb
-from fastest.mapdb import COLLECTION
+from bolttest import journal, mapdb
+from bolttest.mapdb import COLLECTION
 
 
 @pytest.fixture

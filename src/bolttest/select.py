@@ -1,7 +1,7 @@
 """Phase 2: diff -> affected test selection, with receipts and evidence.
 
 Reads the roll-up in map.sqlite (tests + current_links) and never writes:
-journal files reach it only through `fastest rollup`. A test's evidence is
+journal files reach it only through `bolttest rollup`. A test's evidence is
 the tree of the run whose coverage it last recorded (`deps_run`), so
 selection is computed per observed tree:
 
@@ -33,7 +33,7 @@ An explicit --base collapses this to one tree (that commit, all tests), which
 is what the replay/mutation harnesses use. Every result carries `evidence`:
 runs, commits, freshness, the trees, and every warning.
 
-Usage: python -m fastest.select --repo testbeds/httpx [--base REV] [--json]
+Usage: python -m bolttest.select --repo testbeds/httpx [--base REV] [--json]
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastest import config, journal, mapdb, provenance
+from bolttest import config, journal, mapdb, provenance
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -265,7 +265,7 @@ def _brief(run: dict | None) -> dict | None:
 
 
 def _rollup_meta(con) -> dict:
-    """Where the last `fastest rollup` left the map."""
+    """Where the last `bolttest rollup` left the map."""
     m = mapdb.meta(con)
     return {
         "seq": int(m["rollup_seq"]) if m.get("rollup_seq") else None,
@@ -999,7 +999,7 @@ def main():
     ap.add_argument("--head", default=None)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    db = args.db or journal.map_path(args.repo)  # read-only: `fastest rollup` first
+    db = args.db or journal.map_path(args.repo)  # read-only: `bolttest rollup` first
     result = select(db, args.repo.resolve(), args.base, args.head)
     if args.json:
         print(json.dumps(result, indent=2))

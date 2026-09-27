@@ -1,10 +1,10 @@
 """Shadow mode: what selection would skip, checked against a full run.
 
-`fastest audit [--base REV]`:
+`bolttest audit [--base REV]`:
 
-  1. select exactly as `fastest run` would (--base REV, else the evidence),
+  1. select exactly as `bolttest run` would (--base REV, else the evidence),
      after rolling up pending journal files
-  2. run the FULL suite in a subprocess with the recorder on (FASTEST_COV=1)
+  2. run the FULL suite in a subprocess with the recorder on (BOLTTEST_COV=1)
      into a temporary journal, so an audit never feeds the map it audits
      (record=True appends the run to the real journal instead; history replay
      uses that to walk commits)
@@ -22,7 +22,7 @@
      the change did not move it — the environment did (state a previous run
      left behind in an ignored directory, a clock) — and it is reported as
      drift, not a miss. Harnesses that own the working tree supply their
-     own; `fastest audit --control` uses checkout_control(), which checks
+     own; `bolttest audit --control` uses checkout_control(), which checks
      out the commit each miss's baseline was observed on, in place
 
 Every miss carries the receipt that skipped it; a known-flaky test that
@@ -41,8 +41,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from fastest import config, journal, mapdb, provenance
-from fastest.select import select
+from bolttest import config, journal, mapdb, provenance
+from bolttest.select import select
 
 NOT_AN_OUTCOME = {"unknown", "collection"}  # statuses that are never compared
 MAX_ISOLATE = 25  # re-running misses alone is one pytest start-up each
@@ -65,10 +65,10 @@ def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=()
     own journal file, never from parsing pytest's output (poc-results finding
     4). Unless `record`, that file goes to a temporary directory and is
     discarded."""
-    tmp = Path(tempfile.mkdtemp(prefix="fastest-audit-"))
+    tmp = Path(tempfile.mkdtemp(prefix="bolttest-audit-"))
     jdir = journal.journal_dir(repo) if record else tmp
     key = journal.new_key()
-    env = dict(os.environ, FASTEST_COV="1", FASTEST_JOURNAL=str(jdir), FASTEST_JOURNAL_KEY=key)
+    env = dict(os.environ, BOLTTEST_COV="1", BOLTTEST_JOURNAL=str(jdir), BOLTTEST_JOURNAL_KEY=key)
     t0 = time.monotonic()
     try:
         p = subprocess.run(
@@ -143,7 +143,7 @@ def status_changes(baseline: dict[str, str], run: dict, repo: Path) -> dict:
 
 
 def planned(sel: dict, tests) -> set[str]:
-    """Every test `fastest run` would execute for this selection: the
+    """Every test `bolttest run` would execute for this selection: the
     selected ids, plus every test in a module targeted as a whole file."""
     files = set(sel.get("selected_files", {}))
     return set(sel["selected"]) | {t for t in tests if t.split("::", 1)[0] in files}
@@ -182,7 +182,7 @@ class ControlError(Exception):
 
 
 def checkout_control(repo: Path, python: str = sys.executable, pytest_args=()):
-    """A control for `fastest audit --control`: run each test alone on the
+    """A control for `bolttest audit --control`: run each test alone on the
     commit its baseline status was observed on, in this checkout — ignored
     files, the state a previous run left behind, stay exactly as they are,
     which is the point. It checks out each commit detached and puts HEAD
@@ -233,7 +233,7 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           history_window: int | None = None, max_map_age: int | None = None,
           flaky_window: int | None = None, control=None) -> dict:
     """Select, run everything, report every status change the selection
-    skipped. Pending journal files are rolled up first, as `fastest run`
+    skipped. Pending journal files are rolled up first, as `bolttest run`
     would. `control(tests)`, if given, returns each test's status run alone
     on the base code (see step 5). The result's `statuses` (every test's
     status in the full run) is for harnesses that chain audits; the CLI

@@ -1,0 +1,48 @@
+# Publish to PyPI when a GitHub Release is published, through the trusted
+# publisher registered for this repository (workflow publishing.yml,
+# environment pypi). Pushing a tag does nothing by itself: the click on
+# "Publish release" is the gate.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#   gh release create v0.1.0 --draft --generate-notes   # then publish it on GitHub
+#
+# The tag must match the version in src/bolttest/__init__.py.
+
+name: publishing
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the tag matches the package version
+        run: |
+          pkg=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"(.+?)\"', pathlib.Path('src/bolttest/__init__.py').read_text()).group(1))")
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$pkg" = "$tag" ] || { echo "::error::tag v$tag but package version is $pkg"; exit 1; }
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

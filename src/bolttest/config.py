@@ -1,5 +1,5 @@
-"""Selection settings: [tool.fastest] in pyproject.toml, overridden by
-FASTEST_<NAME> environment variables, overridden by CLI flags.
+"""Selection settings: [tool.bolttest] in pyproject.toml, overridden by
+BOLTTEST_<NAME> environment variables, overridden by CLI flags.
 
   history_window   a test whose outcome flipped in any of the last N rollups
                    is selected ("recent status change")
@@ -31,13 +31,13 @@ def settings(repo: Path, **overrides) -> dict:
     out = dict(DEFAULTS)
     try:
         table = tomllib.loads((Path(repo) / "pyproject.toml").read_text())
-        table = table.get("tool", {}).get("fastest", {})
+        table = table.get("tool", {}).get("bolttest", {})
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         table = {}
     for name in DEFAULTS:
         if name in table:
             out[name] = int(table[name])
-        env = os.environ.get(f"FASTEST_{name.upper()}")
+        env = os.environ.get(f"BOLTTEST_{name.upper()}")
         if env:
             out[name] = int(env)
         if overrides.get(name) is not None:

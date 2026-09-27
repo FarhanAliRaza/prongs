@@ -8,9 +8,9 @@ import os
 
 import pytest
 
-from fastest import journal, mapdb
-from fastest.select import flaky_tests, recent_status_changes
-from fastest.select import test_history as history_of
+from bolttest import journal, mapdb
+from bolttest.select import flaky_tests, recent_status_changes
+from bolttest.select import test_history as history_of
 
 
 @pytest.fixture

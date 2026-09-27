@@ -1,19 +1,19 @@
 """Agent-facing CLI (PoC Phase 5).
 
-  python -m fastest affected [--base REV]             what would run, and why — JSON
-  python -m fastest run [--base REV] [--no-cov]       select + execute + JSON results
+  python -m bolttest affected [--base REV]             what would run, and why — JSON
+  python -m bolttest run [--base REV] [--no-cov]       select + execute + JSON results
                         [--no-record]
-  python -m fastest audit [--base REV]                select, then run everything and
+  python -m bolttest audit [--base REV]                select, then run everything and
                                                       report every status change the
                                                       selection skipped, with receipts
-  python -m fastest rollup                            fold pending journal files into
+  python -m bolttest rollup                            fold pending journal files into
                                                       the map
-  python -m fastest ci save DIR                       write the map and this job's
+  python -m bolttest ci save DIR                       write the map and this job's
                                                       journal files as a CI artifact
-  python -m fastest ci restore PATH...                install CI artifacts into a
+  python -m bolttest ci restore PATH...                install CI artifacts into a
                                                       fresh clone (see ci.py)
-  python -m fastest daemon                            start the warm daemon
-  python -m fastest stop                              stop the daemon
+  python -m bolttest daemon                            start the warm daemon
+  python -m bolttest stop                              stop the daemon
 
 Run from the repo root (same directory you'd run pytest from).
 `run` uses the warm daemon when its socket exists, else falls back to
@@ -61,15 +61,15 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from fastest import config, journal, provenance
-from fastest.select import select
+from bolttest import config, journal, provenance
+from bolttest.select import select
 
 
 def roll_up(repo: Path) -> dict:
     """Fold pending journal files into the map: lazily, before every
     selection, so a run's evidence counts as soon as the next command reads
     the map. The selector itself only reads."""
-    from fastest import mapdb
+    from bolttest import mapdb
 
     return mapdb.rollup(journal.map_path(repo), journal.journal_dir(repo))
 
@@ -115,7 +115,7 @@ def cmd_affected(args) -> dict:
 
 
 def settings(repo: Path, args) -> dict:
-    """[tool.fastest], environment, then this command's flags."""
+    """[tool.bolttest], environment, then this command's flags."""
     return config.settings(repo, **{name: getattr(args, name, None) for name in config.DEFAULTS})
 
 
@@ -145,7 +145,7 @@ def no_map_selection(pending: int) -> dict:
         "targets": [],
         "evidence": {"map": None, "journal": {"rolled_up_now": 0, "pending": pending}},
         "skip_receipt": {"skipped": 0, "rule": f"nothing skipped: {reason}"},
-        "hint": "any recorded run builds the map: fastest run, or pytest --fastest-cov",
+        "hint": "any recorded run builds the map: bolttest run, or pytest --bolttest-cov",
     }
 
 
@@ -196,7 +196,7 @@ TRACEBACKS = "--tb=native"
 
 
 def run_via_daemon(targets: list[str], extra_args: list[str]) -> dict | None:
-    from fastest.daemon import SOCK, recv_msg, send_msg
+    from bolttest.daemon import SOCK, recv_msg, send_msg
     import socket
 
     if not os.path.exists(SOCK):
@@ -213,7 +213,7 @@ def run_via_daemon(targets: list[str], extra_args: list[str]) -> dict | None:
 
 
 def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
-    from fastest.daemon import ResultCollector, execution_response  # the daemon's schema
+    from bolttest.daemon import ResultCollector, execution_response  # the daemon's schema
 
     import io
 
@@ -381,8 +381,8 @@ def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict,
     failing now on a tree where it passed before. Reported under `flaky`
     with its history; a failing one is retried (retry_flaky) before it is
     counted either way."""
-    from fastest import mapdb
-    from fastest.select import contradicted_on_tree
+    from bolttest import mapdb
+    from bolttest.select import contradicted_on_tree
 
     known = aff.get("flaky", {})
     failed = [r["id"] for r in results if r["status"] == "failed" and r["id"] not in known]
@@ -414,7 +414,7 @@ def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
     recorded like any run (unless --no-record), so a pass lands in history
     next to the failure on the same tree: the next run knows the flake.
     Retries use the warm daemon when the run did, else a fresh pytest."""
-    from fastest.audit import observe
+    from bolttest.audit import observe
 
     jdir = journal.journal_dir(repo)
     for entry in flaky.values():
@@ -425,14 +425,14 @@ def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
             status = None
             if warm:
                 key = journal.new_key()
-                extra = ["--tb=no"] + (["--fastest-cov", "--fastest-journal", str(jdir),
-                                        "--fastest-journal-key", key] if record else [])
+                extra = ["--tb=no"] + (["--bolttest-cov", "--bolttest-journal", str(jdir),
+                                        "--bolttest-journal-key", key] if record else [])
                 resp = run_via_daemon([entry["test"]], extra)
                 if resp and not resp.get("stale") and "error" not in resp:
                     status = next((r["status"] for r in resp.get("results", [])
                                    if r["id"] == entry["test"]), "absent")
             if status is None:
-                args = shlex.split(os.environ.get("FASTEST_RUN_ARGS", ""))
+                args = shlex.split(os.environ.get("BOLTTEST_RUN_ARGS", ""))
                 status = observe(repo, sys.executable, args, targets=[entry["test"]],
                                  record=record)["statuses"].get(entry["test"], "absent")
             entry["retries"].append(status)
@@ -471,7 +471,7 @@ def cmd_run(args) -> dict:
     key = journal.new_key() if mode else None
     jdir = journal.journal_dir(repo)
     extra = [TRACEBACKS] + (
-        ["--fastest-cov", "--fastest-journal", str(jdir), "--fastest-journal-key", key]
+        ["--bolttest-cov", "--bolttest-journal", str(jdir), "--bolttest-journal-key", key]
         if mode == "coverage" else []
     )
     snap, started = provenance.snapshot(repo), time.time()  # the tree this run executes
@@ -566,15 +566,15 @@ def cmd_run(args) -> dict:
 
 
 def cmd_audit(args) -> dict:
-    from fastest.audit import audit, checkout_control
+    from bolttest.audit import audit, checkout_control
 
     repo = Path.cwd()
     if args.rollup:
         roll_up(repo)
     if not journal.map_path(repo).exists():
         return {"error": "no coverage map",
-                "hint": "build one with: pytest --fastest-cov (then fastest rollup)"}
-    raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
+                "hint": "build one with: pytest --bolttest-cov (then bolttest rollup)"}
+    raw = args.pytest_args if args.pytest_args is not None else os.environ.get("BOLTTEST_RUN_ARGS", "")
     control = checkout_control(repo, pytest_args=shlex.split(raw)) if args.control else None
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
                 record=args.record, rollup=False, history_window=args.history_window,
@@ -585,7 +585,7 @@ def cmd_audit(args) -> dict:
 
 
 def cmd_ci(args) -> dict:
-    from fastest import ci
+    from bolttest import ci
 
     repo = Path.cwd()
     if args.ci_cmd == "save":
@@ -619,7 +619,7 @@ def exit_code(cmd: str, out: dict) -> int:
 def main():
     import argparse
 
-    ap = argparse.ArgumentParser(prog="fastest")
+    ap = argparse.ArgumentParser(prog="bolttest")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("affected", "run", "audit"):
         p = sub.add_parser(name)
@@ -629,13 +629,13 @@ def main():
                        help="fold pending journal files into the map first (default: on)")
         p.add_argument("--history-window", type=int, default=None, metavar="N",
                        help="select tests whose outcome flipped in the last N rollups "
-                            "(default: [tool.fastest] history_window, else 3)")
+                            "(default: [tool.bolttest] history_window, else 3)")
         p.add_argument("--max-map-age", type=int, default=None, metavar="N",
                        help="run everything when the map is more than N commits behind HEAD "
-                            "(default: [tool.fastest] max_map_age, else 50)")
+                            "(default: [tool.bolttest] max_map_age, else 50)")
         p.add_argument("--flaky-window", type=int, default=None, metavar="N",
                        help="flaky evidence (both outcomes on one tree) older than N rollups "
-                            "expires (default: [tool.fastest] flaky_window, else 50)")
+                            "expires (default: [tool.bolttest] flaky_window, else 50)")
         if name == "run":
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
                            help="append this run to the journal, refreshing the tests it "
@@ -645,12 +645,12 @@ def main():
                                 "and durations (default: on)")
             p.add_argument("--flaky-retries", type=int, default=None, metavar="N",
                            help="re-run a failing flaky test alone up to N times; a pass makes "
-                                "it a flake, else it is a failure (default: [tool.fastest] "
+                                "it a flake, else it is a failure (default: [tool.bolttest] "
                                 "flaky_retries, else 2; 0: a flaky failure is a failure)")
         if name == "audit":
             p.add_argument("--pytest-args", default=None,
                            help="extra pytest arguments for the full run "
-                                "(default: $FASTEST_RUN_ARGS)")
+                                "(default: $BOLTTEST_RUN_ARGS)")
             p.add_argument("--isolate", action=argparse.BooleanOptionalAction, default=True,
                            help="re-run each miss alone to separate first-order misses "
                                 "from second-order pollution (default: on)")
@@ -682,11 +682,11 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "daemon":
-        from fastest.daemon import serve
+        from bolttest.daemon import serve
 
         serve()
     elif args.cmd == "stop":
-        from fastest.daemon import SOCK, send_msg, recv_msg
+        from bolttest.daemon import SOCK, send_msg, recv_msg
         import socket
 
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

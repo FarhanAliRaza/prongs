@@ -1,0 +1,113 @@
+# bolttest's own CI, running on bolttest.
+#
+# bolttest calls pytest in-process and registers its plugin through an entry
+# point, so the checkout under test is also the bolttest doing the selecting.
+# That is the point (this is the flow examples/github-actions.yml describes),
+# but it means a pull request that breaks the selector could skip the tests
+# that would catch it. So the merge gate is a plain full run; `bolttest run`
+# is the dogfood, and a test that fails in the full run but was not selected
+# is a selection miss that fails the job on its own.
+#
+# push / nightly   restore the newest map, fold the journals recent pull
+#                  request jobs uploaded, run everything recorded, save the map
+# pull request     restore the newest map, `bolttest run` the affected tests,
+#                  then the full suite, upload this job's journals
+
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: pip install -e . pytest
+
+      - name: Restore the map
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bolttest-ci/map
+          key: bolttest-map-py${{ matrix.python }}-${{ github.sha }}
+          restore-keys: bolttest-map-py${{ matrix.python }}-
+
+      - name: Collect pull-request journals
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bolttest-ci/journals"
+          for id in $(gh run list --workflow "${{ github.workflow }}" --event pull_request \
+                        --status completed --limit 50 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$id" --pattern "bolttest-journals-py${{ matrix.python }}-*" \
+              --dir "$RUNNER_TEMP/bolttest-ci/journals/$id" || true
+          done
+
+      - name: Restore
+        run: bolttest ci restore "$RUNNER_TEMP/bolttest-ci"
+
+      - name: Affected tests (bolttest run)
+        id: affected
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: bolttest run | tee "$RUNNER_TEMP/bolttest-result.json"
+
+      - name: Full suite (the gate)
+        if: github.event_name == 'pull_request'
+        run: python -m pytest
+
+      - name: Selection miss check
+        if: github.event_name == 'pull_request' && always() && steps.affected.outcome != 'skipped'
+        run: |
+          # `bolttest run` passed while the full suite failed: the selector
+          # skipped a test the change broke. Fail loudly, not just via pytest.
+          if [ "${{ steps.affected.outcome }}" = "success" ] && [ "${{ job.status }}" = "failure" ]; then
+            echo "::error::bolttest run passed but the full suite failed: selection miss"
+            exit 1
+          fi
+
+      - name: Full suite, recorded
+        if: github.event_name != 'pull_request'
+        run: python -m pytest --bolttest-cov
+
+      - name: Save this job's journals
+        if: always() && github.event_name == 'pull_request'
+        run: bolttest ci save --no-map "$RUNNER_TEMP/bolttest-out"
+
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name == 'pull_request'
+        with:
+          name: bolttest-journals-py${{ matrix.python }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bolttest-out
+          retention-days: 14
+
+      - name: Save the map
+        if: always() && github.event_name != 'pull_request'
+        run: bolttest ci save --no-journals "$RUNNER_TEMP/bolttest-ci/map"
+
+      - uses: actions/cache/save@v4
+        if: always() && github.event_name != 'pull_request'
+        with:
+          path: ${{ runner.temp }}/bolttest-ci/map
+          key: bolttest-map-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

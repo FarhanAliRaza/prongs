@@ -207,7 +207,7 @@ def test_unknown_revision_is_a_clean_error(recorded):
 
 
 def test_non_git_directory_is_a_clean_error(tmp_path):
-    from fastest.select import select
+    from bolttest.select import select
 
     assert select(tmp_path / "map.sqlite", tmp_path)["mode"] == "error"
     assert not (tmp_path / "map.sqlite").exists()  # nothing was created

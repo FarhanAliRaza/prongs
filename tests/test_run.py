@@ -1,11 +1,11 @@
-"""`fastest run` as the agent reads it: the status verdict, the conservation
+"""`bolttest run` as the agent reads it: the status verdict, the conservation
 block that must balance, and failures grouped by root cause."""
 
 from __future__ import annotations
 
 from conftest import T_A, T_B, T_C
 
-from fastest.__main__ import exception_line, group_failures
+from bolttest.__main__ import exception_line, group_failures
 
 
 def test_selected_run_balances_its_books(recorded):

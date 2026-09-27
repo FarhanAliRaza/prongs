@@ -1,19 +1,37 @@
 [project]
-name = "fastest"
-version = "0.0.1"
-description = "Agent-native test runner for Python — PoC"
+name = "bolttest"
+dynamic = ["version"]
+description = "Agent-native test runner for Python: runs only the tests a change can affect"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = []
+classifiers = [
+  "Framework :: Pytest",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Source = "https://github.com/FarhanAliRaza/fastest"
+
+[project.scripts]
+bolttest = "bolttest.__main__:main"
 
 [project.entry-points.pytest11]
-fastest = "fastest.plugin"
+bolttest = "bolttest.plugin"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/bolttest/__init__.py"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/fastest"]
+packages = ["src/bolttest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

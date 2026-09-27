@@ -62,7 +62,7 @@ def shallow_hint(repo: Path) -> str:
     """Why an evidence commit may be missing, when this clone is shallow."""
     if not is_shallow(repo):
         return ""
-    return " (shallow clone: run `fastest ci restore`, or fetch the full history)"
+    return " (shallow clone: run `bolttest ci restore`, or fetch the full history)"
 
 
 def exists_at(repo: Path, rev: str, path: str) -> bool:
@@ -107,12 +107,12 @@ def blob_hash_at(repo: Path, rev: str, path: str) -> str | None:
 
 
 def _own_state(repo: Path) -> tuple[str, ...]:
-    """Path prefixes under the repository that hold fastest's own state (the
+    """Path prefixes under the repository that hold bolttest's own state (the
     map, the journal). They are never part of the tree a run observed: a
-    project that does not ignore .fastest/ would otherwise see every run's
+    project that does not ignore .bolttest/ would otherwise see every run's
     journal file as a change to its tree."""
-    prefixes = {".fastest/"}
-    for var in ("FASTEST_DIR", "FASTEST_JOURNAL"):
+    prefixes = {".bolttest/"}
+    for var in ("BOLTTEST_DIR", "BOLTTEST_JOURNAL"):
         value = os.environ.get(var)
         if value:
             try:
@@ -127,7 +127,7 @@ def dirty_files(repo: Path, contents: dict[str, bytes] | None = None) -> dict[st
     """path -> content hash for every file that differs from HEAD.
 
     Covers staged, unstaged and untracked (non-ignored) files, except
-    fastest's own state. Deleted files hash to None. Renames report the new
+    bolttest's own state. Deleted files hash to None. Renames report the new
     path. When `contents` is given, the bytes of each Python file (the only
     kind the selector line-diffs) are stored in it by hash.
     """
@@ -179,7 +179,7 @@ def between(start: dict, end: dict) -> dict:
 
 
 def recorder_fingerprint() -> str:
-    from fastest import __version__
+    from bolttest import __version__
 
     try:
         import pytest
@@ -188,4 +188,4 @@ def recorder_fingerprint() -> str:
     except ImportError:  # pragma: no cover - the recorder runs inside pytest
         pv = "?"
     py = ".".join(str(v) for v in sys.version_info[:3])
-    return f"fastest={__version__};python={py};pytest={pv};{platform.system().lower()}"
+    return f"bolttest={__version__};python={py};pytest={pv};{platform.system().lower()}"
