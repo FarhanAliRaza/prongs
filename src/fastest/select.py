@@ -308,7 +308,13 @@ def evidence_summary(con, repo: Path) -> tuple[dict, list[dict]]:
     return ev, contributing
 
 
-def build_trees(repo: Path, contributing: list[dict], base: str | None, ev: dict) -> list[Tree]:
+def build_trees(repo: Path, contributing: list[dict], base: str | None, ev: dict,
+                missing: dict[int, str] | None = None) -> list[Tree]:
+    """The trees the evidence was observed on. A run whose commit this
+    repository does not have (a deleted branch, a shallow clone) has no tree
+    to diff from: it goes into `missing` (run id -> commit) and its tests are
+    selected, never diffed from HEAD — which would show none of the changes
+    since and skip them."""
     if base is not None:
         ev["base_source"] = "explicit"
         sha = provenance.rev_parse(repo, base)
@@ -328,9 +334,12 @@ def build_trees(repo: Path, contributing: list[dict], base: str | None, ev: dict
                 exists[commit] = provenance.rev_parse(repo, commit) is not None
             if not exists[commit]:
                 ev["warnings"].append(
-                    f"run #{r['id']}: evidence commit {commit[:8]} no longer exists; diffing from HEAD"
+                    f"run #{r['id']}: evidence commit {commit[:8]} is not in this repository"
+                    f"{provenance.shallow_hint(repo)}; its tests are selected"
                 )
-                commit = None
+                if missing is not None:
+                    missing[r["id"]] = commit
+                continue
         else:
             ev["warnings"].append(f"run #{r['id']} carries no commit; diffing from HEAD")
         commit = commit or "HEAD"
@@ -657,7 +666,8 @@ def map_age(con, repo: Path, head: str | None) -> dict:
     if commit is None:
         age["unknown"] = "the last rollup recorded no commit"
     elif provenance.rev_parse(repo, commit) is None:
-        age["unknown"] = f"map commit {commit[:8]} is not in this repository"
+        age["unknown"] = (f"map commit {commit[:8]} is not in this repository"
+                          f"{provenance.shallow_hint(repo)}")
     else:
         age["commits_behind_head"] = provenance.count_commits(repo, commit, head or "HEAD")
     return age
@@ -781,7 +791,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         stale.append(f"map is {age['commits_behind_head']} commits behind HEAD "
                      f"(max_map_age {max_map_age})")
 
-    trees = build_trees(repo, contributing, base, ev)
+    missing: dict[int, str] = {}  # evidence run -> its commit, absent from this repository
+    trees = build_trees(repo, contributing, base, ev, missing)
     untracked = provenance.dirty_files(repo) if head is None else {}
     git_cache: dict[str, dict] = {}
     analyses: list[Analysis] = []
@@ -845,9 +856,13 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "evidence": ev,
         }
 
-    known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids}
+    known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids} | set(missing)
     selected: dict[str, str] = {}  # test_id -> reason
     selected_files: dict[str, str] = {}
+    for t, (_, deps_run) in all_tests.items():
+        if deps_run in missing:
+            selected[t] = (f"evidence commit {missing[deps_run][:8]} is not in this repository: "
+                           "nothing to diff it against")
     for tree, an in zip(trees, analyses):
         if tree.run_ids is None:
             in_tree = set(all_tests)

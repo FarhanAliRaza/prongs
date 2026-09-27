@@ -53,6 +53,18 @@ def count_commits(repo: Path, since: str, rev: str = "HEAD") -> int | None:
     return int(out.strip()) if out else None
 
 
+def is_shallow(repo: Path) -> bool:
+    out = _git(repo, "rev-parse", "--is-shallow-repository")
+    return bool(out) and out.strip() == "true"
+
+
+def shallow_hint(repo: Path) -> str:
+    """Why an evidence commit may be missing, when this clone is shallow."""
+    if not is_shallow(repo):
+        return ""
+    return " (shallow clone: run `fastest ci restore`, or fetch the full history)"
+
+
 def exists_at(repo: Path, rev: str, path: str) -> bool:
     return _git(repo, "cat-file", "-e", f"{rev}:{path}") is not None
 

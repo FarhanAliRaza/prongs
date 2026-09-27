@@ -79,6 +79,30 @@ def test_a_map_too_far_behind_head_runs_everything(recorded):
     assert recorded.cli("affected")["mode"] == "select"
 
 
+def test_evidence_from_a_commit_this_clone_lacks_is_never_diffed_from_head(recorded):
+    # test_b's newest evidence comes from a commit that is gone (a deleted
+    # branch; in CI, a shallow clone), while the map's own commit is here
+    main = recorded.git("rev-parse", "--abbrev-ref", "HEAD")
+    recorded.git("checkout", "-q", "-b", "side")
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # side")
+    side = recorded.commit("side edit")
+    assert recorded.record("tests/test_m.py::test_b").returncode == 0
+    recorded.git("checkout", "-q", main)
+    assert recorded.record("tests/test_m.py::test_a").returncode == 0
+    recorded.git("branch", "-qD", "side")
+    recorded.git("reflog", "expire", "--expire=now", "--all")
+    recorded.git("gc", "-q", "--prune=now")
+    recorded.edit("pkg/mod.py", "return 2", "return 3")  # breaks test_b and test_c
+    recorded.commit("break b")
+    sel = recorded.select()
+    assert sel["mode"] == "select" and sel["evidence"]["map_age"]["commits_behind_head"] == 1
+    # diffing test_b's evidence from HEAD would see no change and skip it
+    assert set(sel["selected"]) == {T_B, T_C}
+    assert sel["selected"][T_B] == (
+        f"evidence commit {side[:8]} is not in this repository: nothing to diff it against"
+    )
+
+
 def test_a_map_of_unknown_age_runs_everything(recorded):
     recorded.rollup()
     con = recorded.db()
