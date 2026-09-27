@@ -205,7 +205,8 @@ def test_v2_map_is_migrated_with_its_history(tmp_path):
         (1, "passed"), (2, "failed")
     ]
     assert con.execute("SELECT deps_run, last_run FROM tests").fetchall() == [(2, 2), (1, 1)]
-    assert mapdb.meta(con)["schema_version"] == "3" and mapdb.meta(con)["rollup_seq"] == "2"
+    assert mapdb.meta(con)["schema_version"] == "4" and mapdb.meta(con)["rollup_seq"] == "2"
+    assert con.execute("SELECT DISTINCT lineage FROM runs").fetchall() == [("own",)]
     before = con.execute("SELECT * FROM tests").fetchall()
     assert mapdb.rebuild_rollup(con) == 2 and con.execute("SELECT * FROM tests").fetchall() == before
     con.close()

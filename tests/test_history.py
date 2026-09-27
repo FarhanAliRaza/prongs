@@ -10,6 +10,7 @@ import pytest
 
 from fastest import journal, mapdb
 from fastest.select import flaky_tests, recent_status_changes
+from fastest.select import test_history as history_of
 
 
 @pytest.fixture
@@ -107,3 +108,21 @@ def test_flaky_test_is_reported_apart_from_failures(recorded, tmp_path):
     assert coin in out["tests"] and out["flaky"][coin]["passed"] == 1
     out = recorded.cli("run")
     assert out["summary"]["flaky"]["ran"] == 1 and out["failures"] == []
+
+
+def test_foreign_outcomes_never_count_as_a_recent_flip_but_do_show_flakes(tmp_path, root):
+    rolled(tmp_path, root, {"t::a": "passed", "t::b": "passed"}, commit="main1")
+    jdir = tmp_path / "journal"
+    foreign = jdir / journal.FOREIGN
+    records = {"t::a": (0.1, "failed", [(root + "pkg/mod.py", "f", 1)])}
+    # a pull request broke t::a on its own branch: not this branch's news
+    journal.append(foreign, root, records, {"scope": "partial", "commit": "pr1", "recorder": "r1"})
+    # and t::b flaked on another branch's tree: passed, then failed, same tree
+    for status in ("passed", "failed"):
+        journal.append(foreign, root, {"t::b": (0.1, status, [(root + "pkg/mod.py", "f", 1)])},
+                       {"scope": "partial", "commit": "pr2", "recorder": "r1"})
+    mapdb.rollup(tmp_path / "map.sqlite", jdir)
+    con = mapdb.connect(str(tmp_path / "map.sqlite"))
+    assert recent_status_changes(con, 3) == {}
+    assert flaky_tests(con) == {"t::b": {"tree": "pr2", "passed": 1, "failed": 1, "last_run": 4}}
+    assert [h.get("foreign", False) for h in history_of(con, "t::b")] == [False, True, True]

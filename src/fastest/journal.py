@@ -22,7 +22,9 @@ place, so a reader never sees half a run and writers never contend: two
 worktrees, xdist workers, a daemon child and a CI job each write their own
 file. rollup folds pending files and moves them to consumed/; read_run() and
 statuses() read one file with no map at all, which is all a CI artifact flow
-needs.
+needs. Files under journal/foreign/ were imported from another line of
+history (`fastest ci restore`: a CI job whose commit is not an ancestor of
+this checkout's HEAD) and fold as history only.
 
 State lives in <worktree>/.fastest/ unless FASTEST_DIR says otherwise (point
 several worktrees at one directory to pool their runs); FASTEST_JOURNAL
@@ -42,6 +44,7 @@ from pathlib import Path
 FORMAT = 1
 COLLECTION = "__collection__"  # pseudo-test: code executed at import/collection time
 STATE = ".fastest"
+FOREIGN = "foreign"  # journal/foreign/: runs from another line of history
 
 SCHEMA = """
 CREATE TABLE run (
@@ -244,16 +247,22 @@ def statuses(path) -> dict[str, str]:
 
 
 def pending(jdir) -> list[Path]:
-    """Journal files not yet rolled up, by name (≈ finish time)."""
+    """Journal files in `jdir` not yet rolled up, by name (≈ finish time)."""
     jdir = Path(jdir)
     if not jdir.is_dir():
         return []
     return sorted(p for p in jdir.glob("*.sqlite") if not p.name.startswith("."))
 
 
+def pending_all(jdir) -> list[Path]:
+    """Every journal file a rollup would fold: own, then foreign."""
+    return pending(jdir) + pending(Path(jdir) / FOREIGN)
+
+
 def find(jdir, key: str) -> Path | None:
-    """A run's journal file, pending or already consumed."""
-    for p in (Path(jdir) / f"{key}.sqlite", Path(jdir) / "consumed" / f"{key}.sqlite"):
+    """A run's journal file, pending (own or foreign) or already consumed."""
+    for sub in ("", FOREIGN, "consumed"):
+        p = Path(jdir) / sub / f"{key}.sqlite"
         if p.exists():
             return p
     return None

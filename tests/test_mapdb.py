@@ -81,7 +81,7 @@ def test_full_run_writes_journal_and_rollup(tmp_path, root):
         (COLLECTION, "<module>"), ("tests/t.py::test_a", "a"),
         ("tests/t.py::test_b", "b"), ("tests/t.py::test_b2", "b"),
     }
-    assert rows(con, "SELECT value FROM meta WHERE key='schema_version'") == [("3",)]
+    assert rows(con, "SELECT value FROM meta WHERE key='schema_version'") == [("4",)]
 
 
 def test_partial_run_refreshes_only_what_it_observed(tmp_path, root):
@@ -244,3 +244,102 @@ def test_concurrent_writers_append_without_clobbering(tmp_path, root):
                      f"WHERE t.test_id='{COLLECTION}'")
     assert coll == [(3,)]  # all three import-time sets survived
     assert journal.pending(jdir) == [] and len(list((jdir / "consumed").iterdir())) == 3
+
+
+def view(db: str) -> tuple[dict, dict]:
+    """The current view with run ids replaced by journal keys, so maps folded
+    in different orders compare: ({test_id: (status, deps, retired,
+    last_run, deps_run)}, meta commit)."""
+    con = sqlite3.connect(db)
+    key = dict(rows(con, "SELECT id, journal_key FROM runs"))
+    deps: dict[str, set] = {}
+    for t, path, q in rows(con, "SELECT t.test_id, f.path, fn.qualname FROM current_links l "
+                                "JOIN tests t ON t.id=l.test_id JOIN funcs fn ON fn.id=l.func_id "
+                                "JOIN files f ON f.id=fn.file_id"):
+        deps.setdefault(t, set()).add(q if path == "pkg/mod.py" else f"{path}:{q}")
+    out = {
+        t: (status, frozenset(deps.get(t, ())), retired is not None, key.get(last), key.get(dr))
+        for t, status, retired, last, dr in rows(
+            con, "SELECT test_id, status, retired_run, last_run, deps_run FROM tests")
+    }
+    return out, dict(rows(con, "SELECT key, value FROM meta WHERE key='rollup_commit'"))
+
+
+def test_fold_order_does_not_change_the_map(tmp_path, root):
+    # three runs, as three CI jobs' journal files; the second finished
+    # between the others but may arrive last
+    runs = [
+        ({COLLECTION: (0.0, "collection", [dep(root, "pkg/mod.py", "<module>")]),
+          "tests/a.py::test_1": (0.1, "passed", [dep(root, "pkg/mod.py", "a")]),
+          "tests/a.py::test_2": (0.1, "passed", [dep(root, "pkg/mod.py", "b")])},
+         dict(run_info(commit="c1"), started_at=10.0, finished_at=11.0)),
+        ({COLLECTION: (0.0, "collection", [dep(root, "pkg/x.py", "<module>")]),
+          "tests/a.py::test_1": (0.1, "failed", [dep(root, "pkg/mod.py", "c")])},
+         dict(run_info(scope="partial", commit="c2"), started_at=20.0, finished_at=21.0)),
+        ({COLLECTION: (0.0, "collection", [dep(root, "pkg/mod.py", "<module>")]),
+          "tests/a.py::test_1": (0.1, "passed", [dep(root, "pkg/mod.py", "a")])},
+         dict(run_info(commit="c3"), started_at=30.0, finished_at=31.0)),
+    ]
+    views = []
+    for order in ([0, 1, 2], [2, 0, 1], [1, 2, 0]):
+        db, jdir = str(tmp_path / f"map-{order}.sqlite"), tmp_path / f"journal-{order}"
+        keys = [f"2026010{i}T000000.000000Z-1-00000{i}" for i in range(3)]
+        for i in order:  # one rollup per arrival
+            journal.append(jdir, root, runs[i][0], runs[i][1], key=keys[i])
+            mapdb.rollup(db, jdir)
+        views.append(view(db))
+    assert views[0] == views[1] == views[2]
+    tests, commit = views[0]
+    # the newest run wins: test_1 passes again on c3, test_2 was deleted by then
+    assert tests["tests/a.py::test_1"][:3] == ("passed", frozenset({"a"}), False)
+    assert tests["tests/a.py::test_2"][2] is True
+    # the newest complete import-time snapshot replaced the partial run's union
+    assert tests[COLLECTION][1] == {"<module>"}
+    assert commit == {"rollup_commit": "c3"}
+    # and replaying history in id order agrees with the incremental folds
+    con = mapdb.connect(str(tmp_path / "map-[2, 0, 1].sqlite"))
+    mapdb.rebuild_rollup(con)
+    con.close()
+    assert view(str(tmp_path / "map-[2, 0, 1].sqlite")) == views[0]
+
+
+def test_a_foreign_run_adds_history_and_nothing_else(tmp_path, root):
+    db, jdir = str(tmp_path / "map.sqlite"), tmp_path / "journal"
+    record(db, root, {"tests/a.py::test_1": (0.1, "passed", [dep(root, "pkg/mod.py", "a")])},
+           dict(run_info(commit="main1"), finished_at=10.0))
+    # another branch's CI job, newer and full, failing test_1 and adding a test
+    journal.append(jdir / journal.FOREIGN, root, {
+        COLLECTION: (0.0, "collection", [dep(root, "pkg/branch.py", "<module>")]),
+        "tests/a.py::test_1": (0.1, "failed", [dep(root, "pkg/mod.py", "z")]),
+        "tests/a.py::test_new": (0.1, "passed", [dep(root, "pkg/mod.py", "a")]),
+    }, dict(run_info(commit="pr1"), finished_at=20.0))
+    res = mapdb.rollup(db, jdir)
+    assert [r["lineage"] for r in res["runs"]] == ["foreign"] and res["commit"] == "main1"
+    con = mapdb.connect(db)
+    assert rows(con, "SELECT status, deps_run, last_run, retired_run FROM tests "
+                     "WHERE test_id='tests/a.py::test_1'") == [("passed", 1, 1, None)]
+    assert links(con) == {("tests/a.py::test_1", "a")}  # no foreign evidence
+    assert rows(con, "SELECT last_run FROM tests WHERE test_id='tests/a.py::test_new'") == [(None,)]
+    assert rows(con, "SELECT status, deps_set FROM history WHERE run_id=2 ORDER BY test_id") == [
+        ("failed", None), ("passed", None)
+    ]
+    assert rows(con, "SELECT value FROM meta WHERE key='rollup_commit'") == [("main1",)]
+    assert [r["id"] for r in mapdb.contributing_runs(con)] == [1]
+    assert mapdb.last_full_run(con)["id"] == 1
+    assert journal.pending_all(jdir) == []
+
+
+def test_a_partial_run_after_the_last_full_run_stays_in_the_import_time_set(tmp_path, root):
+    full = ({COLLECTION: (0.0, "collection", [dep(root, "pkg/mod.py", "<module>")])},
+            dict(run_info(commit="c1"), finished_at=11.0))
+    partial = ({COLLECTION: (0.0, "collection", [dep(root, "pkg/x.py", "<module>")])},
+               dict(run_info(scope="partial", commit="c2"), finished_at=21.0))
+    for order in ((full, partial), (partial, full)):
+        db, jdir = str(tmp_path / f"map-{id(order)}.sqlite"), tmp_path / f"journal-{id(order)}"
+        for records, info in order:
+            journal.append(jdir, root, records, info)
+            mapdb.rollup(db, jdir)
+        con = sqlite3.connect(db)
+        assert set(rows(con, "SELECT f.path FROM current_links l JOIN tests t ON t.id=l.test_id "
+                             "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
+                             f"WHERE t.test_id='{COLLECTION}'")) == {("pkg/mod.py",), ("pkg/x.py",)}

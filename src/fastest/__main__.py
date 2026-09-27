@@ -72,7 +72,7 @@ def cmd_affected(args) -> dict:
     db, jdir = journal.map_path(repo), journal.journal_dir(repo)
     rolled = roll_up(repo) if getattr(args, "rollup", True) else None
     if not db.exists():
-        return no_map_selection(len(journal.pending(jdir)))
+        return no_map_selection(len(journal.pending_all(jdir)))
     cfg = config.settings(repo, history_window=getattr(args, "history_window", None),
                           max_map_age=getattr(args, "max_map_age", None))
     sel = select(db, repo, args.base, history_window=cfg["history_window"],
@@ -102,7 +102,7 @@ def cmd_affected(args) -> dict:
         "targets": sel["targets"],
         "evidence": sel["evidence"] | {"journal": {
             "rolled_up_now": rolled["rolled_up"] if rolled else 0,
-            "pending": len(journal.pending(jdir)),
+            "pending": len(journal.pending_all(jdir)),
         }},
         "skip_receipt": skip_receipt(sel),
     }
@@ -512,7 +512,7 @@ def cmd_rollup(args) -> dict:
     repo = Path.cwd()
     res = roll_up(repo)
     res["map"] = str(journal.map_path(repo))
-    res["pending"] = len(journal.pending(journal.journal_dir(repo)))
+    res["pending"] = len(journal.pending_all(journal.journal_dir(repo)))
     return res
 
 

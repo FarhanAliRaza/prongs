@@ -276,20 +276,23 @@ def _rollup_meta(con) -> dict:
 
 def evidence_summary(con, repo: Path) -> tuple[dict, list[dict]]:
     """(evidence block, contributing runs)."""
-    all_runs = mapdb.runs(con)
+    all_runs = mapdb.runs(con, lineage="own")
     full = mapdb.last_full_run(con)
     contributing = mapdb.contributing_runs(con)
     commits = sorted({r["commit_sha"] for r in contributing if r["commit_sha"]})
     refreshed = None
     if full:
         refreshed = con.execute(
-            "SELECT COUNT(*) FROM tests WHERE retired_run IS NULL AND deps_run > ? "
-            "AND test_id != ?",
-            (full["id"], mapdb.COLLECTION),
+            "SELECT COUNT(*) FROM tests t JOIN runs d ON d.id = t.deps_run "
+            "WHERE t.retired_run IS NULL AND t.test_id != ? "
+            "AND (COALESCE(d.finished_at, 0), d.id) > (?, ?)",
+            (mapdb.COLLECTION, full["finished_at"] or 0.0, full["id"]),
         ).fetchone()[0]
     ev = {
         "schema": mapdb.SCHEMA_VERSION,
         "runs": len(all_runs),
+        "foreign_runs": con.execute(
+            "SELECT COUNT(*) FROM runs WHERE lineage='foreign'").fetchone()[0],
         "last_full_run": _brief(full),
         "last_run": _brief(all_runs[-1]) if all_runs else None,
         "contributing_runs": [r["id"] for r in contributing],
@@ -568,27 +571,38 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
 
 def recent_status_changes(con, window: int) -> dict[str, str]:
     """test_id -> reason, for every live test whose outcome flipped (passed
-    <-> failed, against its previous outcome) in one of the last `window`
-    rollups. Coverage cannot see a test broken by another test's leftovers
-    (poc-results finding 2: a selected failure skipped its cleanup and five
-    tests that never touch the changed code failed after it); history can,
-    once a run has observed the flip, and keeps selecting the test until
-    `window` rollups pass without one."""
-    top = con.execute("SELECT MAX(rollup_seq) FROM runs").fetchone()[0]
-    if window <= 0 or top is None:
+    <-> failed, against its previous outcome, in the order the runs
+    happened) in one of the last `window` rollups of own runs. Coverage
+    cannot see a test broken by another test's leftovers (poc-results
+    finding 2: a selected failure skipped its cleanup and five tests that
+    never touch the changed code failed after it); history can, once a run
+    has observed the flip, and keeps selecting the test until `window`
+    rollups pass without one. Foreign runs (another branch's CI jobs) never
+    count: their outcomes describe code this line of history may never
+    have."""
+    if window <= 0:
         return {}
+    seqs = [q for (q,) in con.execute(
+        "SELECT DISTINCT rollup_seq FROM runs WHERE lineage='own' "
+        "ORDER BY rollup_seq DESC LIMIT ?", (window,)
+    )]
+    if not seqs:
+        return {}
+    low = min(seqs)
     rows = con.execute(
         "WITH h AS ("
         " SELECT h.test_id, h.run_id, r.rollup_seq, h.status,"
-        "  LAG(h.status) OVER (PARTITION BY h.test_id ORDER BY h.run_id) AS prev"
+        "  COALESCE(r.finished_at, 0) AS t,"
+        "  LAG(h.status) OVER (PARTITION BY h.test_id"
+        "   ORDER BY COALESCE(r.finished_at, 0), h.run_id) AS prev"
         " FROM history h JOIN runs r ON r.id = h.run_id"
-        " WHERE h.status IN ('passed', 'failed') AND h.test_id IN ("
+        " WHERE r.lineage = 'own' AND h.status IN ('passed', 'failed') AND h.test_id IN ("
         "  SELECT h2.test_id FROM history h2 JOIN runs r2 ON r2.id = h2.run_id"
-        "  WHERE r2.rollup_seq > ?))"
+        "  WHERE r2.lineage = 'own' AND r2.rollup_seq >= ?))"
         " SELECT t.test_id, h.prev, h.status, h.run_id FROM h JOIN tests t ON t.id = h.test_id"
-        " WHERE h.rollup_seq > ? AND h.prev IS NOT NULL AND h.prev != h.status"
-        " AND t.retired_run IS NULL ORDER BY h.run_id",
-        (top - window, top - window),
+        " WHERE h.rollup_seq >= ? AND h.prev IS NOT NULL AND h.prev != h.status"
+        " AND t.retired_run IS NULL ORDER BY h.t, h.run_id",
+        (low, low),
     ).fetchall()
     return {  # the latest flip wins
         test_id: f"recent status change: {prev} -> {status} in run #{run_id}"
@@ -623,14 +637,17 @@ def flaky_tests(con) -> dict[str, dict]:
 
 
 def test_history(con, test_id: str, limit: int = 10) -> list[dict]:
-    """A test's latest outcomes, oldest first: the receipt for a flake."""
+    """A test's latest outcomes, oldest first: the receipt for a flake.
+    Outcomes from another line of history are marked foreign."""
     rows = con.execute(
-        "SELECT h.run_id, r.commit_sha, r.dirty_files, h.status FROM history h "
+        "SELECT h.run_id, r.commit_sha, r.dirty_files, h.status, r.lineage FROM history h "
         "JOIN runs r ON r.id = h.run_id JOIN tests t ON t.id = h.test_id "
-        "WHERE t.test_id = ? ORDER BY h.run_id DESC LIMIT ?", (test_id, limit),
+        "WHERE t.test_id = ? ORDER BY COALESCE(r.finished_at, 0) DESC, h.run_id DESC LIMIT ?",
+        (test_id, limit),
     ).fetchall()
     return [{"run": run_id, "tree": _tree(sha, dirty), "status": status}
-            for run_id, sha, dirty, status in reversed(rows)]
+            | ({"foreign": True} if lineage == "foreign" else {})
+            for run_id, sha, dirty, status, lineage in reversed(rows)]
 
 
 def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str) -> dict[str, dict]:
