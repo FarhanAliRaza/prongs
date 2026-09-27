@@ -8,6 +8,10 @@
                                                       selection skipped, with receipts
   python -m fastest rollup                            fold pending journal files into
                                                       the map
+  python -m fastest ci save DIR                       write the map and this job's
+                                                      journal files as a CI artifact
+  python -m fastest ci restore PATH...                install CI artifacts into a
+                                                      fresh clone (see ci.py)
   python -m fastest daemon                            start the warm daemon
   python -m fastest stop                              stop the daemon
 
@@ -508,6 +512,15 @@ def cmd_audit(args) -> dict:
     return res
 
 
+def cmd_ci(args) -> dict:
+    from fastest import ci
+
+    repo = Path.cwd()
+    if args.ci_cmd == "save":
+        return ci.save(repo, Path(args.dir), with_map=args.map, with_journals=args.journals)
+    return ci.restore(repo, args.paths, fetch=args.fetch, remote=args.remote)
+
+
 def cmd_rollup(args) -> dict:
     repo = Path.cwd()
     res = roll_up(repo)
@@ -566,6 +579,21 @@ def main():
                            help="append the full run to the journal instead of a temporary "
                                 "database (default: off — an audit never feeds the map)")
     sub.add_parser("rollup")
+    ci = sub.add_parser("ci", help="carry the map and journal files between CI jobs")
+    ci_sub = ci.add_subparsers(dest="ci_cmd", required=True)
+    p = ci_sub.add_parser("save", help="write an artifact directory")
+    p.add_argument("dir")
+    p.add_argument("--map", action=argparse.BooleanOptionalAction, default=True,
+                   help="a snapshot of the map, pending journal files rolled up first "
+                        "(default: on; a pull-request job needs --no-map)")
+    p.add_argument("--journals", action=argparse.BooleanOptionalAction, default=True,
+                   help="the journal files this checkout wrote (default: on)")
+    p = ci_sub.add_parser("restore", help="install artifact directories into this checkout")
+    p.add_argument("paths", nargs="+", help="artifact directories, or directories holding them")
+    p.add_argument("--fetch", action=argparse.BooleanOptionalAction, default=True,
+                   help="deepen a shallow clone until the map's evidence commits are present "
+                        "(default: on)")
+    p.add_argument("--remote", default="origin", help="the remote to fetch history from")
     sub.add_parser("daemon")
     sub.add_parser("stop")
     args = ap.parse_args()
@@ -584,7 +612,7 @@ def main():
         recv_msg(c)
     else:
         commands = {"affected": cmd_affected, "run": cmd_run, "audit": cmd_audit,
-                    "rollup": cmd_rollup}
+                    "rollup": cmd_rollup, "ci": cmd_ci}
         out = commands[args.cmd](args)
         print(json.dumps(out, indent=2))
         sys.exit(exit_code(args.cmd, out))
