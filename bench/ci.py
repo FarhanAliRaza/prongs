@@ -23,12 +23,21 @@ is a pull request against its parent, then merged:
              tree), rather than a second full run of the same code. Between
              main jobs, PR jobs select from a map up to K commits behind.
 
+With --inject, each PR job also breaks one function the map covers (a
+seeded random pick: `raise RuntimeError` as its first statement, as
+bench/mutate.py does) and commits that on top, the way a pull request adds a
+commit: real history changes few test outcomes, and an audit with no status
+changes proves little. The main job then records its own full run of the
+unbroken commit, and the PR job's journal (on a commit the main branch never
+has) folds as foreign history.
+
 Reported per PR job: the selection (mode, selected/total, reasons), the
 exit code and wall time of `fastest run` next to the full suite's, what
 `ci restore` fetched and how long it took, misses. Kill criterion: any
 first-order miss.
 
 Usage: python bench/ci.py testbeds/httpx --commits 20 [--shallow] [--map-every K]
+                                        [--inject [--seed N]]
 """
 
 from __future__ import annotations
@@ -36,13 +45,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))  # bench/mutate.py, for --inject
 
 # a job starts from the runner's environment, not the harness's: no fastest
 # settings, and no proxy (httpx's proxy tests read these, and fail on a
@@ -66,7 +79,26 @@ def checkout(origin: Path, sha: str, dest: Path, shallow: bool) -> Path:
     git(dest, "remote", "add", "origin", origin.as_uri())
     git(dest, "fetch", "-q", "--no-tags", *(["--depth=1"] if shallow else []), "origin", sha)
     git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+    git(dest, "config", "user.email", "ci@example.com")
+    git(dest, "config", "user.name", "ci")
     return dest
+
+
+def inject(job: Path, rng: random.Random) -> str | None:
+    """Break one function the restored map covers, and commit it."""
+    from mutate import mapped_functions, mutate_function
+
+    db = job / ".fastest" / "map.sqlite"
+    try:
+        candidates = mapped_functions(db)
+    except sqlite3.Error:
+        return None
+    rng.shuffle(candidates)
+    for path, qual in candidates:
+        if (job / path).is_file() and mutate_function(job, path, qual):
+            git(job, "commit", "-qam", f"inject a fault into {path}::{qual}")
+            return f"{path}::{qual}"
+    return None
 
 
 class Job:
@@ -95,13 +127,18 @@ def main():
     ap.add_argument("--map-every", type=int, default=1, metavar="K",
                     help="a main job (a new map artifact) on every K-th commit")
     ap.add_argument("--work", type=Path, default=None, help="scratch directory for the jobs")
+    ap.add_argument("--inject", action="store_true",
+                    help="each PR job breaks one mapped function, committed on top")
+    ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
+    rng = random.Random(args.seed)
     origin = args.repo.resolve()
     py = str(origin / ".venv" / "bin" / "python")
     work = (args.work or Path(tempfile.mkdtemp(prefix="fastest-ci-"))).resolve()
     store = work / "artifacts"
     store.mkdir(parents=True, exist_ok=True)
-    tag = ("-shallow" if args.shallow else "") + (f"-every{args.map_every}" if args.map_every > 1 else "")
+    tag = (("-shallow" if args.shallow else "") + ("-inject" if args.inject else "")
+           + (f"-every{args.map_every}" if args.map_every > 1 else ""))
     out_path = Path(__file__).parent.parent / "results" / f"ci-{origin.name}{tag}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -127,17 +164,19 @@ def main():
         is_main = i % args.map_every == 0
         job = Job(checkout(origin, sha, work / "job", shallow=args.shallow), py)
         _, restored, restore_wall = job.fastest("ci", "restore", str(maps[-1]))
+        injected = inject(job.path, rng) if args.inject else None
         code, run, run_wall = job.fastest("run")
         # shadow mode: the full suite as ground truth (recorded on main commits,
-        # where it doubles as the main job's full run)
-        audit_args = ["audit", "--no-rollup"] + (["--record"] if is_main else [])
+        # where it doubles as the main job's full run, unless a fault was injected)
+        record = is_main and not args.inject
+        audit_args = ["audit", "--no-rollup"] + (["--record"] if record else [])
         audit_code, aud, _ = job.fastest(*audit_args)
         pr_art = store / f"pr-{i:04d}"
         job.fastest("ci", "save", "--no-map", str(pr_art))
         since_main.append(pr_art)
         sel, summ = run.get("selection", {}), run.get("summary", {})
         rec = {
-            "commit": sha, "parent": commits[i - 1],
+            "commit": sha, "parent": commits[i - 1], "injected": injected,
             "restore": {"wall_s": restore_wall, "map": (restored.get("map") or {}).get("rollup_commit"),
                         "fetches": len(restored.get("history", {}).get("fetches", [])),
                         "still_missing": restored.get("history", {}).get("still_missing"),
@@ -164,6 +203,10 @@ def main():
             main_job = Job(checkout(origin, sha, work / "main", shallow=False), py)
             _, restored_main, _ = main_job.fastest("ci", "restore", str(maps[-1]),
                                                    *map(str, since_main))
+            if args.inject:  # the PR job's full run saw broken code: record our own
+                subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                                "--fastest-cov"], cwd=main_job.path, env=main_job.env,
+                               capture_output=True)
             _, rolled, roll_wall = main_job.fastest("rollup")
             maps.append(store / f"map-{i:04d}")
             _, saved, _ = main_job.fastest("ci", "save", str(maps[-1]))
@@ -174,6 +217,8 @@ def main():
             shutil.rmtree(work / "main", ignore_errors=True)
         results.append(rec)
         miss = "  !!! MISS !!!" if rec["audit"]["misses"] else ""
+        if injected:
+            print(f"  [{i}/{len(commits) - 1}] {sha[:8]} injected {injected}")
         print(f"  [{i}/{len(commits) - 1}] {sha[:8]} map age {rec['map_age']}: {rec['mode']} "
               f"{rec['n_selected']}/{rec['n_total']} ({rec.get('pct')}%), exit {code}, "
               f"run {run_wall}s vs full {rec['full_wall_s']}s, restore {restore_wall}s "
