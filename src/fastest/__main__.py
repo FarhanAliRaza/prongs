@@ -553,7 +553,7 @@ def cmd_run(args) -> dict:
 
 
 def cmd_audit(args) -> dict:
-    from fastest.audit import audit
+    from fastest.audit import audit, checkout_control
 
     repo = Path.cwd()
     if args.rollup:
@@ -562,9 +562,11 @@ def cmd_audit(args) -> dict:
         return {"error": "no coverage map",
                 "hint": "build one with: pytest --fastest-cov (then fastest rollup)"}
     raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
+    control = checkout_control(repo, pytest_args=shlex.split(raw)) if args.control else None
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
                 record=args.record, rollup=False, history_window=args.history_window,
-                max_map_age=args.max_map_age, flaky_window=args.flaky_window)
+                max_map_age=args.max_map_age, flaky_window=args.flaky_window,
+                control=control)
     res.pop("statuses", None)  # per-test statuses are for harnesses, not the agent
     return res
 
@@ -642,6 +644,10 @@ def main():
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=False,
                            help="append the full run to the journal instead of a temporary "
                                 "database (default: off — an audit never feeds the map)")
+            p.add_argument("--control", action=argparse.BooleanOptionalAction, default=False,
+                           help="re-run each first-order miss alone on the commit its baseline "
+                                "was observed on, checked out in place (clean working tree "
+                                "only), to tell environment drift from a miss (default: off)")
     sub.add_parser("rollup")
     ci = sub.add_parser("ci", help="carry the map and journal files between CI jobs")
     ci_sub = ci.add_subparsers(dest="ci_cmd", required=True)

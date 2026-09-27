@@ -17,11 +17,13 @@
      its baseline -> second-order pollution from an already-selected failure
      (a skipped cleanup, an unraisable exception landing on a later test),
      which fork-per-test isolation fixes, not selection
-  5. with a `control` (harnesses that own the working tree supply one), each
-     first-order miss is also run alone on the base code, in the same
-     checkout: if it differs from its baseline there too, the change did not
-     move it — the environment did (state a previous run left behind in an
-     ignored directory, a clock) — and it is reported as drift, not a miss
+  5. with a `control`, each first-order miss is also run alone on the base
+     code, in the same checkout: if it differs from its baseline there too,
+     the change did not move it — the environment did (state a previous run
+     left behind in an ignored directory, a clock) — and it is reported as
+     drift, not a miss. Harnesses that own the working tree supply their
+     own; `fastest audit --control` uses checkout_control(), which checks
+     out the commit each miss's baseline was observed on, in place
 
 Every miss carries the receipt that skipped it; a known-flaky test that
 flips is reported under `flaky` with its history, not as a miss.
@@ -175,6 +177,56 @@ def skip_receipt_for(con, sel: dict, test_id: str) -> dict:
     }
 
 
+class ControlError(Exception):
+    """A control run that cannot be done safely."""
+
+
+def checkout_control(repo: Path, python: str = sys.executable, pytest_args=()):
+    """A control for `fastest audit --control`: run each test alone on the
+    commit its baseline status was observed on, in this checkout — ignored
+    files, the state a previous run left behind, stay exactly as they are,
+    which is the point. It checks out each commit detached and puts HEAD
+    back afterwards, so it refuses a working tree with changes (commit
+    them, or run it in CI) and a baseline observed on a tree with changes
+    (that tree cannot be checked out)."""
+    repo = Path(repo)
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+    def control(tests) -> dict[str, str]:
+        con = mapdb.connect(str(journal.map_path(repo)))
+        try:
+            base: dict[str, list[str]] = {}
+            for t in tests:
+                row = con.execute(
+                    "SELECT r.commit_sha, r.dirty_files FROM tests t JOIN runs r "
+                    "ON r.id = t.last_run WHERE t.test_id = ?", (t,)).fetchone()
+                if row and row[0] and row[1] in (None, "{}"):
+                    base.setdefault(row[0], []).append(t)
+        finally:
+            con.close()
+        if not base:
+            raise ControlError("no miss has a baseline observed on a clean commit")
+        if provenance.dirty_files(repo):
+            raise ControlError("the working tree has changes: commit them (or run the "
+                               "control in CI) so the base commit can be checked out")
+        branch = git("symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+        back = branch or provenance.git_head(repo)
+        out: dict[str, str] = {}
+        try:
+            for commit, ts in sorted(base.items()):
+                p = git("checkout", "-q", "--detach", commit)
+                if p.returncode:
+                    raise ControlError(f"cannot check out {commit[:8]}: {p.stderr.strip()[-300:]}")
+                out.update(run_alone(repo, python, pytest_args, ts))
+        finally:
+            git("checkout", "-q", back)
+        return out
+
+    return control
+
+
 def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
           pytest_args=(), baseline: dict[str, str] | None = None, isolate: bool = True,
           record: bool = False, rollup: bool = True, max_isolate: int = MAX_ISOLATE,
@@ -256,7 +308,11 @@ def audit(repo: Path, base: str | None = None, *, python: str = sys.executable,
             misses.append(entry)
         drift = []
         if control and misses:
-            on_base = control([m["test"] for m in misses if m.get("alone") is not None])
+            try:
+                on_base = control([m["test"] for m in misses if m.get("alone") is not None])
+            except ControlError as e:
+                on_base = {}
+                out["control_error"] = str(e)
             for m in [m for m in misses if m["test"] in on_base]:
                 m["on_base"] = on_base[m["test"]]
                 if m["on_base"] != m["before"]:  # it moved without the change

@@ -73,22 +73,28 @@ def test_audit_record_appends_the_full_run(recorded):
     assert [r[1] for r in recorded.runs()] == ["full", "full"]
 
 
+ONCE = (
+    "import pathlib\n\n"
+    "def test_once():\n"
+    "    p = pathlib.Path('state/ran')\n"
+    "    first = not p.exists()\n"
+    "    p.parent.mkdir(exist_ok=True)\n"
+    "    p.touch()\n"
+    "    assert first\n"
+)
+
+
+def run_once_test(repo) -> None:
+    """A test that passes only on a fresh checkout: the state it leaves behind
+    sits in an ignored directory no diff and no coverage map can see."""
+    repo.write(".gitignore", ".fastest/\n__pycache__/\nstate/\n")
+    repo.write("tests/test_once.py", ONCE)
+    repo.commit("a run-once test")
+    assert repo.record().returncode == 0
+
+
 def test_a_control_run_separates_environment_drift_from_misses(recorded):
-    # a test that passes only on a fresh checkout: the state it leaves behind
-    # sits in an ignored directory no diff and no coverage map can see
-    recorded.write(".gitignore", ".fastest/\n__pycache__/\nstate/\n")
-    recorded.write(
-        "tests/test_once.py",
-        "import pathlib\n\n"
-        "def test_once():\n"
-        "    p = pathlib.Path('state/ran')\n"
-        "    first = not p.exists()\n"
-        "    p.parent.mkdir(exist_ok=True)\n"
-        "    p.touch()\n"
-        "    assert first\n",
-    )
-    recorded.commit("a run-once test")
-    assert recorded.record().returncode == 0
+    run_once_test(recorded)
     recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
     assert recorded.cli("audit", code=1)["misses"][0]["test"] == "tests/test_once.py::test_once"
 
@@ -105,3 +111,21 @@ def test_a_control_run_separates_environment_drift_from_misses(recorded):
     assert (d["test"], d["before"], d["after"], d["alone"], d["on_base"]) == (
         "tests/test_once.py::test_once", "passed", "failed", "failed", "failed"
     )
+
+
+def test_audit_control_checks_out_the_base_commit_in_place(recorded):
+    run_once_test(recorded)
+    branch = recorded.git("rev-parse", "--abbrev-ref", "HEAD")
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    # uncommitted work: the control will not check anything out over it
+    out = recorded.cli("audit", "--control", code=1)
+    assert out["misses"][0]["test"] == "tests/test_once.py::test_once"
+    assert out["control_error"].startswith("the working tree has changes")
+    recorded.commit("edit b")
+    out = recorded.cli("audit", "--control")
+    assert out["verdict"] == "pass" and out["misses"] == []
+    (d,) = out["drift"]
+    assert (d["test"], d["alone"], d["on_base"]) == (
+        "tests/test_once.py::test_once", "failed", "failed")
+    assert recorded.git("rev-parse", "--abbrev-ref", "HEAD") == branch  # put back
+    assert "# edited" in recorded.read("pkg/mod.py")
