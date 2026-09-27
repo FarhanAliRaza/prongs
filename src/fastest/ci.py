@@ -209,7 +209,8 @@ def ensure_history(repo: Path, commits, *, remote: str = "origin", fetch: bool =
         return out
 
     def fetch_(*args: str) -> None:
-        p = _git(repo, "fetch", "--no-tags", "--quiet", *args)
+        # --update-shallow: a remote that is itself shallow moves our boundary too
+        p = _git(repo, "fetch", "--no-tags", "--quiet", "--update-shallow", *args)
         out["fetches"].append({"args": list(args), "ok": p.returncode == 0}
                               | ({"error": p.stderr.strip()[-300:]} if p.returncode else {}))
 

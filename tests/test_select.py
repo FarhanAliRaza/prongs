@@ -100,11 +100,13 @@ def test_test_module_changes_never_escalate_to_run_all(recorded):
     assert sel["selected_files"] == {"tests/test_m.py": "1 known test(s) not found statically: test_b"}
     assert set(sel["selected"]) == {T_A, T_B, T_C}
     assert all(r.startswith("test file changed") for r in sel["selected"].values())
-    # editing a test body targets exactly that file's known tests
+    # editing a test body selects that file's known tests: all of them here,
+    # so pytest gets the file, not one id per test
     recorded.git("checkout", "--", "tests/test_m.py")
     recorded.edit("tests/test_m.py", "assert a() == 1", "assert a() == 1  # edited")
     sel = recorded.select()
-    assert sel["targets"] == [T_C, T_A, T_B] and sel["selected_files"] == {}
+    assert set(sel["selected"]) == {T_A, T_B, T_C} and sel["selected_files"] == {}
+    assert sel["targets"] == ["tests/test_m.py"]
 
 
 def test_import_time_change_in_production_code_runs_all(recorded):
@@ -112,7 +114,7 @@ def test_import_time_change_in_production_code_runs_all(recorded):
     sel = recorded.select()
     assert sel["mode"] == "run_all"
     assert sel["reasons"] == ["module-level change in import-time file: pkg/mod.py"]
-    assert sel["targets"] == [T_C, T_A, T_B] and sel["selected"][T_A] == "run_all"
+    assert sel["targets"] == ["tests/test_m.py"] and sel["selected"][T_A] == "run_all"
 
 
 def test_conftest_change_runs_all(recorded):
@@ -189,11 +191,11 @@ def test_targets_that_never_ran_are_reported(recorded):
     out = recorded.cli("run", code=2)
     s = out["summary"]
     assert s["ran"] == 0 and s["failed"] == 0
-    # pytest cannot resolve node ids in a module skipped at import: exit 4
+    # the module is skipped at import, so pytest collects nothing: exit 5
     assert s["status"] == "error" and s["complete"] is False
-    assert out["error"].startswith("pytest exit 4")
+    assert out["error"].startswith("pytest exit 5")
     assert out["collect_skipped"] == ["tests/test_m.py"]
-    assert s["unrun_targets"] == [T_C, T_A, T_B]
+    assert s["unrun_targets"] == ["tests/test_m.py"]
     assert out["conservation"]["conserved"] is False
     assert out["conservation"]["not_executed"] == sorted([T_A, T_B, T_C])
     assert s["record_ok"] is True  # the journal saw exactly what ran: nothing
@@ -221,7 +223,8 @@ def test_unittest_style_classes_are_found_statically(recorded):
     assert recorded.record().returncode == 0
     recorded.edit("tests/test_u.py", "assertEqual(a(), 1)", "assertEqual(a(), 1)  # edited")
     sel = recorded.select()
-    assert sel["targets"] == ["tests/test_u.py::ModTests::test_a"] and sel["selected_files"] == {}
+    assert sel["selected"] == {"tests/test_u.py::ModTests::test_a": "test file changed: tests/test_u.py"}
+    assert sel["targets"] == ["tests/test_u.py"] and sel["selected_files"] == {}
 
 
 def test_skip_receipt_is_tied_to_the_evidence(recorded):

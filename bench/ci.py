@@ -77,7 +77,9 @@ def checkout(origin: Path, sha: str, dest: Path, shallow: bool) -> Path:
     dest.mkdir(parents=True)
     git(dest, "init", "-q")
     git(dest, "remote", "add", "origin", origin.as_uri())
-    git(dest, "fetch", "-q", "--no-tags", *(["--depth=1"] if shallow else []), "origin", sha)
+    # --update-shallow: the origin may itself be a shallow clone (a testbed)
+    git(dest, "fetch", "-q", "--no-tags", "--update-shallow",
+        *(["--depth=1"] if shallow else []), "origin", sha)
     git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
     git(dest, "config", "user.email", "ci@example.com")
     git(dest, "config", "user.name", "ci")
