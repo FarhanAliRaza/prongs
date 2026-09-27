@@ -15,7 +15,7 @@ classifiers = [
 ]
 
 [project.urls]
-Source = "https://github.com/FarhanAliRaza/fastest"
+Source = "https://github.com/FarhanAliRaza/bolttest"
 
 [project.scripts]
 bolttest = "bolttest.__main__:main"
