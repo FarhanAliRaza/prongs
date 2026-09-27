@@ -138,8 +138,10 @@ def test_an_unreadable_journal_file_is_quarantined(tmp_path):
 
 
 def test_affected_rolls_up_lazily_and_reports_the_journal(recorded):
-    out = recorded.cli("affected", "--no-rollup", code=2)
-    assert out["error"] == "no coverage map" and out["pending_journal_files"] == 1
+    out = recorded.cli("affected", "--no-rollup")
+    # no map until a rollup: nothing may be skipped, and the receipt says why
+    assert out["mode"] == "run_all" and out["evidence"]["journal"]["pending"] == 1
+    assert out["run_all_reasons"] == ["no coverage map (1 journal file(s) pending: roll them up)"]
     out = recorded.cli("affected")
     assert out["evidence"]["journal"] == {"rolled_up_now": 1, "pending": 0}
     assert out["evidence"]["rollup"] == {"seq": 1, "run": 1, "commit": recorded.head()}

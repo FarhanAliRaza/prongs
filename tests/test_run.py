@@ -59,6 +59,27 @@ def test_tests_that_silently_did_not_run_make_the_run_inconsistent(recorded):
     assert (c["run_all"], c["executed"], c["conserved"], c["not_executed"]) == (3, 2, False, [T_B])
 
 
+def test_without_a_map_everything_runs_and_the_run_builds_the_map(repo):
+    # a first CI run, an expired cache: no evidence, so nothing may be skipped
+    out = repo.cli("affected")
+    assert out["mode"] == "run_all"
+    assert out["run_all_reasons"] == ["no coverage map (this run records one)"]
+    out = repo.cli("run")
+    assert out["selection"]["mode"] == "run_all" and out["summary"]["status"] == "passed"
+    assert out["summary"]["ran"] == 3 and out["summary"]["recorded"]["scope"] == "full"
+    assert out["conservation"]["census"] == "no map: the run's own collection"
+    # the next command rolls that run up and selects precisely
+    repo.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    out = repo.cli("affected")
+    assert out["mode"] == "select" and out["tests"] == sorted([T_B, T_C])
+
+
+def test_without_a_map_a_failure_still_fails_the_run(repo):
+    repo.edit("pkg/mod.py", "return 1", "return 5")
+    out = repo.cli("run", code=1)
+    assert out["summary"]["status"] == "failed" and out["summary"]["failed"] == 2
+
+
 def test_run_all_runs_new_test_files_and_counts_them(recorded):
     recorded.write("tests/test_new.py", "def test_new():\n    assert True\n")
     recorded.write("tests/conftest.py", "import pytest\n")

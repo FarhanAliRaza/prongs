@@ -72,11 +72,7 @@ def cmd_affected(args) -> dict:
     db, jdir = journal.map_path(repo), journal.journal_dir(repo)
     rolled = roll_up(repo) if getattr(args, "rollup", True) else None
     if not db.exists():
-        return {
-            "error": "no coverage map",
-            "hint": "build one with: pytest --fastest-cov (then fastest rollup)",
-            "pending_journal_files": len(journal.pending(jdir)),
-        }
+        return no_map_selection(len(journal.pending(jdir)))
     cfg = config.settings(repo, history_window=getattr(args, "history_window", None),
                           max_map_age=getattr(args, "max_map_age", None))
     sel = select(db, repo, args.base, history_window=cfg["history_window"],
@@ -109,6 +105,36 @@ def cmd_affected(args) -> dict:
             "pending": len(journal.pending(jdir)),
         }},
         "skip_receipt": skip_receipt(sel),
+    }
+
+
+def no_map_selection(pending: int) -> dict:
+    """No evidence at all (a first CI run, an expired cache): the only safe
+    selection is everything, as pytest itself would collect it. A run
+    records coverage by default, so it builds the map it lacked."""
+    reason = "no coverage map" + (
+        f" ({pending} journal file(s) pending: roll them up)" if pending
+        else " (this run records one)"
+    )
+    return {
+        "mode": "run_all",
+        "whole_suite": True,  # no node ids: pytest's own collection is the target
+        "n_total": None,
+        "n_selected": None,
+        "n_skipped": 0,
+        "changed_functions": [],
+        "run_all_reasons": [reason],
+        "selected_by_reason": {},
+        "tests": [],
+        "selected_files": {},
+        "vanished": [],
+        "broadened": [],
+        "flaky": {},
+        "history": None,
+        "targets": [],
+        "evidence": {"map": None, "journal": {"rolled_up_now": 0, "pending": pending}},
+        "skip_receipt": {"skipped": 0, "rule": f"nothing skipped: {reason}"},
+        "hint": "any recorded run builds the map: fastest run, or pytest --fastest-cov",
     }
 
 
@@ -257,6 +283,13 @@ def conservation(aff: dict, results: list[dict]) -> dict:
     that ran unplanned (new tests in a whole-file target) are counted, never
     absorbed. Any mismatch makes `conserved` false and the run
     'inconsistent' rather than 'passed'."""
+    ids = [r["id"] for r in results]
+    if aff.get("whole_suite"):
+        # no map to balance against: the run's own collection is the census,
+        # and a module that failed to collect makes the run an error
+        return {"collected": None, "selected": 0, "run_all": len(set(ids)), "skipped": 0,
+                "executed": len(ids), "conserved": len(set(ids)) == len(ids),
+                "census": "no map: the run's own collection"}
     planned = set(aff["tests"])
     run_all = len(planned) if aff["mode"] == "run_all" else 0
     block = {
@@ -266,7 +299,6 @@ def conservation(aff: dict, results: list[dict]) -> dict:
         "skipped": aff["n_skipped"],
         "executed": len(results),
     }
-    ids = [r["id"] for r in results]
     ran = set(ids)
     vanished = set(aff.get("vanished", []))
     not_executed = sorted(planned - ran - vanished)
@@ -328,11 +360,13 @@ def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict) -> dic
 
     known = aff.get("flaky", {})
     failed = [r["id"] for r in results if r["status"] == "failed" and r["id"] not in known]
-    con = mapdb.connect(str(journal.map_path(repo)))
-    try:
-        caught = contradicted_on_tree(con, failed, tree, provenance.recorder_fingerprint())
-    finally:
-        con.close()
+    caught: dict[str, dict] = {}
+    if failed and journal.map_path(repo).exists():  # no map: no history to contradict
+        con = mapdb.connect(str(journal.map_path(repo)))
+        try:
+            caught = contradicted_on_tree(con, failed, tree, provenance.recorder_fingerprint())
+        finally:
+            con.close()
     out = {}
     for r in results:
         f = known.get(r["id"]) or caught.get(r["id"])
@@ -360,7 +394,7 @@ def cmd_run(args) -> dict:
         "evidence": aff["evidence"],
         "skip_receipt": aff["skip_receipt"],
     }
-    if not aff["targets"]:
+    if not aff["targets"] and not aff.get("whole_suite"):
         out["results"] = []
         out["conservation"] = conservation(aff, [])
         out["summary"] = {
