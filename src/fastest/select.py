@@ -614,19 +614,33 @@ def _tree(commit: str | None, dirty: str | None) -> str:
     return (commit or "?")[:8] + ("" if dirty in (None, "{}") else " + dirty files")
 
 
-def flaky_tests(con) -> dict[str, dict]:
+def _flaky_horizon(con, window: int) -> int | None:
+    """The rollup sequence number flaky evidence must be newer than, or None
+    when nothing can be flaky (window 0, an empty map)."""
+    top = con.execute("SELECT MAX(rollup_seq) FROM runs").fetchone()[0]
+    return None if window <= 0 or top is None else top - window
+
+
+def flaky_tests(con, window: int = config.DEFAULTS["flaky_window"]) -> dict[str, dict]:
     """test_id -> evidence, for every live test that both passed and failed
-    on one tree: the same commit, the same dirty content, the same recorder
-    (python, pytest), in runs the tree did not change under. Same code, both
-    outcomes: the difference is not in the code."""
+    on one tree within the last `window` rollups: the same commit, the same
+    dirty content, the same recorder (python, pytest), in runs the tree did
+    not change under. Same code, both outcomes: the difference is not in the
+    code. Any lineage counts (a flake on another branch's tree is still a
+    flake); evidence older than the window expires, so a test fixed for good
+    stops being flaky."""
+    horizon = _flaky_horizon(con, window)
+    if horizon is None:
+        return {}
     rows = con.execute(
         "SELECT t.test_id, r.commit_sha, r.dirty_files, SUM(h.status = 'passed'), "
         "SUM(h.status = 'failed'), MAX(h.run_id) "
         "FROM history h JOIN runs r ON r.id = h.run_id JOIN tests t ON t.id = h.test_id "
         "WHERE h.status IN ('passed', 'failed') AND r.tree_changed = 0 "
-        "AND r.commit_sha IS NOT NULL AND t.retired_run IS NULL "
+        "AND r.commit_sha IS NOT NULL AND t.retired_run IS NULL AND r.rollup_seq > ? "
         "GROUP BY h.test_id, r.commit_sha, r.dirty_files, r.recorder "
-        "HAVING SUM(h.status = 'passed') > 0 AND SUM(h.status = 'failed') > 0"
+        "HAVING SUM(h.status = 'passed') > 0 AND SUM(h.status = 'failed') > 0",
+        (horizon,),
     ).fetchall()
     out: dict[str, dict] = {}
     for test_id, commit, dirty, n_pass, n_fail, last in rows:
@@ -650,12 +664,14 @@ def test_history(con, test_id: str, limit: int = 10) -> list[dict]:
             for run_id, sha, dirty, status, lineage in reversed(rows)]
 
 
-def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str) -> dict[str, dict]:
+def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str,
+                         window: int = config.DEFAULTS["flaky_window"]) -> dict[str, dict]:
     """Failures that contradict a pass recorded on this very tree (a
-    provenance snapshot: commit + dirty content) with this recorder: a flake,
-    caught the first time it contradicts itself rather than after the next
-    rollup."""
-    if not failed or tree.get("commit") is None:
+    provenance snapshot: commit + dirty content) with this recorder, within
+    the last `window` rollups: a flake, caught the first time it contradicts
+    itself rather than after the next rollup."""
+    horizon = _flaky_horizon(con, window)
+    if not failed or tree.get("commit") is None or horizon is None:
         return {}
     dirty = json.dumps({p: [h, h] for p, h in tree["dirty"].items()}, sort_keys=True)
     out = {}
@@ -664,8 +680,8 @@ def contradicted_on_tree(con, failed: list[str], tree: dict, recorder: str) -> d
             "SELECT COUNT(*) FROM history h JOIN runs r ON r.id = h.run_id "
             "JOIN tests tt ON tt.id = h.test_id WHERE tt.test_id = ? AND h.status = 'passed' "
             "AND r.commit_sha = ? AND r.dirty_files = ? AND r.recorder = ? "
-            "AND r.tree_changed = 0",
-            (t, tree["commit"], dirty, recorder),
+            "AND r.tree_changed = 0 AND r.rollup_seq > ?",
+            (t, tree["commit"], dirty, recorder, horizon),
         ).fetchone()[0]
         if passes:
             out[t] = {"tree": _tree(tree["commit"], dirty), "passed": passes, "failed": 1,
@@ -748,7 +764,8 @@ def broadening(path: str, quals: list[str]) -> str:
 
 def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None, *,
            history_window: int = config.DEFAULTS["history_window"],
-           max_map_age: int = config.DEFAULTS["max_map_age"]) -> dict:
+           max_map_age: int = config.DEFAULTS["max_map_age"],
+           flaky_window: int = config.DEFAULTS["flaky_window"]) -> dict:
     if provenance.git_head(repo) is None:
         return {"error": f"not a git repository with commits: {repo}", "mode": "error"}
     for rev in (base, head):
@@ -792,8 +809,9 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         t: r for t, r in recent_status_changes(con, history_window).items() if t in all_tests
     }
     flaky = {t: f | {"history": test_history(con, t)}
-             for t, f in flaky_tests(con).items() if t in all_tests}
-    history = {"window": history_window, "recent_changes": len(recent), "flaky": len(flaky)}
+             for t, f in flaky_tests(con, flaky_window).items() if t in all_tests}
+    history = {"window": history_window, "recent_changes": len(recent), "flaky": len(flaky),
+               "flaky_window": flaky_window}
     seen_funcs = set(con.execute(
         "SELECT DISTINCT f.path, fn.qualname FROM funcs fn JOIN files f ON f.id = fn.file_id"
     ))

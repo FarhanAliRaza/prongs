@@ -68,7 +68,7 @@ def test_a_polluted_test_is_selected_on_the_run_after_its_failure(recorded):
     assert polluted not in recorded.cli("affected")["tests"]  # coverage cannot see it
     assert recorded.record().returncode == 1  # the failure: a full run, recorded
     out = recorded.cli("affected")
-    assert out["history"] == {"window": 3, "recent_changes": 4, "flaky": 0}
+    assert out["history"] == {"window": 3, "recent_changes": 4, "flaky": 0, "flaky_window": 50}
     assert polluted in out["tests"]
     # the failing run observed this very tree, so coverage alone would now
     # select nothing: every test that just flipped comes back through history
@@ -81,33 +81,73 @@ def test_a_polluted_test_is_selected_on_the_run_after_its_failure(recorded):
     assert journal.statuses(path)[polluted] == "passed"
 
 
-def test_flaky_test_is_reported_apart_from_failures(recorded, tmp_path):
+COIN = (
+    "import os, pathlib\n\n"
+    "def test_coin():\n"
+    "    assert not os.environ.get('COIN_BROKEN')\n"
+    "    p = pathlib.Path(os.environ['COIN'])\n"
+    "    n = int(p.read_text()) if p.exists() else 0\n"
+    "    p.write_text(str(n + 1))\n"
+    "    assert n % 2 == 0\n"
+)
+COIN_ID = "tests/test_coin.py::test_coin"
+
+
+@pytest.fixture
+def coin(recorded, tmp_path):
+    """A test that passes on even calls and fails on odd ones, recorded
+    passing once (call 0)."""
     recorded.env["COIN"] = str(tmp_path / "coin")  # outside the repo: the tree never changes
-    recorded.write(
-        "tests/test_coin.py",
-        "import os, pathlib\n\n"
-        "def test_coin():\n"
-        "    p = pathlib.Path(os.environ['COIN'])\n"
-        "    n = int(p.read_text()) if p.exists() else 0\n"
-        "    p.write_text(str(n + 1))\n"
-        "    assert n % 2 == 0\n",
-    )
+    recorded.write("tests/test_coin.py", COIN)
     recorded.commit("a coin-flip test")
-    coin = "tests/test_coin.py::test_coin"
-    assert recorded.record().returncode == 0  # passes (0)
-    # run by selection on the same tree, it fails (1): contradicts the pass
-    out = recorded.cli("run", "--base", "HEAD~1")  # selects the new test file
+    assert recorded.record().returncode == 0
+    return recorded
+
+
+def test_a_flake_passes_on_retry_and_is_reported_apart_from_failures(coin):
+    # run by selection on the same tree, it fails (call 1): that contradicts
+    # the pass, so it is retried alone, passes (call 2), and is a flake
+    out = coin.cli("run", "--base", "HEAD~1")  # selects the new test file
     assert out["summary"]["status"] == "passed" and out["failures"] == []
     (f,) = out["flaky"]
-    assert (f["test"], f["status"]) == (coin, "failed")
+    assert (f["test"], f["status"], f["retries"], f["counted_as"]) == (
+        COIN_ID, "failed", ["passed"], "flaky")
     assert f["why"].startswith("passed 1x and failed 1x on tree ")
     assert [h["status"] for h in f["history"]] == ["passed"]
-    assert out["summary"]["flaky"] == {"ran": 1, "failed": 1}
-    # rolled up, it is known flaky: still selected (its outcome flipped), reported apart
-    out = recorded.cli("affected")
-    assert coin in out["tests"] and out["flaky"][coin]["passed"] == 1
-    out = recorded.cli("run")
-    assert out["summary"]["flaky"]["ran"] == 1 and out["failures"] == []
+    assert out["summary"]["flaky"] == {"ran": 1, "failed": 1, "passed_on_retry": 1, "retries": 2}
+    # rolled up — the retry's pass is recorded next to the failure — it is
+    # known flaky: still selected (its outcome flipped), retried again
+    out = coin.cli("affected")
+    assert COIN_ID in out["tests"] and out["flaky"][COIN_ID]["failed"] == 1
+    out = coin.cli("run")  # call 3 fails, call 4 passes
+    assert out["summary"]["status"] == "passed" and out["flaky"][0]["counted_as"] == "flaky"
+
+
+def test_a_known_flake_that_fails_every_retry_is_a_failure(coin):
+    coin.cli("run", "--base", "HEAD~1")  # the flake, known from now on
+    coin.env["COIN_BROKEN"] = "1"  # now it fails for real, on the same tree
+    out = coin.cli("run", code=1)
+    assert out["summary"]["status"] == "failed" and out["summary"]["failed"] == 1
+    (f,) = out["flaky"]
+    assert f["retries"] == ["failed", "failed"] and f["counted_as"] == "failure"
+    assert out["failures"][0]["representative"] == COIN_ID
+
+
+def test_no_retries_makes_a_flaky_failure_a_failure(coin):
+    out = coin.cli("run", "--base", "HEAD~1", "--flaky-retries", "0", code=1)
+    (f,) = out["flaky"]
+    assert f["retries"] == [] and f["counted_as"] == "failure"
+    assert out["summary"]["failed"] == 1
+
+
+def test_flaky_evidence_expires(tmp_path, root):
+    rolled(tmp_path, root, {"t::a": "passed"})
+    con = rolled(tmp_path, root, {"t::a": "failed"})  # same tree: a flake
+    assert set(flaky_tests(con, 2)) == {"t::a"}
+    con = rolled(tmp_path, root, {"t::b": "passed"})  # a rollup without it
+    assert set(flaky_tests(con, 3)) == {"t::a"}
+    assert flaky_tests(con, 2) == {}  # the pass has left the window
+    assert flaky_tests(con, 0) == {}
 
 
 def test_foreign_outcomes_never_count_as_a_recent_flip_but_do_show_flakes(tmp_path, root):

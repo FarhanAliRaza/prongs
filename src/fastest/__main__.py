@@ -35,7 +35,10 @@ selected, run_all, skipped and executed counts, and whether they balance —
 and a status that is 'error' when pytest exits 2-5 or a module fails to
 collect, 'inconsistent' when the counts do not balance, never 'passed' for a
 run that silently did less than asked; `recorded` and `record_ok` show that
-the journal saw exactly what ran.
+the journal saw exactly what ran. A failing test that is flaky (both
+outcomes on one tree within the last --flaky-window rollups) is re-run alone
+up to --flaky-retries times: a pass reports it under `flaky`, failing every
+time counts it as a failure.
 
 Exit codes, for CI gates (the JSON document carries the detail):
 
@@ -77,10 +80,9 @@ def cmd_affected(args) -> dict:
     rolled = roll_up(repo) if getattr(args, "rollup", True) else None
     if not db.exists():
         return no_map_selection(len(journal.pending_all(jdir)))
-    cfg = config.settings(repo, history_window=getattr(args, "history_window", None),
-                          max_map_age=getattr(args, "max_map_age", None))
+    cfg = settings(repo, args)
     sel = select(db, repo, args.base, history_window=cfg["history_window"],
-                 max_map_age=cfg["max_map_age"])
+                 max_map_age=cfg["max_map_age"], flaky_window=cfg["flaky_window"])
     if "error" in sel:
         return sel
     reasons = Counter(v.split(":")[0].split(" (")[0] for v in sel["selected"].values())
@@ -110,6 +112,11 @@ def cmd_affected(args) -> dict:
         }},
         "skip_receipt": skip_receipt(sel),
     }
+
+
+def settings(repo: Path, args) -> dict:
+    """[tool.fastest], environment, then this command's flags."""
+    return config.settings(repo, **{name: getattr(args, name, None) for name in config.DEFAULTS})
 
 
 def no_map_selection(pending: int) -> dict:
@@ -354,11 +361,13 @@ def append_results(repo: Path, jdir: Path, key: str, targets: list[str], results
     )
 
 
-def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict) -> dict[str, dict]:
+def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict,
+                  window: int) -> dict[str, dict]:
     """test_id -> entry for every flaky test that ran: known flaky from
-    history (passed and failed on one tree), or failing now on a tree where
-    it has passed before. Reported under `flaky` with its history, never as
-    a failure."""
+    history (passed and failed on one tree within the flaky window), or
+    failing now on a tree where it passed before. Reported under `flaky`
+    with its history; a failing one is retried (retry_flaky) before it is
+    counted either way."""
     from fastest import mapdb
     from fastest.select import contradicted_on_tree
 
@@ -368,7 +377,8 @@ def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict) -> dic
     if failed and journal.map_path(repo).exists():  # no map: no history to contradict
         con = mapdb.connect(str(journal.map_path(repo)))
         try:
-            caught = contradicted_on_tree(con, failed, tree, provenance.recorder_fingerprint())
+            caught = contradicted_on_tree(con, failed, tree, provenance.recorder_fingerprint(),
+                                          window)
         finally:
             con.close()
     out = {}
@@ -381,6 +391,41 @@ def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict) -> dic
                 "history": f["history"],
             }
     return out
+
+
+def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
+                warm: bool) -> None:
+    """Re-run each failing flaky test alone, up to `retries` times, until it
+    passes. A pass makes its failure a flake; failing every time makes it a
+    failure, flaky or not — a known flake is no licence to fail. Retries are
+    recorded like any run (unless --no-record), so a pass lands in history
+    next to the failure on the same tree: the next run knows the flake.
+    Retries use the warm daemon when the run did, else a fresh pytest."""
+    from fastest.audit import observe
+
+    jdir = journal.journal_dir(repo)
+    for entry in flaky.values():
+        if entry["status"] != "failed":
+            continue
+        entry["retries"] = []
+        for _ in range(retries):
+            status = None
+            if warm:
+                key = journal.new_key()
+                extra = (["--fastest-cov", "--fastest-journal", str(jdir),
+                          "--fastest-journal-key", key] if record else [])
+                resp = run_via_daemon([entry["test"]], extra)
+                if resp and not resp.get("stale") and "error" not in resp:
+                    status = next((r["status"] for r in resp.get("results", [])
+                                   if r["id"] == entry["test"]), "absent")
+            if status is None:
+                args = shlex.split(os.environ.get("FASTEST_RUN_ARGS", ""))
+                status = observe(repo, sys.executable, args, targets=[entry["test"]],
+                                 record=record)["statuses"].get(entry["test"], "absent")
+            entry["retries"].append(status)
+            if status == "passed":
+                break
+        entry["counted_as"] = "flaky" if "passed" in entry["retries"] else "failure"
 
 
 def cmd_run(args) -> dict:
@@ -433,8 +478,14 @@ def cmd_run(args) -> dict:
     results = resp.get("results", [])
     if mode == "results":
         append_results(repo, jdir, key, aff["targets"], results, resp, snap, started)
-    flaky = flaky_results(repo, aff, results, snap)
-    failures = [r for r in results if r["status"] == "failed" and r["id"] not in flaky]
+    cfg = settings(repo, args)
+    flaky = flaky_results(repo, aff, results, snap, cfg["flaky_window"])
+    t_retry = time.monotonic()
+    retry_flaky(repo, flaky, cfg["flaky_retries"], record=mode is not None,
+                warm=out["executor"] == "daemon")
+    retry_s = time.monotonic() - t_retry
+    failures = [r for r in results if r["status"] == "failed"
+                and flaky.get(r["id"], {}).get("counted_as") != "flaky"]
     out["failures"] = group_failures(failures)  # passes are summarized, not listed
     if flaky:
         out["flaky"] = list(flaky.values())
@@ -473,12 +524,18 @@ def cmd_run(args) -> dict:
         "status": status,
         "passed": sum(1 for r in results if r["status"] == "passed"),
         "failed": len(failures),
-        "flaky": {"ran": len(flaky), "failed": sum(f["status"] == "failed" for f in flaky.values())},
+        "flaky": {
+            "ran": len(flaky),
+            "failed": sum(f["status"] == "failed" for f in flaky.values()),
+            "passed_on_retry": sum(f.get("counted_as") == "flaky" for f in flaky.values()),
+            "retries": cfg["flaky_retries"],
+        },
         "ran": ran,
         "unrun_targets": unrun,
         "complete": not unrun and not error,
         "skipped_by_selection": aff["n_skipped"],
         "exec_wall_s": resp.get("wall_s"),
+        "retry_wall_s": round(retry_s, 3),
         "total_wall_s": round(time.monotonic() - t0, 3),
     }
     if "pytest_output" in resp:
@@ -507,7 +564,7 @@ def cmd_audit(args) -> dict:
     raw = args.pytest_args if args.pytest_args is not None else os.environ.get("FASTEST_RUN_ARGS", "")
     res = audit(repo, args.base, pytest_args=shlex.split(raw), isolate=args.isolate,
                 record=args.record, rollup=False, history_window=args.history_window,
-                max_map_age=args.max_map_age)
+                max_map_age=args.max_map_age, flaky_window=args.flaky_window)
     res.pop("statuses", None)  # per-test statuses are for harnesses, not the agent
     return res
 
@@ -561,6 +618,9 @@ def main():
         p.add_argument("--max-map-age", type=int, default=None, metavar="N",
                        help="run everything when the map is more than N commits behind HEAD "
                             "(default: [tool.fastest] max_map_age, else 50)")
+        p.add_argument("--flaky-window", type=int, default=None, metavar="N",
+                       help="flaky evidence (both outcomes on one tree) older than N rollups "
+                            "expires (default: [tool.fastest] flaky_window, else 50)")
         if name == "run":
             p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True,
                            help="append this run to the journal, refreshing the tests it "
@@ -568,6 +628,10 @@ def main():
             p.add_argument("--cov", action=argparse.BooleanOptionalAction, default=True,
                            help="record per-test coverage; --no-cov still appends outcomes "
                                 "and durations (default: on)")
+            p.add_argument("--flaky-retries", type=int, default=None, metavar="N",
+                           help="re-run a failing flaky test alone up to N times; a pass makes "
+                                "it a flake, else it is a failure (default: [tool.fastest] "
+                                "flaky_retries, else 2; 0: a flaky failure is a failure)")
         if name == "audit":
             p.add_argument("--pytest-args", default=None,
                            help="extra pytest arguments for the full run "
