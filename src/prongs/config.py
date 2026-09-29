@@ -11,6 +11,13 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
   flaky_retries    a flaky test that fails is re-run alone up to N times: a
                    pass makes the failure a flake, failing every time makes it
                    a failure (0: a flaky failure is a failure)
+
+[tool.prongs] only:
+
+  inert            glob patterns for tracked non-Python files that cannot
+                   affect test outcomes, on top of the built-in list (docs,
+                   .github/, *.md ...). A pattern is matched against the
+                   path and against the file name: "*.svg", "assets/*"
 """
 
 from __future__ import annotations
@@ -27,13 +34,24 @@ DEFAULTS = {
 }
 
 
-def settings(repo: Path, **overrides) -> dict:
-    out = dict(DEFAULTS)
+def _table(repo: Path) -> dict:
     try:
         table = tomllib.loads((Path(repo) / "pyproject.toml").read_text())
-        table = table.get("tool", {}).get("prongs", {})
+        return table.get("tool", {}).get("prongs", {})
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
-        table = {}
+        return {}
+
+
+def inert(repo: Path) -> tuple[str, ...]:
+    patterns = _table(repo).get("inert", [])
+    if not isinstance(patterns, list):  # a bare string would match per character
+        return ()
+    return tuple(p for p in patterns if isinstance(p, str))
+
+
+def settings(repo: Path, **overrides) -> dict:
+    out = dict(DEFAULTS)
+    table = _table(repo)
     for name in DEFAULTS:
         if name in table:
             out[name] = int(table[name])

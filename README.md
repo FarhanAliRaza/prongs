@@ -105,6 +105,14 @@ Each selected test carries a reason:
 Some changes run everything (`mode: "run_all"`).
 These include a changed `conftest.py`, a changed tracked non-Python file, and module-level or import-time code in a production module.
 A new file that did not exist when the map was recorded also runs everything.
+Files that cannot affect test outcomes are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `docs/`, `.github/`, `.gitignore` and `LICENSE`.
+Add your own with glob patterns, matched against the path and against the file name:
+
+```toml
+[tool.prongs]
+inert = ["*.svg", "assets/*"]
+```
+
 As a safety net, a map more than `max_map_age` commits behind HEAD runs everything.
 
 **Flaky tests.** A test that both passed and failed on one tree within `flaky_window` rollups is flaky.

@@ -46,6 +46,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from prongs import config, journal, mapdb, provenance
@@ -58,11 +59,13 @@ INERT_PREFIXES = ("docs/", ".github/", ".gitignore")
 INERT_NAMES = {"LICENSE", "LICENSE.md", "CHANGELOG.md", "README.md", "CODE_OF_CONDUCT.md"}
 
 
-def is_inert(path: str) -> bool:
+def is_inert(path: str, patterns: tuple[str, ...] = ()) -> bool:
+    name = Path(path).name
     return (
         path.endswith(INERT_SUFFIXES)
         or path.startswith(INERT_PREFIXES)
-        or Path(path).name in INERT_NAMES
+        or name in INERT_NAMES
+        or any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns)
     )
 
 
@@ -457,7 +460,8 @@ def tree_changes(
     return changes
 
 
-def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis) -> Analysis:
+def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis,
+            inert: tuple[str, ...] = ()) -> Analysis:
     """Turn a change set into changed functions, wholesale files, run-all
     reasons and test-file selections."""
 
@@ -503,7 +507,7 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
 
     for path, ch in changes.items():
         name = Path(path).name
-        if is_inert(path):
+        if is_inert(path, inert):
             continue
         if not path.endswith(".py"):
             an.run_all_reasons.append(f"non-Python file changed: {path}")
@@ -846,10 +850,11 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     untracked = provenance.dirty_files(repo) if head is None else {}
     git_cache: dict[str, dict] = {}
     analyses: list[Analysis] = []
+    inert = config.inert(repo)
     for tree in trees:
         an = Analysis()
         changes = tree_changes(repo, tree, now, con, git_cache, untracked, an)
-        analyze(repo, con, now, changes, all_tests, an)
+        analyze(repo, con, now, changes, all_tests, an, inert)
         # import/collection-time execution: a changed function that runs during
         # collection (decorators, module-level declarations) can break any test
         # before it even starts — no per-test attribution possible, so run all.

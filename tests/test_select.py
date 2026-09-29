@@ -137,6 +137,18 @@ def test_non_python_files_follow_the_tracked_untracked_policy(recorded):
     assert sel["mode"] == "run_all" and sel["reasons"] == ["non-Python file changed: pyproject.toml"]
 
 
+def test_configured_inert_patterns_are_not_a_change(recorded):
+    recorded.write("pyproject.toml", recorded.read("pyproject.toml")
+                   + '\n[tool.prongs]\ninert = ["*.svg", "hashes.json", "assets/*"]\n')
+    for path in ("pkg/logo.svg", "pkg/hashes.json", "assets/img/a.png", "pkg/data.json"):
+        recorded.write(path, "x")
+    recorded.commit()
+    sel = recorded.select()
+    assert sel["mode"] == "run_all" and sel["reasons"] == [
+        "non-Python file changed: pkg/data.json", "non-Python file changed: pyproject.toml",
+    ]
+
+
 def test_deleted_test_is_retired_by_the_next_full_run(recorded):
     recorded.edit("tests/test_m.py", "def test_b():\n    assert b() == 2\n\n", "")
     assert recorded.record().returncode == 0
