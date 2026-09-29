@@ -113,6 +113,8 @@ Add your own with glob patterns, matched against the path and against the file n
 inert = ["*.svg", "assets/*"]
 ```
 
+These patterns never match a `.py` file: a changed module is always analyzed.
+
 As a safety net, a map more than `max_map_age` commits behind HEAD runs everything.
 
 **Flaky tests.** A test that both passed and failed on one tree within `flaky_window` rollups is flaky.

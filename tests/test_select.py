@@ -149,6 +149,17 @@ def test_configured_inert_patterns_are_not_a_change(recorded):
     ]
 
 
+def test_configured_inert_patterns_never_hide_python(recorded):
+    recorded.write("pyproject.toml", recorded.read("pyproject.toml")
+                   + '\n[tool.prongs]\ninert = ["pkg/*"]\n')
+    recorded.write("pkg/data.json", "x")
+    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.commit()
+    sel = recorded.select()
+    assert sel["changed_functions"] == ["pkg/mod.py::b"]
+    assert sel["reasons"] == ["non-Python file changed: pyproject.toml"]
+
+
 def test_deleted_test_is_retired_by_the_next_full_run(recorded):
     recorded.edit("tests/test_m.py", "def test_b():\n    assert b() == 2\n\n", "")
     assert recorded.record().returncode == 0

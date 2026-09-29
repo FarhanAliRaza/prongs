@@ -65,7 +65,10 @@ def is_inert(path: str, patterns: tuple[str, ...] = ()) -> bool:
         path.endswith(INERT_SUFFIXES)
         or path.startswith(INERT_PREFIXES)
         or name in INERT_NAMES
-        or any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns)
+        # configured patterns are for non-Python files: a pattern like "pkg/*"
+        # must never hide a changed module from selection
+        or (not path.endswith(".py")
+            and any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns))
     )
 
 
