@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 2 validation: replay real git history through `bolttest audit`.
+"""Phase 2 validation: replay real git history through `prongs audit`.
 
 Walk the last N first-parent commits, oldest first. The map is built once, by
 a full recorded run at the oldest commit; every later commit is checked out
@@ -30,8 +30,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from bolttest import journal  # noqa: E402
-from bolttest.audit import audit, observe, run_alone  # noqa: E402
+from prongs import journal  # noqa: E402
+from prongs.audit import audit, observe, run_alone  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> str:
@@ -48,7 +48,7 @@ def build_map(repo: Path, py: str, extra: list[str]) -> int:
         p.unlink()
     shutil.rmtree(journal.journal_dir(repo), ignore_errors=True)
     return subprocess.run(
-        [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--bolttest-cov", *extra],
+        [py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--prongs-cov", *extra],
         cwd=repo, capture_output=True, text=True,
     ).returncode
 

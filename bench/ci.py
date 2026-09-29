@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """The CI artifact flow, replayed: every job is a fresh clone of one commit,
-and all that survives between jobs is artifact directories (`bolttest ci
-save` / `bolttest ci restore`), the way a CI cache and uploaded artifacts
+and all that survives between jobs is artifact directories (`prongs ci
+save` / `prongs ci restore`), the way a CI cache and uploaded artifacts
 carry them.
 
 Walk the last N first-parent commits of a testbed, oldest first. Each commit
 is a pull request against its parent, then merged:
 
   bootstrap  a fresh clone of the oldest commit; the artifact store is
-             empty, so `bolttest run` runs everything and records it; `ci
+             empty, so `prongs run` runs everything and records it; `ci
              save` writes the first map artifact
   PR job     a fresh clone of the commit (--shallow: depth 1, the way CI
              checks out, and `ci restore` deepens it); `ci restore` the
-             newest map artifact; `bolttest run`, the timed step and the gate;
-             then, in shadow mode, `bolttest audit` — the full suite, every
+             newest map artifact; `prongs run`, the timed step and the gate;
+             then, in shadow mode, `prongs audit` — the full suite, every
              status change the selection skipped, each re-run alone — as
              ground truth; `ci save --no-map` its journal files
   main job   on every --map-every K-th commit: a fresh clone; `ci restore`
              the newest map and every PR job's journals since the last main
-             job; `bolttest rollup`; `ci save` the next map artifact. Its full
+             job; `prongs rollup`; `ci save` the next map artifact. Its full
              run is the PR job's audit run, recorded (same commit, same
              tree), rather than a second full run of the same code. Between
              main jobs, PR jobs select from a map up to K commits behind.
@@ -32,7 +32,7 @@ unbroken commit, and the PR job's journal (on a commit the main branch never
 has) folds as foreign history.
 
 Reported per PR job: the selection (mode, selected/total, reasons), the
-exit code and wall time of `bolttest run` next to the full suite's, what
+exit code and wall time of `prongs run` next to the full suite's, what
 `ci restore` fetched and how long it took, misses. Kill criterion: any
 first-order miss.
 
@@ -57,11 +57,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))  # bench/mutate.py, for --inject
 
-# a job starts from the runner's environment, not the harness's: no bolttest
+# a job starts from the runner's environment, not the harness's: no prongs
 # settings, and no proxy (httpx's proxy tests read these, and fail on a
 # sandbox's agent proxy that no CI runner sets)
-CLEAN_ENV = {"PYTEST_ADDOPTS", "BOLTTEST_COV", "BOLTTEST_DIR", "BOLTTEST_JOURNAL",
-             "BOLTTEST_JOURNAL_KEY"}
+CLEAN_ENV = {"PYTEST_ADDOPTS", "PRONGS_COV", "PRONGS_DIR", "PRONGS_JOURNAL",
+             "PRONGS_JOURNAL_KEY"}
 PROXY_ENV = {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
 
 
@@ -90,7 +90,7 @@ def inject(job: Path, rng: random.Random) -> str | None:
     """Break one function the restored map covers, and commit it."""
     from mutate import mapped_functions, mutate_function
 
-    db = job / ".bolttest" / "map.sqlite"
+    db = job / ".prongs" / "map.sqlite"
     try:
         candidates = mapped_functions(db)
     except sqlite3.Error:
@@ -109,9 +109,9 @@ class Job:
         self.env = {k: v for k, v in os.environ.items()
                     if k not in CLEAN_ENV and k.lower() not in PROXY_ENV}
 
-    def bolttest(self, *args: str) -> tuple[int, dict, float]:
+    def prongs(self, *args: str) -> tuple[int, dict, float]:
         t0 = time.monotonic()
-        p = subprocess.run([self.py, "-m", "bolttest", *args], cwd=self.path, env=self.env,
+        p = subprocess.run([self.py, "-m", "prongs", *args], cwd=self.path, env=self.env,
                            capture_output=True, text=True)
         wall = time.monotonic() - t0
         try:
@@ -136,7 +136,7 @@ def main():
     rng = random.Random(args.seed)
     origin = args.repo.resolve()
     py = str(origin / ".venv" / "bin" / "python")
-    work = (args.work or Path(tempfile.mkdtemp(prefix="bolttest-ci-"))).resolve()
+    work = (args.work or Path(tempfile.mkdtemp(prefix="prongs-ci-"))).resolve()
     store = work / "artifacts"
     store.mkdir(parents=True, exist_ok=True)
     tag = (("-shallow" if args.shallow else "") + ("-inject" if args.inject else "")
@@ -152,11 +152,11 @@ def main():
 
     # bootstrap: an empty artifact store, so everything runs and is recorded
     job = Job(checkout(origin, commits[0], work / "job", shallow=False), py)
-    code, res, wall = job.bolttest("run")
+    code, res, wall = job.prongs("run")
     boot = {"commit": commits[0], "exit": code, "mode": res.get("selection", {}).get("mode"),
             "ran": res.get("summary", {}).get("ran"), "wall_s": wall}
     maps = [store / "map-0000"]
-    _, saved, _ = job.bolttest("ci", "save", str(maps[-1]))
+    _, saved, _ = job.prongs("ci", "save", str(maps[-1]))
     boot["map"] = saved.get("map")
     print(f"  bootstrap {commits[0][:8]}: {boot['mode']}, ran {boot['ran']} in {wall}s "
           f"-> map of {boot['map']['tests']} tests", flush=True)
@@ -165,16 +165,16 @@ def main():
     for i, sha in enumerate(commits[1:], start=1):
         is_main = i % args.map_every == 0
         job = Job(checkout(origin, sha, work / "job", shallow=args.shallow), py)
-        _, restored, restore_wall = job.bolttest("ci", "restore", str(maps[-1]))
+        _, restored, restore_wall = job.prongs("ci", "restore", str(maps[-1]))
         injected = inject(job.path, rng) if args.inject else None
-        code, run, run_wall = job.bolttest("run")
+        code, run, run_wall = job.prongs("run")
         # shadow mode: the full suite as ground truth (recorded on main commits,
         # where it doubles as the main job's full run, unless a fault was injected)
         record = is_main and not args.inject
         audit_args = ["audit", "--no-rollup"] + (["--record"] if record else [])
-        audit_code, aud, _ = job.bolttest(*audit_args)
+        audit_code, aud, _ = job.prongs(*audit_args)
         pr_art = store / f"pr-{i:04d}"
-        job.bolttest("ci", "save", "--no-map", str(pr_art))
+        job.prongs("ci", "save", "--no-map", str(pr_art))
         since_main.append(pr_art)
         sel, summ = run.get("selection", {}), run.get("summary", {})
         rec = {
@@ -203,15 +203,15 @@ def main():
             rec["run_error"] = run["error"]
         if is_main:
             main_job = Job(checkout(origin, sha, work / "main", shallow=False), py)
-            _, restored_main, _ = main_job.bolttest("ci", "restore", str(maps[-1]),
+            _, restored_main, _ = main_job.prongs("ci", "restore", str(maps[-1]),
                                                    *map(str, since_main))
             if args.inject:  # the PR job's full run saw broken code: record our own
                 subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                                "--bolttest-cov"], cwd=main_job.path, env=main_job.env,
+                                "--prongs-cov"], cwd=main_job.path, env=main_job.env,
                                capture_output=True)
-            _, rolled, roll_wall = main_job.bolttest("rollup")
+            _, rolled, roll_wall = main_job.prongs("rollup")
             maps.append(store / f"map-{i:04d}")
-            _, saved, _ = main_job.bolttest("ci", "save", str(maps[-1]))
+            _, saved, _ = main_job.prongs("ci", "save", str(maps[-1]))
             rec["main_job"] = {"journals": restored_main.get("journals", {}),
                                "rolled_up": rolled.get("rolled_up"), "rollup_wall_s": roll_wall,
                                "map_bytes": (saved.get("map") or {}).get("bytes")}
@@ -245,7 +245,7 @@ def main():
     if ok:
         run_s = sum(r["run_wall_s"] for r in ok)
         full_s = sum(r["full_wall_s"] or 0 for r in ok)
-        print(f"=== test step: bolttest run {run_s:.1f}s total vs full suite {full_s:.1f}s "
+        print(f"=== test step: prongs run {run_s:.1f}s total vs full suite {full_s:.1f}s "
               f"(median {statistics.median(r['run_wall_s'] for r in ok)}s vs "
               f"{statistics.median(r['full_wall_s'] or 0 for r in ok)}s per job)")
         print(f"=== restore: median {statistics.median(r['restore']['wall_s'] for r in ok)}s, "

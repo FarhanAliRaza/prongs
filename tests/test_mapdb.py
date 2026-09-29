@@ -8,8 +8,8 @@ import sqlite3
 
 import pytest
 
-from bolttest import journal, mapdb
-from bolttest.mapdb import COLLECTION
+from prongs import journal, mapdb
+from prongs.mapdb import COLLECTION
 
 
 @pytest.fixture

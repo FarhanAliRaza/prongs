@@ -7,7 +7,7 @@ Records into results/<repo>.json:
   - collect_s   : cold `pytest --collect-only -q` wall time + test count
   - full_run_s  : cold full-suite wall time
   - single_s    : cold single-test wall time (default: first collected test)
-  - cov_run_s   : full-suite wall time with --bolttest-cov (Phase 1 overhead)
+  - cov_run_s   : full-suite wall time with --prongs-cov (Phase 1 overhead)
 
 Each pytest invocation is a fresh interpreter (cold), run REPS times, min taken.
 """
@@ -89,8 +89,8 @@ def main():
         print(f"  {out['full_run']['s']}s  ({out['full_run']['tail']})")
 
         # 4. full run with coverage map (Phase 1 overhead)
-        print(f"[{repo.name}] full run + bolttest-cov ...", flush=True)
-        dt, p3 = run(pytest_cmd + ["-q", "--bolttest-cov"] + extra, repo)
+        print(f"[{repo.name}] full run + prongs-cov ...", flush=True)
+        dt, p3 = run(pytest_cmd + ["-q", "--prongs-cov"] + extra, repo)
         out["cov_run"] = {"s": round(dt, 3), "exit": p3.returncode,
                           "stderr_tail": p3.stderr.strip().splitlines()[-1] if p3.stderr.strip() else ""}
         base = out["full_run"]["s"]

@@ -1,4 +1,4 @@
-"""bolttest recorder plugin (PoC Phase 1, v4: one journal file per run).
+"""prongs recorder plugin (PoC Phase 1, v4: one journal file per run).
 
 Records, per test, the set of (file, qualname) project functions the test
 entered, using sys.monitoring PY_START events. Non-project code objects
@@ -8,7 +8,7 @@ zero callbacks after the first test. Project functions stay armed and are
 deduped into a per-test set (a set.add per project call).
 
 Every session appends one journal file (see journal.py) and never touches
-the map: `bolttest rollup` folds journal files into it. A run is full, partial
+the map: `prongs rollup` folds journal files into it. A run is full, partial
 (node ids, -k, -m, --lf, an interrupted session, an xdist worker) or
 collect-only. Partial runs are safe by construction — the roll-up refreshes
 exactly the tests they observed and unions their import-time code into the
@@ -19,10 +19,10 @@ Provenance: HEAD and every file that differed from it are snapshotted at
 session start and again at finish, with content hashes, so the selector can
 diff against the tree the evidence actually saw.
 
-Opt-in: only active when --bolttest-cov is passed (or BOLTTEST_COV=1), so
+Opt-in: only active when --prongs-cov is passed (or PRONGS_COV=1), so
 installing the package does not perturb baseline runs. The journal directory
-is --bolttest-journal, else $BOLTTEST_JOURNAL, else <state dir>/journal; the
-file is named by --bolttest-journal-key (or $BOLTTEST_JOURNAL_KEY) when the
+is --prongs-journal, else $PRONGS_JOURNAL, else <state dir>/journal; the
+file is named by --prongs-journal-key (or $PRONGS_JOURNAL_KEY) when the
 caller needs to find it again.
 """
 
@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from bolttest import journal, provenance
+from prongs import journal, provenance
 
 MON = sys.monitoring
 TOOL_ID = MON.COVERAGE_ID
@@ -43,27 +43,27 @@ TOOL_ID = MON.COVERAGE_ID
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--bolttest-cov",
+        "--prongs-cov",
         action="store_true",
         default=False,
-        help="record per-test coverage and outcomes as a journal file (.bolttest/journal/)",
+        help="record per-test coverage and outcomes as a journal file (.prongs/journal/)",
     )
-    parser.addoption("--bolttest-journal", default=None, help="journal directory for --bolttest-cov")
-    parser.addoption("--bolttest-journal-key", default=None, help="name of this run's journal file")
+    parser.addoption("--prongs-journal", default=None, help="journal directory for --prongs-cov")
+    parser.addoption("--prongs-journal-key", default=None, help="name of this run's journal file")
 
 
 def _enabled(config) -> bool:
     ns = getattr(config, "known_args_namespace", None)  # all an early config has parsed
     return (
-        bool(getattr(ns, "bolttest_cov", False))
-        or bool(getattr(config.option, "bolttest_cov", False))
-        or os.environ.get("BOLTTEST_COV") == "1"
+        bool(getattr(ns, "prongs_cov", False))
+        or bool(getattr(config.option, "prongs_cov", False))
+        or os.environ.get("PRONGS_COV") == "1"
     )
 
 
 def _start(config) -> None:
-    if _enabled(config) and not config.pluginmanager.has_plugin("bolttest-cov"):
-        config.pluginmanager.register(BolttestCov(config), "bolttest-cov")
+    if _enabled(config) and not config.pluginmanager.has_plugin("prongs-cov"):
+        config.pluginmanager.register(ProngsCov(config), "prongs-cov")
 
 
 @pytest.hookimpl(wrapper=True)
@@ -84,7 +84,7 @@ def classify_scope(config) -> str:
     """'collect' for --collect-only; 'partial' when the invocation restricts
     the item set (node ids, files, subdirectories, -k, -m, --deselect, --lf);
     else 'full'. A session that ends with unobserved items is downgraded to
-    'partial' at finish (see BolttestCov.pytest_sessionfinish)."""
+    'partial' at finish (see ProngsCov.pytest_sessionfinish)."""
     if config.getoption("collectonly", default=False):
         return "collect"
     opt = config.option
@@ -119,7 +119,7 @@ def classify_scope(config) -> str:
     return "full"
 
 
-class BolttestCov:
+class ProngsCov:
     def __init__(self, config):
         self.config = config
         self.rootpath = str(config.rootpath) + os.sep
@@ -133,7 +133,7 @@ class BolttestCov:
         self.n_collected = 0
         self.started_at = time.time()
         self.snapshot_start = provenance.snapshot(config.rootpath)
-        MON.use_tool_id(TOOL_ID, "bolttest")
+        MON.use_tool_id(TOOL_ID, "prongs")
         MON.register_callback(TOOL_ID, MON.events.PY_START, self._on_start)
         MON.set_events(TOOL_ID, MON.events.PY_START)
 
@@ -209,12 +209,12 @@ class BolttestCov:
         MON.free_tool_id(TOOL_ID)
         t0 = time.monotonic()
         config = session.config
-        jdir = config.getoption("bolttest_journal") or journal.journal_dir(config.rootpath)
-        key = config.getoption("bolttest_journal_key") or os.environ.get("BOLTTEST_JOURNAL_KEY")
+        jdir = config.getoption("prongs_journal") or journal.journal_dir(config.rootpath)
+        key = config.getoption("prongs_journal_key") or os.environ.get("PRONGS_JOURNAL_KEY")
         info = self.run_info()
         res = journal.append(jdir, self.rootpath, self.records, info, key=key)
         sys.stderr.write(
-            f"\n[bolttest] journaled run {res['key']} ({info['scope']}"
+            f"\n[prongs] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"
             f" -> {res['n_funcs']} funcs ({time.monotonic() - t0:.2f}s) -> {res['path']}\n"
         )

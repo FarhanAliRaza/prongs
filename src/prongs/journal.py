@@ -1,7 +1,7 @@
 """The journal: one SQLite file per recorded run, written once, never updated.
 
-Every run appends — the recorder at the end of a pytest session, `bolttest
-run` for a run without coverage — and nothing but `bolttest rollup` writes the
+Every run appends — the recorder at the end of a pytest session, `prongs
+run` for a run without coverage — and nothing but `prongs rollup` writes the
 map (see mapdb.rollup). A journal file is the whole record of one run:
 
   run      one row: key, provenance (commit; the files that differed from
@@ -23,11 +23,11 @@ worktrees, xdist workers, a daemon child and a CI job each write their own
 file. rollup folds pending files and moves them to consumed/; read_run() and
 statuses() read one file with no map at all, which is all a CI artifact flow
 needs. Files under journal/foreign/ were imported from another line of
-history (`bolttest ci restore`: a CI job whose commit is not an ancestor of
+history (`prongs ci restore`: a CI job whose commit is not an ancestor of
 this checkout's HEAD) and fold as history only.
 
-State lives in <worktree>/.bolttest/ unless BOLTTEST_DIR says otherwise (point
-several worktrees at one directory to pool their runs); BOLTTEST_JOURNAL
+State lives in <worktree>/.prongs/ unless PRONGS_DIR says otherwise (point
+several worktrees at one directory to pool their runs); PRONGS_JOURNAL
 overrides just the journal directory.
 """
 
@@ -43,7 +43,7 @@ from pathlib import Path
 
 FORMAT = 1
 COLLECTION = "__collection__"  # pseudo-test: code executed at import/collection time
-STATE = ".bolttest"
+STATE = ".prongs"
 FOREIGN = "foreign"  # journal/foreign/: runs from another line of history
 
 SCHEMA = """
@@ -56,7 +56,7 @@ CREATE TABLE run (
     worktree TEXT,           -- the checkout that ran it
     dirty_files TEXT,        -- JSON {path: [hash_at_start, hash_at_end]}
     tree_changed INTEGER,    -- HEAD moved or the dirty set changed mid-run
-    recorder TEXT,           -- recorder fingerprint (bolttest/python/pytest)
+    recorder TEXT,           -- recorder fingerprint (prongs/python/pytest)
     args TEXT,               -- JSON: pytest invocation args
     n_collected INTEGER, n_observed INTEGER,
     collect_errors TEXT,     -- JSON {node id: last line of the error}
@@ -85,12 +85,12 @@ _JSON_FIELDS = {"dirty_files": {}, "args": [], "collect_errors": {}, "collect_sk
 # --- where state lives ---------------------------------------------------------
 
 def state_dir(rootpath) -> Path:
-    env = os.environ.get("BOLTTEST_DIR")
+    env = os.environ.get("PRONGS_DIR")
     return Path(rootpath) / env if env else Path(rootpath) / STATE
 
 
 def journal_dir(rootpath) -> Path:
-    env = os.environ.get("BOLTTEST_JOURNAL")
+    env = os.environ.get("PRONGS_JOURNAL")
     return Path(rootpath) / env if env else state_dir(rootpath) / "journal"
 
 

@@ -75,7 +75,7 @@ def test_a_map_too_far_behind_head_runs_everything(recorded):
     assert out["mode"] == "run_all"
     assert out["run_all_reasons"] == ["map is 3 commits behind HEAD (max_map_age 2)"]
     assert out["skip_receipt"]["map_age"]["commits_behind_head"] == 3
-    recorded.env["BOLTTEST_MAX_MAP_AGE"] = "3"
+    recorded.env["PRONGS_MAX_MAP_AGE"] = "3"
     assert recorded.cli("affected")["mode"] == "select"
 
 

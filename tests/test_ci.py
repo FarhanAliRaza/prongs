@@ -1,5 +1,5 @@
 """The CI artifact flow: the map and journal files travel between fresh
-clones as artifact directories (`bolttest ci save` / `bolttest ci restore`),
+clones as artifact directories (`prongs ci save` / `prongs ci restore`),
 the way CI jobs pass them through a cache or uploaded artifacts."""
 
 from __future__ import annotations

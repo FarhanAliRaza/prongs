@@ -3,5 +3,5 @@ results/
 .venv/
 __pycache__/
 *.egg-info/
-.bolttest/
+.prongs/
 notes/

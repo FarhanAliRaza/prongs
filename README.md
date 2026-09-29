@@ -1,43 +1,43 @@
-# bolttest
+# prongs
 
-bolttest is a test runner for Python, built on pytest, for coding agents and developers iterating on large test suites.
+prongs is a test runner for Python, built on pytest, for coding agents and developers iterating on large test suites.
 It records which project functions each test executes.
 After a change, it runs only the tests that change can affect.
 Every skipped test comes with a receipt that says why it was safe to skip.
 
 ## Why
 
-- **A full suite per edit is too slow.** bolttest diffs your change against a recorded map and runs the affected tests only.
-- **Agents re-run everything because they cannot tell what is safe to skip.** Every `bolttest run` prints one JSON document with a skip receipt: the rule, the evidence, and how old it is.
+- **A full suite per edit is too slow.** prongs diffs your change against a recorded map and runs the affected tests only.
+- **Agents re-run everything because they cannot tell what is safe to skip.** Every `prongs run` prints one JSON document with a skip receipt: the rule, the evidence, and how old it is.
 - **Selection tools are hard to trust.** Every run checks that collected tests equal selected plus run-all plus skipped. If the books do not balance, the run fails with exit code 3.
-- **Trust needs measuring.** `bolttest audit` runs the full suite in shadow mode and reports every status change that selection would have skipped.
+- **Trust needs measuring.** `prongs audit` runs the full suite in shadow mode and reports every status change that selection would have skipped.
 
 ## Installation
 
 ```console
-pip install bolttest
+pip install prongs
 ```
 
-bolttest requires Python 3.12 or later, since it records with `sys.monitoring`.
+prongs requires Python 3.12 or later, since it records with `sys.monitoring`.
 It has no dependencies beyond pytest in your environment.
 It registers itself as a pytest plugin through the `pytest11` entry point.
-The recorder stays off unless you pass `--bolttest-cov`, so plain pytest runs are unaffected.
+The recorder stays off unless you pass `--prongs-cov`, so plain pytest runs are unaffected.
 
 ## Quick start
 
 Run from the repository root, the directory you run pytest from.
 
 ```console
-python -m pytest --bolttest-cov   # one full run with the recorder on
-bolttest affected                 # what a change can affect, and why
-bolttest run                      # run those tests and report as JSON
+python -m pytest --prongs-cov   # one full run with the recorder on
+prongs affected                 # what a change can affect, and why
+prongs run                      # run those tests and report as JSON
 ```
 
-The first command writes a journal file under `.bolttest/`.
+The first command writes a journal file under `.prongs/`.
 `affected` and `run` fold it into the map before they select.
-Add `.bolttest/` to your `.gitignore`.
+Add `.prongs/` to your `.gitignore`.
 
-After editing one function, `bolttest affected` prints (trimmed):
+After editing one function, `prongs affected` prints (trimmed):
 
 ```json
 {
@@ -46,13 +46,13 @@ After editing one function, `bolttest affected` prints (trimmed):
   "n_selected": 3,
   "n_skipped": 95,
   "changed_functions": [
-    "src/bolttest/__main__.py::exception_line",
-    "src/bolttest/config.py::settings"
+    "src/prongs/__main__.py::exception_line",
+    "src/prongs/config.py::settings"
   ],
   "run_all_reasons": [],
   "selected_by_reason": {
-    "touches changed function src/bolttest/config.py": 1,
-    "touches changed function src/bolttest/__main__.py": 2
+    "touches changed function src/prongs/config.py": 1,
+    "touches changed function src/prongs/__main__.py": 2
   },
   "tests": [
     "tests/test_audit.py::test_a_control_run_separates_environment_drift_from_misses",
@@ -71,7 +71,7 @@ After editing one function, `bolttest affected` prints (trimmed):
 }
 ```
 
-With no map, `bolttest run` runs the whole suite and records it, so it builds the map it lacked.
+With no map, `prongs run` runs the whole suite and records it, so it builds the map it lacked.
 
 ## How it works
 
@@ -80,7 +80,7 @@ Code that runs at import or collection time is recorded as its own set.
 Stdlib and site-packages code is disabled on first sight and costs nothing after that.
 
 **Journal and roll-up.** Every recorded session appends one journal file and never touches the map.
-`bolttest rollup` folds pending journal files into `.bolttest/map.sqlite`.
+`prongs rollup` folds pending journal files into `.prongs/map.sqlite`.
 `affected`, `run` and `audit` roll up first, unless you pass `--no-rollup`.
 Partial runs (node ids, `-k`, `-m`, xdist workers) refresh exactly the tests they observed.
 Concurrent sessions each write their own file.
@@ -123,14 +123,14 @@ All commands print one JSON document on stdout, except `daemon`.
 
 | Command | Purpose |
 |---|---|
-| `bolttest affected` | Show what would run, and why |
-| `bolttest run` | Select, execute, and report results with receipts |
-| `bolttest audit` | Select, then run the full suite and report every skipped status change |
-| `bolttest rollup` | Fold pending journal files into the map |
-| `bolttest ci save DIR` | Write the map and this job's journal files as a CI artifact |
-| `bolttest ci restore PATH...` | Install CI artifacts into a fresh clone |
-| `bolttest daemon` | Start the warm daemon in the foreground |
-| `bolttest stop` | Stop the daemon |
+| `prongs affected` | Show what would run, and why |
+| `prongs run` | Select, execute, and report results with receipts |
+| `prongs audit` | Select, then run the full suite and report every skipped status change |
+| `prongs rollup` | Fold pending journal files into the map |
+| `prongs ci save DIR` | Write the map and this job's journal files as a CI artifact |
+| `prongs ci restore PATH...` | Install CI artifacts into a fresh clone |
+| `prongs daemon` | Start the warm daemon in the foreground |
+| `prongs stop` | Stop the daemon |
 
 `affected`, `run` and `audit` share these flags:
 
@@ -154,7 +154,7 @@ All commands print one JSON document on stdout, except `daemon`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--pytest-args ARGS` | `$BOLTTEST_RUN_ARGS` | Extra pytest arguments for the full run |
+| `--pytest-args ARGS` | `$PRONGS_RUN_ARGS` | Extra pytest arguments for the full run |
 | `--isolate` / `--no-isolate` | on | Re-run each miss alone to separate first-order misses from pollution |
 | `--record` / `--no-record` | off | Append the full run to the real journal |
 | `--control` / `--no-control` | off | Re-run each first-order miss on its baseline commit, checked out in place (clean tree only) |
@@ -166,9 +166,9 @@ The pytest plugin adds:
 
 | Option | Meaning |
 |---|---|
-| `--bolttest-cov` | Record per-test coverage and outcomes as a journal file |
-| `--bolttest-journal DIR` | Journal directory for `--bolttest-cov` |
-| `--bolttest-journal-key KEY` | Name of this run's journal file |
+| `--prongs-cov` | Record per-test coverage and outcomes as a journal file |
+| `--prongs-journal DIR` | Journal directory for `--prongs-cov` |
+| `--prongs-journal-key KEY` | Name of this run's journal file |
 
 `run` uses the daemon when its socket exists, and otherwise runs pytest in-process.
 If the warm image is stale, it falls back to a cold run and says so under `executor`.
@@ -184,10 +184,10 @@ If the warm image is stale, it falls back to a cold run and says so under `execu
 
 ## Configuration
 
-Settings are read from `[tool.bolttest]` in `pyproject.toml`, then `BOLTTEST_<NAME>` environment variables, then command-line flags.
+Settings are read from `[tool.prongs]` in `pyproject.toml`, then `PRONGS_<NAME>` environment variables, then command-line flags.
 
 ```toml
-[tool.bolttest]
+[tool.prongs]
 history_window = 3   # a test whose outcome flipped in the last N rollups is selected
 max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
@@ -196,50 +196,50 @@ flaky_retries = 2    # re-run a failing flaky test alone up to N times
 
 | Variable | Meaning |
 |---|---|
-| `BOLTTEST_HISTORY_WINDOW`, `BOLTTEST_MAX_MAP_AGE`, `BOLTTEST_FLAKY_WINDOW`, `BOLTTEST_FLAKY_RETRIES` | Override the settings above |
-| `BOLTTEST_COV=1` | Turn the recorder on, like `--bolttest-cov` |
-| `BOLTTEST_DIR` | State directory, relative to the repository root (default `.bolttest`); point worktrees at one directory to pool runs |
-| `BOLTTEST_JOURNAL` | Journal directory only (default `<state dir>/journal`) |
-| `BOLTTEST_JOURNAL_KEY` | Name of the recorded run's journal file |
-| `BOLTTEST_RUN_ARGS` | Extra pytest arguments for every pytest run bolttest starts: `run`, `audit`, flaky retries, and daemon children |
-| `BOLTTEST_WARM_ARGS` | Extra pytest arguments for the daemon's warm-up collection |
-| `BOLTTEST_WARM_DB_TEST` | A test node id the daemon runs once at warm-up, so forked children inherit the test database |
+| `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES` | Override the settings above |
+| `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
+| `PRONGS_DIR` | State directory, relative to the repository root (default `.prongs`); point worktrees at one directory to pool runs |
+| `PRONGS_JOURNAL` | Journal directory only (default `<state dir>/journal`) |
+| `PRONGS_JOURNAL_KEY` | Name of the recorded run's journal file |
+| `PRONGS_RUN_ARGS` | Extra pytest arguments for every pytest run prongs starts: `run`, `audit`, flaky retries, and daemon children |
+| `PRONGS_WARM_ARGS` | Extra pytest arguments for the daemon's warm-up collection |
+| `PRONGS_WARM_DB_TEST` | A test node id the daemon runs once at warm-up, so forked children inherit the test database |
 
 ## CI
 
 A CI job starts from a fresh clone, so the map travels as an artifact.
 Pushes to the default branch run the full suite with the recorder and save the map to a cache.
-Pull requests restore that map, run `bolttest run` as the gate, and upload their journal files.
+Pull requests restore that map, run `prongs run` as the gate, and upload their journal files.
 The next push job folds those journals in as history, which feeds flaky detection.
 `ci restore` deepens a shallow clone until the map's evidence commits are present.
-With no map, `bolttest run` runs everything and records it, so the gate never depends on the cache.
+With no map, `prongs run` runs everything and records it, so the gate never depends on the cache.
 See [`examples/github-actions.yml`](examples/github-actions.yml) for the full, commented workflow.
 
 ```yaml
 - name: Restore
-  run: python -m bolttest ci restore "$RUNNER_TEMP/bolttest-ci"
+  run: python -m prongs ci restore "$RUNNER_TEMP/prongs-ci"
 
 - name: Tests (the affected ones)
   if: github.event_name == 'pull_request'
   shell: bash
-  run: python -m bolttest run | tee "$RUNNER_TEMP/bolttest-result.json"
+  run: python -m prongs run | tee "$RUNNER_TEMP/prongs-result.json"
 
 - name: Tests (all of them, recorded)
   if: github.event_name != 'pull_request'
-  run: python -m pytest --bolttest-cov
+  run: python -m pytest --prongs-cov
 
 - name: Save this job's journals
   if: always() && github.event_name == 'pull_request'
-  run: python -m bolttest ci save --no-map "$RUNNER_TEMP/bolttest-out"
+  run: python -m prongs ci save --no-map "$RUNNER_TEMP/prongs-out"
 
 - name: Save the map
   if: always() && github.event_name != 'pull_request'
-  run: python -m bolttest ci save --no-journals "$RUNNER_TEMP/bolttest-ci/map"
+  run: python -m prongs ci save --no-journals "$RUNNER_TEMP/prongs-ci/map"
 ```
 
 ## Audit mode
 
-`bolttest audit` selects exactly as `bolttest run` would, then runs the full suite with the recorder on.
+`prongs audit` selects exactly as `prongs run` would, then runs the full suite with the recorder on.
 The full run goes to a temporary journal, so an audit never feeds the map it audits.
 It compares every test's status with the map's baseline.
 A test whose status changed and was not selected is a candidate miss, reported with the receipt that skipped it.
@@ -253,7 +253,7 @@ A known-flaky test that flips is reported under `flaky`, not as a miss.
 With `--control`, a miss that also differs on its baseline commit is reported as `drift`.
 
 ```console
-bolttest audit --base HEAD~1
+prongs audit --base HEAD~1
 ```
 
 The audit exits 1 on any first-order miss.
@@ -261,7 +261,7 @@ Run it in CI alongside selection, and treat a first-order miss as the kill crite
 
 ## Using it from an agent
 
-`bolttest run` is designed as the single command an agent calls after an edit.
+`prongs run` is designed as the single command an agent calls after an edit.
 It rolls up, selects, executes, and reports in one JSON document.
 The output is built for a token budget: failures are grouped by exception line, tracebacks are truncated, passes are counted, not listed.
 The skip receipt and `evidence` let the agent decide whether to trust the skip.
@@ -269,7 +269,7 @@ The exit code carries the verdict, so no output parsing is needed to gate on it.
 
 ## Status
 
-bolttest is early (0.0.x).
+prongs is early (0.0.x).
 The command-line interface, JSON output shape and map schema may change between releases.
 The `bench/` directory holds the harnesses used to validate selection: a baseline timer, mutation testing and history replay around `audit`, and a local replay of the CI artifact flow.
 

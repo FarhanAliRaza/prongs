@@ -1,5 +1,5 @@
 [project]
-name = "bolttest"
+name = "prongs"
 dynamic = ["version"]
 description = "Agent-native test runner for Python: runs only the tests a change can affect"
 readme = "README.md"
@@ -15,23 +15,23 @@ classifiers = [
 ]
 
 [project.urls]
-Source = "https://github.com/FarhanAliRaza/bolttest"
+Source = "https://github.com/FarhanAliRaza/prongs"
 
 [project.scripts]
-bolttest = "bolttest.__main__:main"
+prongs = "prongs.__main__:main"
 
 [project.entry-points.pytest11]
-bolttest = "bolttest.plugin"
+prongs = "prongs.plugin"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/bolttest/__init__.py"
+path = "src/prongs/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/bolttest"]
+packages = ["src/prongs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

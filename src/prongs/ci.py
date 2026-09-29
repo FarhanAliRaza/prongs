@@ -1,9 +1,9 @@
 """The CI artifact flow: carry the map and journal files between CI jobs.
 
-  python -m bolttest ci save DIR [--no-map] [--no-journals]
-  python -m bolttest ci restore PATH [PATH ...] [--no-fetch] [--remote NAME]
+  python -m prongs ci save DIR [--no-map] [--no-journals]
+  python -m prongs ci restore PATH [PATH ...] [--no-fetch] [--remote NAME]
 
-A CI job starts from a fresh clone, so everything bolttest knows has to
+A CI job starts from a fresh clone, so everything prongs knows has to
 travel as an artifact (a cache entry, an uploaded directory). An artifact is
 a directory:
 
@@ -15,9 +15,9 @@ a directory:
 The flow (examples/github-actions.yml has it as a workflow):
 
   main job   restore the last map artifact (and recent PR journal
-             artifacts), run the suite with the recorder, `bolttest rollup`,
+             artifacts), run the suite with the recorder, `prongs rollup`,
              `ci save` the map and this job's journals
-  PR job     restore the last map artifact, `bolttest run` (its exit code is
+  PR job     restore the last map artifact, `prongs run` (its exit code is
              the gate), `ci save --no-map` this job's journals, for the next
              main job to fold
 
@@ -39,7 +39,7 @@ The flow (examples/github-actions.yml has it as a workflow):
     the clone lacks once the evidence history is in is another branch's
   * it skips runs the map already holds, since rollup folds by journal key
     and a journal artifact is often downloaded more than once
-  * it records the keys it imported (.bolttest/ci/restored.json), so `save`
+  * it records the keys it imported (.prongs/ci/restored.json), so `save`
     carries only the journal files this job wrote
 
 Everything the selector needs is in the map and git; journal files are read
@@ -56,7 +56,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from bolttest import __version__, journal, mapdb, provenance
+from prongs import __version__, journal, mapdb, provenance
 
 FORMAT = 1
 MANIFEST = "manifest.json"
@@ -127,7 +127,7 @@ def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = 
     jdir = journal.journal_dir(repo)
     manifest: dict = {
         "format": FORMAT,
-        "bolttest": __version__,
+        "prongs": __version__,
         "created_at": time.time(),
         "head": provenance.git_head(repo),
         "map": None,
@@ -275,7 +275,7 @@ def restore(repo: Path, paths, *, fetch: bool = True, remote: str = "origin") ->
             continue
         if summary["schema"] > mapdb.SCHEMA_VERSION:
             out["warnings"].append(
-                f"{a / MAP}: schema {summary['schema']} is newer than this bolttest "
+                f"{a / MAP}: schema {summary['schema']} is newer than this prongs "
                 f"({mapdb.SCHEMA_VERSION}); skipped")
             continue
         newest = summary["newest_run"] or {}

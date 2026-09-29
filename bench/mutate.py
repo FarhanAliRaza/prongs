@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Phase 2 strong validation: fault injection, as a loop around `bolttest audit`.
+"""Phase 2 strong validation: fault injection, as a loop around `prongs audit`.
 
 For N randomly chosen project functions (that appear in the coverage map):
-  1. insert `raise RuntimeError("bolttest-mutation")` as the first statement
+  1. insert `raise RuntimeError("prongs-mutation")` as the first statement
   2. audit --base HEAD: select for the working-tree diff against map@HEAD,
      run the FULL suite, diff every test's status against the map, and re-run
      each unselected status change alone under the same mutation
@@ -18,7 +18,7 @@ mutation is not what moved it (environment drift — wagtail's upload tests
 fail on any run after the first, because the files the first run uploaded
 are still in the ignored test-media directory).
 
-The map must have been built at HEAD on a clean tree (pytest --bolttest-cov):
+The map must have been built at HEAD on a clean tree (pytest --prongs-cov):
 its recorded statuses are the baseline.
 
 Usage: python bench/mutate.py testbeds/httpx --n 15 [--seed 7]
@@ -38,8 +38,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from bolttest import journal, mapdb, provenance  # noqa: E402
-from bolttest.audit import audit, run_alone  # noqa: E402
+from prongs import journal, mapdb, provenance  # noqa: E402
+from prongs.audit import audit, run_alone  # noqa: E402
 
 
 def mutate_function(repo: Path, path: str, qual: str) -> bool:
@@ -76,7 +76,7 @@ def mutate_function(repo: Path, path: str, qual: str) -> bool:
     ):
         first = target.body[1]
     indent = " " * first.col_offset
-    lines.insert(first.lineno - 1, f'{indent}raise RuntimeError("bolttest-mutation")\n')
+    lines.insert(first.lineno - 1, f'{indent}raise RuntimeError("prongs-mutation")\n')
     (repo / path).write_text("".join(lines))
     return True
 
@@ -109,7 +109,7 @@ def main():
     extra = shlex.split(args.pytest_args)
     db = journal.map_path(repo)
     mapdb.rollup(db, journal.journal_dir(repo))
-    assert db.exists(), "build the map first (pytest --bolttest-cov)"
+    assert db.exists(), "build the map first (pytest --prongs-cov)"
     if subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repo).returncode != 0:
         sys.exit(f"{repo} has uncommitted changes; mutate needs a clean tree (git stash)")
     con = mapdb.connect(str(db))

@@ -12,7 +12,7 @@ import sys
 
 from conftest import T_A, T_B, T_C, Repo
 
-from bolttest import journal, mapdb
+from prongs import journal, mapdb
 
 
 def test_a_recorded_session_appends_a_file_and_never_writes_the_map(repo):
@@ -102,14 +102,14 @@ def test_a_test_without_dependency_evidence_is_unmapped_and_always_runs(repo):
 
 def test_two_worktrees_share_one_journal_without_contention(tmp_path, repo, monkeypatch):
     shared = tmp_path / "shared-state"
-    monkeypatch.setenv("BOLTTEST_DIR", str(shared))
+    monkeypatch.setenv("PRONGS_DIR", str(shared))
     repo.git("worktree", "add", "-q", str(tmp_path / "wt2"))
-    one, two = Repo(repo.path, {"BOLTTEST_DIR": str(shared)}), Repo(tmp_path / "wt2", {"BOLTTEST_DIR": str(shared)})
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", BOLTTEST_DIR=str(shared))
+    one, two = Repo(repo.path, {"PRONGS_DIR": str(shared)}), Repo(tmp_path / "wt2", {"PRONGS_DIR": str(shared)})
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PRONGS_DIR=str(shared))
     env.pop("PYTEST_ADDOPTS", None)
     procs = [
         subprocess.Popen(
-            [sys.executable, "-m", "pytest", "--bolttest-cov", "-q", "-p", "no:cacheprovider"],
+            [sys.executable, "-m", "pytest", "--prongs-cov", "-q", "-p", "no:cacheprovider"],
             cwd=r.path, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         for r in (one, two)
@@ -149,8 +149,8 @@ def test_affected_rolls_up_lazily_and_reports_the_journal(recorded):
 
 
 def test_kd_state_is_never_part_of_the_observed_tree(repo):
-    repo.write(".gitignore", "__pycache__/\n")  # a project that does not ignore .bolttest/
-    repo.commit("stop ignoring .bolttest")
+    repo.write(".gitignore", "__pycache__/\n")  # a project that does not ignore .prongs/
+    repo.commit("stop ignoring .prongs")
     assert repo.record().returncode == 0
     repo.rollup()
     assert repo.record().returncode == 0  # the journal and map now exist, untracked

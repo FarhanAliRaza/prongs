@@ -8,8 +8,8 @@ the requested node IDs — full fixture/plugin compat — streaming a JSON resul
 back over the connection, then os._exit()s. Copy-on-write makes each run
 start from pristine warm state.
 
-Server: python -m bolttest.daemon serve  (run from the repo root)
-Client: python -m bolttest.daemon run tests/test_x.py::test_y ...
+Server: python -m prongs.daemon serve  (run from the repo root)
+Client: python -m prongs.daemon run tests/test_x.py::test_y ...
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import sys
 import time
 
 def sock_path() -> str:
-    """The daemon's socket, in the state directory (BOLTTEST_DIR applies)."""
-    from bolttest.journal import state_dir
+    """The daemon's socket, in the state directory (PRONGS_DIR applies)."""
+    from prongs.journal import state_dir
 
     return str(state_dir(".") / "daemon.sock")
 
@@ -153,7 +153,7 @@ def warm() -> float:
     import pytest
 
     t0 = time.monotonic()
-    extra = shlex.split(os.environ.get("BOLTTEST_WARM_ARGS", ""))
+    extra = shlex.split(os.environ.get("PRONGS_WARM_ARGS", ""))
     # --co imports every test module (assertion-rewritten) and runs plugin
     # configure hooks (django.setup() etc.) without executing any test.
     with _Quiet():
@@ -164,9 +164,9 @@ def warm() -> float:
     # fixture snapshot: run one DB-touching test in the parent so the test
     # database (schema + fixtures) lives in the warm image; every forked
     # child then inherits a pristine copy-on-write copy of it.
-    db_test = os.environ.get("BOLTTEST_WARM_DB_TEST")
+    db_test = os.environ.get("PRONGS_WARM_DB_TEST")
     if db_test:
-        run_args = shlex.split(os.environ.get("BOLTTEST_RUN_ARGS", ""))
+        run_args = shlex.split(os.environ.get("PRONGS_RUN_ARGS", ""))
         with _Quiet():
             pytest.main(
                 [db_test, "-q", "--no-header", "-p", "no:cacheprovider"] + run_args,
@@ -308,7 +308,7 @@ def serve() -> None:
     apply_compat_shims()
     dt = warm()
     warm_time = time.time()
-    sys.stderr.write(f"[bolttest-daemon] warm in {dt:.2f}s, listening on {SOCK}\n")
+    sys.stderr.write(f"[prongs-daemon] warm in {dt:.2f}s, listening on {SOCK}\n")
 
     if os.path.exists(SOCK):
         os.unlink(SOCK)
@@ -345,12 +345,12 @@ def serve() -> None:
 
                 collector = ResultCollector()
                 args = (
-                    shlex.split(os.environ.get("BOLTTEST_RUN_ARGS", ""))
+                    shlex.split(os.environ.get("PRONGS_RUN_ARGS", ""))
                     + req.get("args", [])
                     + req["node_ids"]
                     + ["-q", "--no-header", "-p", "no:cacheprovider"]
                 )
-                if os.environ.get("BOLTTEST_WARM_DB_TEST"):
+                if os.environ.get("PRONGS_WARM_DB_TEST"):
                     skip_db_setup_in_child()
                 import tempfile
 

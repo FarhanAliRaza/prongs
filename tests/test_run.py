@@ -1,11 +1,11 @@
-"""`bolttest run` as the agent reads it: the status verdict, the conservation
+"""`prongs run` as the agent reads it: the status verdict, the conservation
 block that must balance, and failures grouped by root cause."""
 
 from __future__ import annotations
 
 from conftest import T_A, T_B, T_C
 
-from bolttest.__main__ import exception_line, group_failures
+from prongs.__main__ import exception_line, group_failures
 
 
 def test_selected_run_balances_its_books(recorded):
@@ -196,7 +196,7 @@ def test_stop_without_a_daemon_reports_it(recorded):
 def test_run_args_reach_a_cold_run(recorded):
     # an option pytest rejects: the run must fail as an error, proving the
     # arguments reached the in-process pytest, not just the daemon's children
-    recorded.env["BOLTTEST_RUN_ARGS"] = "--no-such-option"
+    recorded.env["PRONGS_RUN_ARGS"] = "--no-such-option"
     recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
     out = recorded.cli("run", code=2)
     assert out["summary"]["status"] == "error"

@@ -1,4 +1,4 @@
-"""`bolttest audit`: the selection checked against a full run of the same
+"""`prongs audit`: the selection checked against a full run of the same
 tree, in a real project. A status change the selection skipped is a miss;
 re-run alone, it is either first-order (still changed) or pollution."""
 
@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 
-from bolttest.audit import audit, run_alone
+from prongs.audit import audit, run_alone
 
 
 def test_audit_passes_when_every_status_change_was_selected(recorded):
@@ -87,7 +87,7 @@ ONCE = (
 def run_once_test(repo) -> None:
     """A test that passes only on a fresh checkout: the state it leaves behind
     sits in an ignored directory no diff and no coverage map can see."""
-    repo.write(".gitignore", ".bolttest/\n__pycache__/\nstate/\n")
+    repo.write(".gitignore", ".prongs/\n__pycache__/\nstate/\n")
     repo.write("tests/test_once.py", ONCE)
     repo.commit("a run-once test")
     assert repo.record().returncode == 0

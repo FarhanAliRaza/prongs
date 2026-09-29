@@ -1,8 +1,8 @@
-# bolttest in GitHub Actions: a pull request runs only the tests its change can
+# prongs in GitHub Actions: a pull request runs only the tests its change can
 # affect; a push to the default branch (and a nightly run) runs everything with
 # the recorder on and refreshes the map every later job selects from.
 #
-# How the map travels between jobs (src/bolttest/ci.py has the rules):
+# How the map travels between jobs (src/prongs/ci.py has the rules):
 #
 #   push / nightly   restore the newest map from the cache, fold the journal
 #                    files recent pull-request jobs uploaded (their outcomes
@@ -10,11 +10,11 @@
 #                    the new map to the cache
 #   pull request     restore the newest map (a cache saved on the default
 #                    branch is visible to pull requests), run the affected
-#                    tests (`bolttest run` exits 1 on a failure, 2 on an error,
+#                    tests (`prongs run` exits 1 on a failure, 2 on an error,
 #                    3 when its books do not balance), upload this job's
 #                    journal files for the next push job to fold
 #
-# With no map yet (the first run, an evicted cache), `bolttest run` runs
+# With no map yet (the first run, an evicted cache), `prongs run` runs
 # everything and records it, so the gate never depends on the cache.
 #
 # Artifacts live under $RUNNER_TEMP, outside the checkout: files the job
@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # the commits the map was recorded on; with the default depth of 1,
-          # `bolttest ci restore` deepens the clone until they are there
+          # `prongs ci restore` deepens the clone until they are there
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -55,56 +55,56 @@ jobs:
       - name: Install
         run: |
           pip install -e . pytest                             # your project
-          pip install bolttest
+          pip install prongs
 
       - name: Restore the map
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/bolttest-ci/map
-          key: bolttest-map-${{ github.sha }}
-          restore-keys: bolttest-map-
+          path: ${{ runner.temp }}/prongs-ci/map
+          key: prongs-map-${{ github.sha }}
+          restore-keys: prongs-map-
 
       - name: Collect pull-request journals
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p "$RUNNER_TEMP/bolttest-ci/journals"
+          mkdir -p "$RUNNER_TEMP/prongs-ci/journals"
           for id in $(gh run list --workflow "${{ github.workflow }}" --event pull_request \
                         --status completed --limit 50 --json databaseId --jq '.[].databaseId'); do
-            gh run download "$id" --pattern 'bolttest-journals-*' \
-              --dir "$RUNNER_TEMP/bolttest-ci/journals/$id" || true  # expired or none
+            gh run download "$id" --pattern 'prongs-journals-*' \
+              --dir "$RUNNER_TEMP/prongs-ci/journals/$id" || true  # expired or none
           done
 
       - name: Restore
-        run: python -m bolttest ci restore "$RUNNER_TEMP/bolttest-ci"
+        run: python -m prongs ci restore "$RUNNER_TEMP/prongs-ci"
 
       - name: Tests (the affected ones)
         if: github.event_name == 'pull_request'
-        shell: bash  # pipefail: the step fails with bolttest, not with tee
-        run: python -m bolttest run | tee "$RUNNER_TEMP/bolttest-result.json"
+        shell: bash  # pipefail: the step fails with prongs, not with tee
+        run: python -m prongs run | tee "$RUNNER_TEMP/prongs-result.json"
 
       - name: Tests (all of them, recorded)
         if: github.event_name != 'pull_request'
-        run: python -m pytest --bolttest-cov
+        run: python -m pytest --prongs-cov
 
       - name: Save this job's journals
         if: always() && github.event_name == 'pull_request'
-        run: python -m bolttest ci save --no-map "$RUNNER_TEMP/bolttest-out"
+        run: python -m prongs ci save --no-map "$RUNNER_TEMP/prongs-out"
 
       - uses: actions/upload-artifact@v4
         if: always() && github.event_name == 'pull_request'
         with:
-          name: bolttest-journals-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/bolttest-out
+          name: prongs-journals-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prongs-out
           retention-days: 14
 
       - name: Save the map
         if: always() && github.event_name != 'pull_request'
-        run: python -m bolttest ci save --no-journals "$RUNNER_TEMP/bolttest-ci/map"
+        run: python -m prongs ci save --no-journals "$RUNNER_TEMP/prongs-ci/map"
 
       - uses: actions/cache/save@v4
         if: always() && github.event_name != 'pull_request'
         with:
-          path: ${{ runner.temp }}/bolttest-ci/map  # the path the restore step used
-          key: bolttest-map-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prongs-ci/map  # the path the restore step used
+          key: prongs-map-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
