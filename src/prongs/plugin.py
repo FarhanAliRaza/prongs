@@ -35,10 +35,13 @@ from pathlib import Path
 
 import pytest
 
-from prongs import journal, provenance
+from prongs import config as settings
+from prongs import evidence, journal, provenance
 
-MON = sys.monitoring
-TOOL_ID = MON.COVERAGE_ID
+# sys.monitoring (3.12+) costs nothing for code it has disabled; before it,
+# a profile function sees every call, which is slower but records the same
+MON = getattr(sys, "monitoring", None)
+TOOL_ID = MON.COVERAGE_ID if MON else None
 
 
 def pytest_addoption(parser):
@@ -133,22 +136,53 @@ class ProngsCov:
         self.n_collected = 0
         self.started_at = time.time()
         self.snapshot_start = provenance.snapshot(config.rootpath)
-        MON.use_tool_id(TOOL_ID, "prongs")
-        MON.register_callback(TOOL_ID, MON.events.PY_START, self._on_start)
-        MON.set_events(TOOL_ID, MON.events.PY_START)
+        # what function entry cannot see: files read, names listed, processes
+        # started (evidence.py). Shared fixtures are set up once, inside the
+        # first test that asks for them: what their setup did is kept per
+        # fixture and credited to every test that uses it.
+        self.evidence = evidence.Evidence(
+            self.rootpath, provenance.tracked_files(config.rootpath),
+            settings.names(config.rootpath, "native_commands"),
+        )
+        self._fixtures: dict = {}  # FixtureDef -> (deps, started a process)
+        self._shared: tuple[set, bool] = (set(), False)
+        self._spawns: dict[str, tuple[int, bool]] = {}  # test -> (own spawns, via a fixture)
+        self.evidence.start()
+        if MON:
+            MON.use_tool_id(TOOL_ID, "prongs")
+            MON.register_callback(TOOL_ID, MON.events.PY_START, self._on_start)
+            MON.set_events(TOOL_ID, MON.events.PY_START)
+        else:
+            import threading
+
+            sys.setprofile(self._profile)
+            threading.setprofile(self._profile)
+
+    def _interest(self, code) -> bool:
+        fn = code.co_filename
+        interesting = self._interesting[code] = (
+            fn.startswith(self.rootpath)
+            and "site-packages" not in fn
+            and not fn.startswith("<")
+        )
+        return interesting
 
     def _on_start(self, code, offset):
         interesting = self._interesting.get(code)
         if interesting is None:
-            fn = code.co_filename
-            interesting = self._interesting[code] = (
-                fn.startswith(self.rootpath)
-                and "site-packages" not in fn
-                and not fn.startswith("<")
-            )
+            interesting = self._interest(code)
         if not interesting:
             return MON.DISABLE
         self._current.add(code)
+
+    def _profile(self, frame, event, arg):
+        if event == "call":
+            code = frame.f_code
+            interesting = self._interesting.get(code)
+            if interesting is None:
+                interesting = self._interest(code)
+            if interesting:
+                self._current.add(code)
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -162,18 +196,76 @@ class ProngsCov:
         # (app setup, module bodies, decorators, class-level declarations): a
         # pseudo-context. A diff touching any of it invalidates the whole suite.
         self.n_collected = len(session.items)
-        self.records[journal.COLLECTION] = (0.0, "collection", frozenset(self._current))
+        # a process started while collecting is not marked: what collection
+        # runs is already a reason to run everything when it changes
+        self.records[journal.COLLECTION] = (
+            0.0, "collection", frozenset(self._current | self.evidence.deps))
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_fixture_setup(self, fixturedef, request):
+        if fixturedef.scope == "function":
+            return (yield)
+        ev = self.evidence
+        outer = self._current, ev.deps, ev.spawns
+        self._current, ev.deps, ev.spawns = set(), set(), 0
+        try:
+            return (yield)
+        finally:
+            self._fixtures[fixturedef] = (self._current | ev.deps, ev.spawns > 0)
+            self._current |= outer[0]
+            ev.deps |= outer[1]
+            ev.spawns += outer[2]
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtest_teardown(self, item):
+        # pytest drops the request when the protocol ends: read the fixtures
+        # in effect (requested by name, autouse, or fetched dynamically) now
+        deps, spawned = set(), False
+        for fixturedef in getattr(getattr(item, "_request", None), "_fixture_defs", {}).values():
+            got = self._fixtures.get(fixturedef)
+            if got:
+                deps |= got[0]
+                spawned = spawned or got[1]
+        self._shared = (deps, spawned)
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(self, item, nextitem):
         self._current = set()
+        self._shared = (set(), False)
+        self.evidence.test(item.nodeid)
         t0 = time.monotonic()
         try:
             return (yield)
         finally:
             dur = time.monotonic() - t0
             status = self._statuses.pop(item.nodeid, "unknown")
-            self.records[item.nodeid] = (dur, status, frozenset(self._current))
+            ev = self.evidence
+            self.records[item.nodeid] = (
+                dur, status, frozenset(self._current | ev.deps | self._shared[0]))
+            if ev.spawns or self._shared[1]:
+                self._spawns[item.nodeid] = (ev.spawns, self._shared[1])
+
+    def _credit_children(self) -> None:
+        """Fold the child processes' reports into the tests that started
+        them. A test keeps a <spawn> marker unless each process it started
+        itself reported back; one that reached a process through a shared
+        fixture always keeps it (the report goes to the fixture's first user)."""
+        ev = self.evidence
+        reports = ev.children()
+        me = os.getpid()
+        for test, (spawns, via_fixture) in self._spawns.items():
+            mine = reports.get(test, [])
+            extra = {tuple(f) for r in mine for f in r["funcs"]}
+            if via_fixture or sum(r.get("parent") == me for r in mine) < spawns:
+                extra.add(ev.spawn_marker())
+            dur, status, deps = self.records[test]
+            self.records[test] = (dur, status, deps | extra)
+        mine = reports.get(journal.COLLECTION, [])
+        if mine and journal.COLLECTION in self.records:
+            dur, status, deps = self.records[journal.COLLECTION]
+            self.records[journal.COLLECTION] = (
+                dur, status, deps | {tuple(f) for r in mine for f in r["funcs"]})
+        ev.cleanup()
 
     def pytest_runtest_logreport(self, report):
         # remember the worst outcome across setup/call/teardown
@@ -205,8 +297,16 @@ class ProngsCov:
         }
 
     def pytest_sessionfinish(self, session):
-        MON.set_events(TOOL_ID, 0)
-        MON.free_tool_id(TOOL_ID)
+        if MON:
+            MON.set_events(TOOL_ID, 0)
+            MON.free_tool_id(TOOL_ID)
+        else:
+            import threading
+
+            sys.setprofile(None)
+            threading.setprofile(None)
+        self.evidence.stop()
+        self._credit_children()
         t0 = time.monotonic()
         config = session.config
         jdir = config.getoption("prongs_journal") or journal.journal_dir(config.rootpath)

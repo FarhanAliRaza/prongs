@@ -18,6 +18,9 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
                    affect test outcomes, on top of the built-in list (docs,
                    .github/, *.md ...). A pattern is matched against the
                    path and against the file name: "*.svg", "assets/*"
+  native_commands  programs (by file name: "git", "node") that are not Python
+                   and run no project Python: a test that starts one is
+                   selected by a changed non-Python file, not by changed code
   ignore_docstrings  true: a docstring edit is not a change. Off by default:
                    a docstring is data a program can read (`__doc__`, a CLI's
                    help text). Also PRONGS_IGNORE_DOCSTRINGS=1
@@ -46,10 +49,15 @@ def _table(repo: Path) -> dict:
 
 
 def inert(repo: Path) -> tuple[str, ...]:
-    patterns = _table(repo).get("inert", [])
-    if not isinstance(patterns, list):  # a bare string would match per character
+    return names(repo, "inert")  # a bare string would match per character
+
+
+def names(repo: Path, name: str) -> tuple[str, ...]:
+    """A list-of-strings setting; anything else is no list at all."""
+    value = _table(repo).get(name, [])
+    if not isinstance(value, list):
         return ()
-    return tuple(p for p in patterns if isinstance(p, str))
+    return tuple(v for v in value if isinstance(v, str))
 
 
 def flag(repo: Path, name: str) -> bool:

@@ -4,11 +4,12 @@ dynamic = ["version"]
 description = "Agent-native test runner for Python: runs only the tests a change can affect"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = []
 classifiers = [
   "Framework :: Pytest",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Testing",
@@ -32,6 +33,10 @@ path = "src/prongs/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/prongs"]
+
+# starts the recorder in child processes of a recording session (child.py)
+[tool.hatch.build.targets.wheel.force-include]
+"src/prongs.pth" = "prongs.pth"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

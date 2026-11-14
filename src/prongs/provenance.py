@@ -155,6 +155,13 @@ def dirty_files(repo: Path, contents: dict[str, bytes] | None = None) -> dict[st
     return result
 
 
+def tracked_files(repo: Path) -> set[str]:
+    """Repository-relative paths git tracks, plus untracked files it does
+    not ignore: the files a diff can ever show."""
+    out = _git(Path(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    return set(out.split("\0")) - {""} if out else set()
+
+
 def snapshot(repo: Path) -> dict:
     """{'commit': sha|None, 'dirty': {path: hash|None}, 'contents': {hash: bytes}}
     for the tree right now."""

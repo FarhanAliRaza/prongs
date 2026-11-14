@@ -1,0 +1,1 @@
+import os; os.environ.get("PRONGS_CHILD") and __import__("prongs.child")

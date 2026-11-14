@@ -57,7 +57,20 @@ class Project:
 
 def delta(new: str, project: Project | None = None, **kw) -> dict:
     d = units.delta(OLD, new, "pkg/mod.py", project or Project(), **kw)
-    return {k: sorted(v) for k, v in vars(d).items() if v}
+    return {k: sorted(v) for k, v in vars(d).items() if v and k != "scopes"}
+
+
+def scopes(new: str) -> set[str]:
+    return units.delta(OLD, new, "pkg/mod.py", Project()).scopes
+
+
+def test_scopes_whose_names_changed_are_reported_for_tests_that_list_them():
+    assert scopes(OLD.replace("return a + 1", "return a + 2")) == set()
+    assert scopes(OLD.replace("LIMIT = 10\n", "LIMIT = 10\n\n\ndef g(): pass\n")) == {""}
+    assert scopes(OLD.replace("from typing import Iterator\n", "")) == {""}
+    assert scopes(OLD.replace("    def m(self):", "    def n(self): pass\n\n    def m(self):")) == {"C"}
+    # the same names, one rebound: a listing can show a different object
+    assert scopes(OLD.replace("size = 1", "size = 2")) == {"C"}
 
 
 def test_formatting_comments_and_reexport_aliases_are_not_a_change():

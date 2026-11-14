@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from prongs import config, journal, mapdb, provenance, units
+from prongs import config, evidence, journal, mapdb, provenance, units
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -65,16 +65,21 @@ INERT_NAMES = {"LICENSE", "LICENSE.md", "CHANGELOG.md", "README.md", "CODE_OF_CO
                "py.typed"}
 
 
+def configured_inert(path: str, patterns: tuple[str, ...]) -> bool:
+    """Matched by a [tool.prongs] inert pattern. Those are for non-Python
+    files: a pattern like "pkg/*" must never hide a changed module."""
+    name = Path(path).name
+    return not path.endswith(".py") and any(
+        fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns)
+
+
 def is_inert(path: str, patterns: tuple[str, ...] = ()) -> bool:
     name = Path(path).name
     return (
         path.endswith(INERT_SUFFIXES)
         or path.startswith(INERT_PREFIXES)
         or name in INERT_NAMES
-        # configured patterns are for non-Python files: a pattern like "pkg/*"
-        # must never hide a changed module from selection
-        or (not path.endswith(".py")
-            and any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns))
+        or configured_inert(path, patterns)
     )
 
 
@@ -260,6 +265,8 @@ class Analysis:
     existed: set[tuple[str, str]] = field(default_factory=set)  # changed funcs the old tree had
     unexecuted: list[str] = field(default_factory=list)  # of those: ones no recorded test enters
     module_level: dict[str, list[str]] = field(default_factory=dict)  # file -> what changed
+    code_changed: bool = False   # production Python changed: unrecorded processes may run it
+    files_changed: bool = False  # a non-Python file changed: any started program may read it
     additive: dict[str, list[str]] = field(default_factory=dict)  # file -> unobserved bindings
 
 
@@ -661,12 +668,23 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
         if notes:
             an.selected_files[path] = "; ".join(notes)
 
+    seen = seen_funcs or ()
     for path, ch in changes.items():
         name = Path(path).name
-        if is_inert(path, inert):
-            continue
         if not path.endswith(".py"):
-            an.run_all_reasons.append(f"non-Python file changed: {path}")
+            # a file the user declared inert is; otherwise evidence decides.
+            # A test was seen reading it: those tests run (and everything, if
+            # collection read it, by the import-time rule). Nothing was seen
+            # reading it: the built-in inert list applies, and any other file
+            # runs everything, as a file nothing can vouch for always did.
+            if configured_inert(path, inert):
+                continue
+            if (path, evidence.FILE) in seen:
+                an.changed_funcs.add((path, evidence.FILE))
+                an.existed.add((path, evidence.FILE))
+                an.files_changed = True
+            elif not is_inert(path):
+                an.run_all_reasons.append(f"non-Python file changed: {path}")
             continue
         if name == "conftest.py" or "conftest" in name:
             an.run_all_reasons.append(f"conftest changed: {path}")
@@ -681,6 +699,8 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
                 select_test_file(path, f"test file {ch['wholesale']}: {path}")
             else:
                 an.wholesale.add(path)
+                an.code_changed = True
+                an.changed_funcs.add((path, evidence.NAMES))
             continue
         if ch["status"] == "A":
             # brand-new file: nothing maps to it; select tests defined in it
@@ -688,9 +708,12 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
                 select_test_file(path, f"new test file {path}")
             else:
                 an.wholesale.add(path)
+                an.code_changed = True
             continue
         if ch["status"] == "D":
             an.wholesale.add(path)
+            an.code_changed = True
+            an.changed_funcs.add((path, evidence.NAMES))
             continue
 
         new_src = now.text(path)
@@ -706,6 +729,12 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
             headers = {q for d in deltas for q in d.headers}
             module_level = sorted({r for d in deltas for r in d.module_level})
             additive = sorted({r for d in deltas for r in d.additive})
+            # whoever listed the names of a scope whose names changed saw it
+            # (pytest lists a test module's names to collect it: that is the
+            # test-file rules' business, below)
+            for scope in {q for d in deltas for q in d.scopes} if not is_test_file(path) else ():
+                an.changed_funcs.add((path, evidence.names_dep(scope)))
+                an.existed.add((path, evidence.names_dep(scope)))
             if additive and not is_test_file(path):
                 an.additive[path] = additive
             if not (changed or added or module_level or additive):
@@ -734,6 +763,7 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
                 continue
             an.changed_funcs |= {(path, q) for q in changed | added}
             an.existed |= {(path, q) for q in changed}
+            an.code_changed = True
             if module_level:
                 # import-time code changed: every test importing this file is suspect
                 an.wholesale.add(path)
@@ -769,6 +799,16 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
         elif module_level or unreadable:
             # import-time code changed: every test importing this file is suspect
             an.wholesale.add(path)
+            an.changed_funcs.add((path, evidence.NAMES))
+        if not is_test_file(path):
+            an.code_changed = True
+    # a process prongs could not record runs code, or reads files, unseen
+    if an.code_changed or an.files_changed:
+        an.changed_funcs.add((evidence.PROCESS, evidence.SPAWN))
+        an.existed.add((evidence.PROCESS, evidence.SPAWN))
+    if an.files_changed:
+        an.changed_funcs.add((evidence.PROCESS, evidence.NATIVE))
+        an.existed.add((evidence.PROCESS, evidence.NATIVE))
     return an
 
 
@@ -951,6 +991,8 @@ def unseen_changes(an: "Analysis", seen_funcs: set, seen_files: set, files: Evid
     function that existed in the tree the evidence was recorded on (known
     when the diff is taken from that tree, not from an explicit base)."""
     for path, qual in sorted(an.changed_funcs):
+        if evidence.describe(path, qual):
+            continue  # evidence of its own kind: nobody holding it is nobody affected
         if (path, qual) not in seen_funcs and path in seen_files:
             if an.exact and (path, qual) in an.existed:
                 # it existed in the very tree the tests were recorded on and
@@ -1074,7 +1116,10 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         # before it even starts — no per-test attribution possible, so run all.
         for path, qual in sorted(an.changed_funcs):
             if (path, qual) in coll_funcs:
-                an.run_all_reasons.append(f"executed at import/collection time: {path}::{qual}")
+                what = evidence.describe(path, qual)
+                an.run_all_reasons.append(
+                    f"collection {what}" if what
+                    else f"executed at import/collection time: {path}::{qual}")
         for path in sorted(an.wholesale):
             if path in coll_files:
                 an.run_all_reasons.append(f"module-level change in import-time file: {path}")
@@ -1092,7 +1137,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         for path, quals in an.unseen.items():
             unseen[path] = sorted(set(unseen.get(path, [])) | set(quals))
     broadened = [broadening(path, quals) for path, quals in sorted(unseen.items())]
-    changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs})
+    changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs
+                            if not evidence.describe(p, q)})
     wholesale = sorted({p for a in analyses for p in a.wholesale})
     # what the unit analysis decided, for the receipt
     units_block = {
@@ -1105,33 +1151,6 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     # known tests the selector expects not to exist any more: they are
     # selected (their module runs whole), and cannot produce a result
     vanished = sorted({t for a in analyses for t in a.vanished if t in all_tests})
-
-    if run_all_reasons:
-        # a changed test module is still targeted whole, so its new tests run
-        # and its deleted ones never reach pytest as node ids
-        run_all_files: dict[str, str] = {}
-        for an in analyses:
-            run_all_files.update(an.selected_files)
-        con.close()
-        return {
-            "mode": "run_all",
-            "reasons": run_all_reasons,
-            "selected": {t: "run_all" for t in sorted(all_tests)},
-            "selected_files": run_all_files,
-            "targets": targets_for(set(all_tests), run_all_files, all_tests),
-            "n_selected": len(all_tests),
-            "n_skipped": 0,
-            "n_total": len(all_tests),
-            "changed_functions": changed_funcs,
-            "changed_files_wholesale": wholesale,
-            "vanished": vanished,
-            "broadened": broadened,
-            "units": units_block,
-            "import_check": [],  # everything is collected anyway
-            "flaky": flaky,
-            "history": history,
-            "evidence": ev,
-        }
 
     known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids} | set(missing)
     selected: dict[str, str] = {}  # test_id -> reason
@@ -1155,9 +1174,10 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
                 "WHERE f.path=? AND fn.qualname=?",
                 (path, qual),
             )
+            reason = evidence.describe(path, qual) or f"touches changed function {path}::{qual}"
             for (t,) in rows:
                 if t in in_tree:
-                    selected.setdefault(t, f"touches changed function {path}::{qual}")
+                    selected.setdefault(t, reason)
         for path in an.wholesale:
             rows = con.execute(
                 "SELECT DISTINCT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
@@ -1200,6 +1220,36 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         for t in all_tests
         if t not in selected
     }
+    if run_all_reasons:
+        # a changed test module is still targeted whole, so its new tests run
+        # and its deleted ones never reach pytest as node ids
+        run_all_files: dict[str, str] = {}
+        for an in analyses:
+            run_all_files.update(an.selected_files)
+        con.close()
+        return {
+            "mode": "run_all",
+            "reasons": run_all_reasons,
+            "selected": {t: "run_all" for t in sorted(all_tests)},
+            "selected_files": run_all_files,
+            "targets": targets_for(set(all_tests), run_all_files, all_tests),
+            "n_selected": len(all_tests),
+            "n_skipped": 0,
+            "n_total": len(all_tests),
+            "changed_functions": changed_funcs,
+            "changed_files_wholesale": wholesale,
+            "vanished": vanished,
+            "broadened": broadened,
+            "units": units_block,
+            "import_check": [],  # everything is collected anyway
+            # what the rules below the run-all ones would have selected: a
+            # run of everything is a free audit of them (see cmd_run)
+            "shadow": sorted(selected),
+            "flaky": flaky,
+            "history": history,
+            "evidence": ev,
+        }
+
     targets = targets_for(set(selected), selected_files, all_tests)
     con.close()
     return {

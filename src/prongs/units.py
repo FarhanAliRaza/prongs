@@ -244,6 +244,7 @@ class Delta:
     added: set[str] = field(default_factory=set)     # new functions something may already reach
     module_level: list[str] = field(default_factory=list)  # why the file is taken wholesale
     additive: list[str] = field(default_factory=list)      # bindings added or removed unobserved
+    scopes: set[str] = field(default_factory=set)  # '' or a class: its set of names changed
 
 
 def pure(node, mod: Module, path: str, project: Project) -> bool:
@@ -345,6 +346,9 @@ def _diff_scope(qual: str, old: Module, new: Module, path: str, project: Project
     a_items, b_items = old.scopes[qual], new.scopes[qual]
     prefix = f"{qual}." if qual else ""
     where = f" in class {qual}" if qual else ""
+    # a test that lists the scope's names sees one appear or disappear
+    if {i.name for i in a_items} != {i.name for i in b_items}:
+        delta.scopes.add(qual)
     a_count, b_count = Counter(i.key for i in a_items), Counter(i.key for i in b_items)
     removed = [i for i in a_items if i.key not in b_count or a_count[i.key] > b_count[i.key]]
     added = [i for i in b_items if i.key not in a_count or b_count[i.key] > a_count[i.key]]
@@ -450,7 +454,10 @@ def delta(old_source: str, new_source: str, path: str, project: Project,
         # that is the module or a class, by its changed parent otherwise
     for qual in old.scopes.keys() | new.scopes.keys():
         if qual in old.scopes and qual in new.scopes:
+            before = len(d.module_level)
             _diff_scope(qual, old, new, path, project, d)
+            if len(d.module_level) > before:
+                d.scopes.add(qual)  # a rebound name can change what a listing shows
     d.added -= d.changed
     return d
 

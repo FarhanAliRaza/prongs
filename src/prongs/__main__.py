@@ -93,6 +93,81 @@ def import_check(modules: list[str]) -> dict:
     return out
 
 
+def shadow_baseline(repo: Path, aff: dict) -> dict[str, str] | None:
+    """The map's statuses, read before a run of everything executes: what
+    its results are compared with to audit the rules that would have skipped
+    tests (see shadow_report)."""
+    if aff.get("mode") != "run_all" or aff.get("shadow") is None:
+        return None
+    import sqlite3
+
+    from prongs.audit import map_statuses
+
+    con = sqlite3.connect(journal.map_path(repo))
+    try:
+        return map_statuses(con)
+    finally:
+        con.close()
+
+
+def shadow_report(repo: Path, aff: dict, baseline: dict[str, str], results: list[dict]) -> dict:
+    """A run of everything, read as an audit: had the run-all rule not
+    fired, the rules below it would have selected `shadow` and skipped the
+    rest. A skipped test whose outcome differs from the map's is a miss of
+    those rules (or a flake, or fallout from a selected failure: it is a log
+    to review, not a verdict). One line per run is appended to
+    <state dir>/shadow.jsonl; `prongs shadow` summarizes them."""
+    selected = set(aff["shadow"])
+    changed = sorted(
+        r["id"] for r in results
+        if r["status"] in ("passed", "failed") and baseline.get(r["id"]) in ("passed", "failed")
+        and baseline[r["id"]] != r["status"]
+    )
+    missed = [t for t in changed if t not in selected]
+    report = {
+        "reasons": aff["run_all_reasons"],
+        "would_select": len(selected),
+        "would_skip": aff["n_total"] - len(selected),
+        "status_changes": len(changed),
+        "missed": missed[:50],
+        "n_missed": len(missed),
+    }
+    line = report | {"at": round(time.time(), 1), "head": provenance.git_head(repo)}
+    try:
+        with open(journal.state_dir(repo) / "shadow.jsonl", "a") as f:
+            f.write(json.dumps(line) + "\n")
+    except OSError:
+        pass
+    return report
+
+
+def cmd_shadow(args) -> dict:
+    """Every recorded run of everything, as audits of the rules a run-all
+    rule overrode: how often each reason fired, what selecting would have
+    saved, and which outcomes it would have missed."""
+    path = journal.state_dir(Path.cwd()) / "shadow.jsonl"
+    runs = []
+    if path.exists():
+        for ln in path.read_text().splitlines():
+            try:
+                runs.append(json.loads(ln))
+            except ValueError:
+                continue
+    by_reason: dict[str, dict] = {}
+    for r in runs:
+        for reason in r["reasons"]:
+            kind = reason.split(":")[0]
+            b = by_reason.setdefault(kind, {"runs": 0, "would_skip": 0, "status_changes": 0,
+                                            "n_missed": 0, "missed": []})
+            b["runs"] += 1
+            b["would_skip"] += r["would_skip"]
+            b["status_changes"] += r["status_changes"]
+            b["n_missed"] += r["n_missed"]
+            b["missed"] = sorted(set(b["missed"]) | set(r["missed"]))[:50]
+    return {"runs": len(runs), "clean": sum(r["n_missed"] == 0 for r in runs),
+            "by_reason": by_reason}
+
+
 def cmd_affected(args, force_all: str | None = None) -> dict:
     repo = Path.cwd()
     db, jdir = journal.map_path(repo), journal.journal_dir(repo)
@@ -120,6 +195,7 @@ def cmd_affected(args, force_all: str | None = None) -> dict:
         "broadened": sel.get("broadened", []),
         "units": sel.get("units", {}),
         "import_check": sel.get("import_check", []),
+        "shadow": sel.get("shadow"),
         # flaky tests still run; their history is the receipt, and a failure
         # of one is reported as flaky, not as a failure
         "flaky": {
@@ -496,6 +572,7 @@ def cmd_run(args) -> dict:
     }
     if checked is not None:
         out["import_check"] = checked
+    baseline = shadow_baseline(repo, aff)
     if not aff["targets"] and not aff.get("whole_suite"):
         out["results"] = []
         out["conservation"] = conservation(aff, [])
@@ -544,6 +621,8 @@ def cmd_run(args) -> dict:
         out["flaky"] = list(flaky.values())
     ran = len(results)
     out["conservation"] = conservation(aff, results)
+    if baseline is not None:
+        out["shadow"] = shadow_report(repo, aff, baseline, results)
     error = resp.get("error")
     if resp.get("collect_errors"):
         error = error or f"{len(resp['collect_errors'])} collection error(s)"
@@ -702,6 +781,7 @@ def main():
                                 "was observed on, checked out in place (clean working tree "
                                 "only), to tell environment drift from a miss (default: off)")
     sub.add_parser("rollup")
+    sub.add_parser("shadow")
     ci = sub.add_parser("ci", help="carry the map and journal files between CI jobs")
     ci_sub = ci.add_subparsers(dest="ci_cmd", required=True)
     p = ci_sub.add_parser("save", help="write an artifact directory")
@@ -745,7 +825,7 @@ def main():
         print(json.dumps(out, indent=2))
     else:
         commands = {"affected": cmd_affected, "run": cmd_run, "audit": cmd_audit,
-                    "rollup": cmd_rollup, "ci": cmd_ci}
+                    "rollup": cmd_rollup, "ci": cmd_ci, "shadow": cmd_shadow}
         out = commands[args.cmd](args)
         print(json.dumps(out, indent=2))
         code = exit_code(args.cmd, out)
