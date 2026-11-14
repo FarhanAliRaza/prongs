@@ -135,7 +135,10 @@ class Evidence:
         self._modules: dict[str, str | None] = {}
         self.child_dir = tempfile.mkdtemp(prefix="prongs-child-")
         self._env = {k: os.environ.get(k) for k in (CHILD_DIR, CHILD_ROOT, CHILD_TEST)}
-        os.environ[CHILD_DIR] = self.child_dir
+        if os.environ.get("PRONGS_RECORD_CHILDREN") == "0":
+            os.environ.pop(CHILD_DIR, None)  # every started process stays unrecorded
+        else:
+            os.environ[CHILD_DIR] = self.child_dir
         os.environ[CHILD_ROOT] = rootpath
         os.environ[CHILD_TEST] = journal.COLLECTION
 

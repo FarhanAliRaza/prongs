@@ -74,23 +74,52 @@ def roll_up(repo: Path) -> dict:
     return mapdb.rollup(journal.map_path(repo), journal.journal_dir(repo))
 
 
-def import_check(modules: list[str]) -> dict:
+def import_check(repo: Path, modules: list[str]) -> dict:
     """Collect every test module once, running nothing: a binding the
     selector judged unobserved (a new function, constant or import) still
     executes when its module is imported, and a selection that imports
     nothing would never find out that it raises."""
-    env = {k: v for k, v in os.environ.items() if k != "PRONGS_COV"}
+    from prongs import state
+
     t0 = time.monotonic()
-    p = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
-         *shlex.split(os.environ.get("PRONGS_RUN_ARGS", "")), *modules],
-        capture_output=True, text=True, env=env,
-    )
-    ok = p.returncode in (0, 5)  # 5: nothing collected
-    out = {"ok": ok, "exit": p.returncode, "wall_s": round(time.monotonic() - t0, 3)}
-    if not ok:
-        out["output"] = p.stdout[-1500:]
-    return out
+    out = state.collect(repo, modules)
+    out.pop("snapshot")
+    return out | {"wall_s": round(time.monotonic() - t0, 3)}
+
+
+IMPORT_TIME = ("module-level change in import-time file", "executed at import/collection time",
+               "collection lists the names of")
+
+
+def import_state_selection(repo: Path, aff: dict) -> tuple[set[str], dict] | None:
+    """What the import-state rule (state.py) would select for a run that
+    executes everything only because import-time code changed: the tests the
+    remaining rules select, plus those that can reach what import now
+    produces differently. None when the rule has nothing to go on."""
+    if not config.flag(repo, "import_state") or not aff.get("run_all_reasons") or not all(
+            r.startswith(IMPORT_TIME) for r in aff["run_all_reasons"]):
+        return None
+    import sqlite3
+
+    from prongs import mapdb, state
+
+    con = sqlite3.connect(journal.map_path(repo))
+    try:
+        full = mapdb.last_full_run(con)
+        base = state.load(repo, full["journal_key"]) if full else None
+        if base is None:
+            return None
+        modules = sorted({t.split("::", 1)[0] for t in aff["tests"]})
+        now = state.collect(repo, modules)["snapshot"]
+        if now is None:
+            return None
+        change = state.diff(base, now)
+        tests = state.reach(con, repo, change) & set(aff["tests"])
+    finally:
+        con.close()
+    info = {"globals": len(change["globals"]), "classes": len(change["classes"]),
+            "names": change["names"][:20], "volatile": len(base.get("volatile", []))}
+    return set(aff["shadow"]) | tests, info
 
 
 def shadow_baseline(repo: Path, aff: dict) -> dict[str, str] | None:
@@ -110,28 +139,29 @@ def shadow_baseline(repo: Path, aff: dict) -> dict[str, str] | None:
         con.close()
 
 
-def shadow_report(repo: Path, aff: dict, baseline: dict[str, str], results: list[dict]) -> dict:
-    """A run of everything, read as an audit: had the run-all rule not
-    fired, the rules below it would have selected `shadow` and skipped the
-    rest. A skipped test whose outcome differs from the map's is a miss of
-    those rules (or a flake, or fallout from a selected failure: it is a log
-    to review, not a verdict). One line per run is appended to
+def shadow_report(repo: Path, aff: dict, baseline: dict[str, str], results: list[dict],
+                  rules: dict[str, set[str]]) -> dict:
+    """A run of everything, read as an audit of rules that would have
+    skipped tests: `selection` (the rules below the run-all one that fired)
+    and, when it applies, `import_state`. For each: what it would have
+    selected, and the skipped tests whose outcome differs from the map's. A
+    difference is a miss of the rule, or a flake, or fallout from a selected
+    failure: a log to review, not a verdict. One line per run is appended to
     <state dir>/shadow.jsonl; `prongs shadow` summarizes them."""
-    selected = set(aff["shadow"])
     changed = sorted(
         r["id"] for r in results
         if r["status"] in ("passed", "failed") and baseline.get(r["id"]) in ("passed", "failed")
         and baseline[r["id"]] != r["status"]
     )
-    missed = [t for t in changed if t not in selected]
-    report = {
-        "reasons": aff["run_all_reasons"],
-        "would_select": len(selected),
-        "would_skip": aff["n_total"] - len(selected),
-        "status_changes": len(changed),
-        "missed": missed[:50],
-        "n_missed": len(missed),
-    }
+    report: dict = {"reasons": aff["run_all_reasons"], "status_changes": len(changed), "rules": {}}
+    for name, selected in rules.items():
+        missed = [t for t in changed if t not in selected]
+        report["rules"][name] = {
+            "would_select": len(selected),
+            "would_skip": aff["n_total"] - len(selected),
+            "missed": missed[:50],
+            "n_missed": len(missed),
+        }
     line = report | {"at": round(time.time(), 1), "head": provenance.git_head(repo)}
     try:
         with open(journal.state_dir(repo) / "shadow.jsonl", "a") as f:
@@ -153,19 +183,21 @@ def cmd_shadow(args) -> dict:
                 runs.append(json.loads(ln))
             except ValueError:
                 continue
-    by_reason: dict[str, dict] = {}
+    by_rule: dict[str, dict] = {}
     for r in runs:
-        for reason in r["reasons"]:
-            kind = reason.split(":")[0]
-            b = by_reason.setdefault(kind, {"runs": 0, "would_skip": 0, "status_changes": 0,
-                                            "n_missed": 0, "missed": []})
-            b["runs"] += 1
-            b["would_skip"] += r["would_skip"]
-            b["status_changes"] += r["status_changes"]
-            b["n_missed"] += r["n_missed"]
-            b["missed"] = sorted(set(b["missed"]) | set(r["missed"]))[:50]
-    return {"runs": len(runs), "clean": sum(r["n_missed"] == 0 for r in runs),
-            "by_reason": by_reason}
+        for rule, got in r.get("rules", {}).items():
+            for reason in r["reasons"]:
+                kind = reason.split(":")[0]
+                b = by_rule.setdefault(rule, {}).setdefault(kind, {
+                    "runs": 0, "would_skip": 0, "status_changes": 0, "n_missed": 0, "missed": []})
+                b["runs"] += 1
+                b["would_skip"] += got["would_skip"]
+                b["status_changes"] += r["status_changes"]
+                b["n_missed"] += got["n_missed"]
+                b["missed"] = sorted(set(b["missed"]) | set(got["missed"]))[:50]
+    return {"runs": len(runs),
+            "clean": sum(all(g["n_missed"] == 0 for g in r.get("rules", {}).values()) for r in runs),
+            "by_rule": by_rule}
 
 
 def cmd_affected(args, force_all: str | None = None) -> dict:
@@ -554,7 +586,7 @@ def cmd_run(args) -> dict:
         return aff
     checked = None
     if aff.get("import_check"):
-        checked = import_check(aff["import_check"])
+        checked = import_check(repo, aff["import_check"])
         if not checked["ok"]:
             # the tree does not even import: run everything, so the errors
             # are reported as any collection error is
@@ -573,6 +605,12 @@ def cmd_run(args) -> dict:
     if checked is not None:
         out["import_check"] = checked
     baseline = shadow_baseline(repo, aff)
+    shadow_rules: dict[str, set[str]] = {}
+    if baseline is not None:
+        shadow_rules["selection"] = set(aff["shadow"])
+        by_state = import_state_selection(repo, aff)
+        if by_state is not None:
+            shadow_rules["import_state"], out["import_state"] = by_state
     if not aff["targets"] and not aff.get("whole_suite"):
         out["results"] = []
         out["conservation"] = conservation(aff, [])
@@ -622,7 +660,7 @@ def cmd_run(args) -> dict:
     ran = len(results)
     out["conservation"] = conservation(aff, results)
     if baseline is not None:
-        out["shadow"] = shadow_report(repo, aff, baseline, results)
+        out["shadow"] = shadow_report(repo, aff, baseline, results, shadow_rules)
     error = resp.get("error")
     if resp.get("collect_errors"):
         error = error or f"{len(resp['collect_errors'])} collection error(s)"

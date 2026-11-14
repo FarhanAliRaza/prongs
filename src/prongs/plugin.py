@@ -28,6 +28,7 @@ caller needs to find it again.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -36,7 +37,7 @@ from pathlib import Path
 import pytest
 
 from prongs import config as settings
-from prongs import evidence, journal, provenance
+from prongs import evidence, journal, provenance, state
 
 # sys.monitoring (3.12+) costs nothing for code it has disabled; before it,
 # a profile function sees every call, which is slower but records the same
@@ -81,6 +82,15 @@ def pytest_load_initial_conftests(early_config, parser, args):
 
 def pytest_configure(config):
     _start(config)  # plugins loaded too late for the early hook (-p, in-process)
+
+
+def pytest_collection_finish(session):
+    # a session asked for what import produced (state.collect): any session,
+    # recording or not
+    out = os.environ.get(state.OUT)
+    if out:
+        with open(out, "w") as f:
+            json.dump(state.snapshot(str(session.config.rootpath) + os.sep), f)
 
 
 def classify_scope(config) -> str:
@@ -147,6 +157,10 @@ class ProngsCov:
         self._fixtures: dict = {}  # FixtureDef -> (deps, started a process)
         self._shared: tuple[set, bool] = (set(), False)
         self._spawns: dict[str, tuple[int, bool]] = {}  # test -> (own spawns, via a fixture)
+        self._state: dict | None = None  # what import produced (state.py), when asked for
+        # read now: the recorder's own look at pyproject.toml is not the suite's
+        self._want_state = settings.flag(config.rootpath, "import_state")
+        self._modules: list[str] = []
         self.evidence.start()
         if MON:
             MON.use_tool_id(TOOL_ID, "prongs")
@@ -196,6 +210,9 @@ class ProngsCov:
         # (app setup, module bodies, decorators, class-level declarations): a
         # pseudo-context. A diff touching any of it invalidates the whole suite.
         self.n_collected = len(session.items)
+        self._modules = sorted({item.nodeid.split("::", 1)[0] for item in session.items})
+        if self._want_state:
+            self._state = state.snapshot(self.rootpath)
         # a process started while collecting is not marked: what collection
         # runs is already a reason to run everything when it changes
         self.records[journal.COLLECTION] = (
@@ -313,6 +330,13 @@ class ProngsCov:
         key = config.getoption("prongs_journal_key") or os.environ.get("PRONGS_JOURNAL_KEY")
         info = self.run_info()
         res = journal.append(jdir, self.rootpath, self.records, info, key=key)
+        if self._state is not None and info["scope"] == "full":
+            # collect once more, elsewhere: what differs between two imports
+            # of one tree says nothing about a change
+            again = state.collect(self.rootpath, self._modules)["snapshot"]
+            if again is not None:
+                self._state["volatile"] = state.volatile(self._state, again)
+                state.save(Path(self.rootpath), res["key"], self._state)
         sys.stderr.write(
             f"\n[prongs] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"

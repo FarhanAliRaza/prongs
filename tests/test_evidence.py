@@ -93,6 +93,8 @@ def project(repo):
     repo.write(".github/workflows/ci.yml", "jobs: {}\n")
     repo.write(".github/workflows/other.yml", "jobs: {}\n")
     repo.commit("project")
+    # whether prongs.pth is installed depends on how prongs was: off, unless a test asks
+    repo.env["PRONGS_RECORD_CHILDREN"] = "0"
     p = repo.record()
     assert p.returncode == 0, p.stdout + p.stderr
     return repo
@@ -138,6 +140,7 @@ def test_a_recorded_child_process_is_credited_to_its_test(project, tmp_path):
     (tmp_path / "site" / "sitecustomize.py").write_text(
         "import os\nif os.environ.get('PRONGS_CHILD'):\n    import prongs.child\n")
     project.env["PYTHONPATH"] = str(tmp_path / "site")
+    project.env["PRONGS_RECORD_CHILDREN"] = "1"
     project.write("pyproject.toml", project.read("pyproject.toml")
                   + '\n[tool.prongs]\nnative_commands = ["git"]\ninert = ["pyproject.toml"]\n')
     project.commit("git is a native command")
@@ -217,10 +220,54 @@ def test_a_run_of_everything_audits_the_rules_it_overrode(project):
     assert out["selection"]["mode"] == "run_all"
     assert out["shadow"] == {
         "reasons": ["module-level change in import-time file: pkg/mod.py"],
-        "would_select": 7, "would_skip": 1, "status_changes": 1, "missed": [], "n_missed": 0,
+        "status_changes": 1,
+        "rules": {"selection": {"would_select": 7, "would_skip": 1, "missed": [], "n_missed": 0}},
     }
     log = (journal.state_dir(project.path) / "shadow.jsonl").read_text().splitlines()
-    assert len(log) == 1 and json.loads(log[0])["n_missed"] == 0
-    assert project.cli("shadow") == {"runs": 1, "clean": 1, "by_reason": {
+    assert len(log) == 1 and json.loads(log[0])["rules"]["selection"]["n_missed"] == 0
+    assert project.cli("shadow") == {"runs": 1, "clean": 1, "by_rule": {"selection": {
         "module-level change in import-time file": {
-            "runs": 1, "would_skip": 1, "status_changes": 1, "n_missed": 0, "missed": []}}}
+            "runs": 1, "would_skip": 1, "status_changes": 1, "n_missed": 0, "missed": []}}}}
+
+
+
+def test_import_state_is_audited_in_shadow_when_asked_for(project):
+    project.write("pkg/tables.py", "from pkg.mod import build\n\nTABLE = {'k': 1}\n"
+                  "OTHER = build()\n\n\ndef lookup():\n    return TABLE['k']\n\n\n"
+                  "def other():\n    return OTHER['v']\n")
+    project.write("tests/test_t.py", "from pkg import tables\n\n\ndef test_lookup():\n"
+                  "    assert tables.lookup() == 1\n\n\ndef test_other():\n"
+                  "    assert tables.other() == 1\n")
+    project.write("pyproject.toml", project.read("pyproject.toml")
+                  + "\n[tool.prongs]\nimport_state = true\n")
+    project.commit("tables, and the import-state shadow")
+    assert project.record().returncode == 0
+    project.rollup()
+    con = project.db()
+    key = con.execute("SELECT journal_key FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+    con.close()
+    snap = json.loads((journal.state_dir(project.path) / "state" / f"{key}.json").read_text())
+    assert sorted(snap["modules"]["pkg/tables.py"]) == ["OTHER", "TABLE", "build", "lookup", "other"]
+    assert snap["volatile"] == []
+    # module-level data changes: everything runs; import-state would select
+    # the test that reaches TABLE, and the one whose outcome changed is in it
+    project.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    out = project.cli("run", "--no-record", code=1)
+    assert out["selection"]["mode"] == "run_all"
+    assert out["import_state"] == {"globals": 1, "classes": 0, "names": ["TABLE"], "volatile": 0}
+    rules = out["shadow"]["rules"]
+    # (the two tests that start a process run on any code change)
+    assert rules["import_state"] == {
+        "would_select": 4, "would_skip": 6, "missed": [], "n_missed": 0}
+    assert rules["selection"]["would_select"] == 4
+    # an import-time function changes what a global holds: the tests that
+    # reach the global are found though they never enter the function
+    project.git("checkout", "--", "pkg/tables.py")
+    project.edit("pkg/mod.py", 'return {"v": 1}', 'return {"v": 3}')
+    out = project.cli("run", "--no-record", code=1)
+    assert out["selection"]["run_all_reasons"] == [
+        "executed at import/collection time: pkg/mod.py::build"]
+    assert out["import_state"]["names"] == ["OTHER"]
+    assert out["shadow"]["status_changes"] == 3
+    assert out["shadow"]["rules"]["import_state"]["n_missed"] == 0
+    assert out["shadow"]["rules"]["selection"]["missed"] == ["tests/test_t.py::test_other"]

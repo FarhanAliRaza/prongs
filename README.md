@@ -236,6 +236,7 @@ ignore_docstrings = false  # true: a docstring edit is not a change
 | `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES` | Override the settings above |
 | `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
+| `PRONGS_RECORD_CHILDREN=0` | Do not record inside child processes: every test that starts one keeps its process marker |
 | `PRONGS_DIR` | State directory, relative to the repository root (default `.prongs`); point worktrees at one directory to pool runs |
 | `PRONGS_JOURNAL` | Journal directory only (default `<state dir>/journal`) |
 | `PRONGS_JOURNAL_KEY` | Name of the recorded run's journal file |

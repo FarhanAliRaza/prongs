@@ -21,6 +21,10 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
   native_commands  programs (by file name: "git", "node") that are not Python
                    and run no project Python: a test that starts one is
                    selected by a changed non-Python file, not by changed code
+  import_state     true: a full recorded run also stores a fingerprint of
+                   what import produced, and a run of everything for an
+                   import-time reason reports what selecting by it would
+                   have skipped (experimental, shadow only: see state.py)
   ignore_docstrings  true: a docstring edit is not a change. Off by default:
                    a docstring is data a program can read (`__doc__`, a CLI's
                    help text). Also PRONGS_IGNORE_DOCSTRINGS=1
