@@ -67,10 +67,13 @@ Selection reasons you will see under `selected_by_reason`:
 | `imports/touches changed file` | the file was added, deleted, changed at module level, or changed mid-run |
 | `changed function not in the map` | a new function in a known file: every test touching that file runs |
 | `test file changed` / `new test file` | the test module itself changed |
+| `reads changed file` | the test opened a tracked non-Python file that changed |
+| `lists the names of` | the test called `dir()`/`vars()` on a module or class that gained or lost a name |
+| `starts a process prongs could not record` | the test starts a process (not Python, or killed): it runs on any production change |
 | `recent status change` | the outcome flipped within the last `history_window` rollups |
 | `unmapped test (conservative)` | the map holds no dependency evidence for it |
 
-`mode: "run_all"` happens for a changed `conftest.py`, a changed tracked non-Python file, module-level or import-time code in a production module, a file that did not exist when the map was recorded, or a map more than `max_map_age` commits behind HEAD.
+`mode: "run_all"` happens for a changed `conftest.py`, a changed tracked non-Python file no test was seen reading, module-level or import-time code in a production module, a file that did not exist when the map was recorded, or a map more than `max_map_age` commits behind HEAD.
 Files that cannot affect tests are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `py.typed`, `docs/`, `.github/`, `.gitignore`, `LICENSE`.
 
 A file is compared by its code, not its lines, so these select nothing: formatting and comments, reordered imports, a new plain function or constant or import that nothing referred to before, and a removed import nothing uses.
@@ -91,7 +94,7 @@ python -m pytest --prongs-cov
 Either writes a journal file under `.prongs/`. `affected`, `run` and `audit` fold pending journals into `.prongs/map.sqlite` before selecting.
 Make sure `.prongs/` is in `.gitignore`.
 
-prongs needs Python 3.12 or later. The recorder is off for plain pytest runs unless `--prongs-cov` or `PRONGS_COV=1` is set.
+prongs needs Python 3.11 or later; recording is cheaper from 3.12. The recorder is off for plain pytest runs unless `--prongs-cov` or `PRONGS_COV=1` is set.
 
 ## Diffing against a specific revision
 
@@ -125,6 +128,7 @@ Use this when asked whether selection can be trusted on a suite, or when a skip 
 | `prongs run` | Select, execute, record, and report |
 | `prongs audit` | Select, then run the full suite and report skipped status changes |
 | `prongs rollup` | Fold pending journal files into the map |
+| `prongs shadow` | Summarize shadow audits: what selecting would have skipped on runs that executed everything |
 | `prongs ci save DIR` | Write the map and this job's journals as a CI artifact |
 | `prongs ci restore PATH...` | Install CI artifacts into a fresh clone |
 | `prongs daemon` | Start the warm daemon in the foreground |

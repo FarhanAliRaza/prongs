@@ -18,7 +18,7 @@ Every skipped test comes with a receipt that says why it was safe to skip.
 pip install prongs
 ```
 
-prongs requires Python 3.12 or later, since it records with `sys.monitoring`.
+prongs requires Python 3.11 or later. From 3.12 it records with `sys.monitoring`; on 3.11 it falls back to a slower profile function.
 It has no dependencies beyond pytest in your environment.
 It registers itself as a pytest plugin through the `pytest11` entry point.
 The recorder stays off unless you pass `--prongs-cov`, so plain pytest runs are unaffected.
@@ -76,6 +76,7 @@ With no map, `prongs run` runs the whole suite and records it, so it builds the 
 ## How it works
 
 **Map.** The pytest plugin uses `sys.monitoring` to record the project functions each test enters.
+On Python 3.11, which has no `sys.monitoring`, it uses a profile function: the same record, at a higher cost.
 Code that runs at import or collection time is recorded as its own set.
 Stdlib and site-packages code is disabled on first sight and costs nothing after that.
 
@@ -105,7 +106,7 @@ Each selected test carries a reason:
 | `evidence commit ... is not in this repository` | there is nothing to diff its evidence against |
 
 Some changes run everything (`mode: "run_all"`).
-These include a changed `conftest.py`, a changed tracked non-Python file, and module-level or import-time code in a production module.
+These include a changed `conftest.py`, a changed tracked non-Python file no test was seen reading, and module-level or import-time code in a production module.
 A new file that did not exist when the map was recorded also runs everything.
 Files that cannot affect test outcomes are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `py.typed`, `docs/`, `.github/`, `.gitignore` and `LICENSE`.
 Add your own with glob patterns, matched against the path and against the file name:
@@ -137,7 +138,29 @@ A new binding still executes at import; if collection fails, everything runs and
 Everything else at module or class level is still a module-level change: a changed assignment, a class statement, a class attribute, a new method, a decorated function, a default or value that calls project code.
 The result lists what the analysis decided under `units`: `module_level` (why a file was taken whole), `additive` (bindings judged unobserved) and `unexecuted` (changed functions no test enters).
 
-These rules are static. They cannot see a test that finds a new name by enumerating a module (`dir()`, `vars()`, `inspect.getmembers`), or code reached only in a subprocess.
+**Evidence beyond function entry.** A test can depend on the tree without entering a changed function.
+The recorder keeps four more kinds of evidence, as dependencies of the test like any other:
+
+| Evidence | Recorded when | Effect on selection |
+|---|---|---|
+| shared fixtures | a module-, class- or session-scoped fixture is set up | what its setup entered is credited to every test that uses the fixture, not only the first |
+| files read | a test opens a tracked non-Python file | a change to that file selects its readers instead of running everything; a file tests read is never inert by default, wherever it lives |
+| names listed | a test calls `dir()` or `vars()` on a project module or class (`inspect.getmembers` does) | a name added to or removed from that module or class selects it |
+| processes started | a test starts a process | a Python child is recorded and its functions credited to the test; a test whose children could not all be recorded runs on any production change |
+
+Child processes are recorded through `prongs.pth`, which the wheel installs next to the package.
+It does nothing unless a recording session set `PRONGS_CHILD`; an editable install does not carry it.
+A child that is killed, or is not Python, reports nothing, and its test keeps the marker.
+Name programs that run no project Python in `native_commands`: a test that starts only those is selected by a changed non-Python file, not by changed code.
+
+```toml
+[tool.prongs]
+native_commands = ["git", "node"]
+```
+
+A non-Python file no test was ever seen reading still runs everything, unless it is inert.
+
+These rules cannot see a file read by a C library or by a child that is not Python, a module's names taken from `module.__dict__` directly, or a process started while collecting.
 Run `prongs audit` on your suite to check them.
 
 A docstring is data a program can read, so a docstring edit is a change by default.
@@ -163,6 +186,7 @@ All commands print one JSON document on stdout, except `daemon`.
 | `prongs run` | Select, execute, and report results with receipts |
 | `prongs audit` | Select, then run the full suite and report every skipped status change |
 | `prongs rollup` | Fold pending journal files into the map |
+| `prongs shadow` | Summarize the shadow audits of runs that executed everything |
 | `prongs ci save DIR` | Write the map and this job's journal files as a CI artifact |
 | `prongs ci restore PATH...` | Install CI artifacts into a fresh clone |
 | `prongs daemon` | Start the warm daemon in the foreground |
@@ -229,6 +253,8 @@ max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
 flaky_retries = 2    # re-run a failing flaky test alone up to N times
 ignore_docstrings = false  # true: a docstring edit is not a change
+native_commands = []       # programs that run no project Python: "git", "node"
+import_state = false       # true: fingerprint import-time state, audited in shadow
 ```
 
 | Variable | Meaning |
@@ -251,6 +277,7 @@ Pushes to the default branch run the full suite with the recorder and save the m
 Pull requests restore that map, run `prongs run` as the gate, and upload their journal files.
 The next push job folds those journals in as history, which feeds flaky detection.
 `ci restore` deepens a shallow clone until the map's evidence commits are present.
+A pull-request job that checks out the branch head, not the forge's test merge commit, can also restore its own earlier journals: they are this line of history's evidence, so a later push runs only what changed since the last one.
 With no map, `prongs run` runs everything and records it, so the gate never depends on the cache.
 See [`examples/github-actions.yml`](examples/github-actions.yml) for the full, commented workflow.
 
@@ -275,6 +302,20 @@ See [`examples/github-actions.yml`](examples/github-actions.yml) for the full, c
   if: always() && github.event_name != 'pull_request'
   run: python -m prongs ci save --no-journals "$RUNNER_TEMP/prongs-ci/map"
 ```
+
+## Shadow audits
+
+A run that executes everything is a free audit of the rules that would have skipped tests.
+Whenever `prongs run` runs everything because a run-all rule fired, its result carries a `shadow` block:
+what the remaining rules would have selected, and every skipped test whose outcome differs from the map's.
+Each such run appends one line to `.prongs/shadow.jsonl`, and `prongs shadow` summarizes them by rule and by run-all reason.
+A difference is a miss of the rule, a flake, or fallout from a selected failure: read it before trusting or relaxing a rule.
+
+**Import state (experimental).** Code that runs at import runs everything when it changes, because function entry cannot say which tests use what that code built.
+With `import_state = true`, a full recorded run also stores a fingerprint of every project module global and class attribute after collection.
+A run of everything for an import-time reason then reports a second shadow rule, `import_state`:
+the tests that entered a function naming a global or attribute whose fingerprint changed, or a method of a changed class.
+Nothing selects by it. It exists to be measured.
 
 ## Audit mode
 
