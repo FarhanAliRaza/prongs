@@ -47,6 +47,13 @@ jobs:
           # the commits the map was recorded on; with the default depth of 1,
           # `prongs ci restore` deepens the clone until they are there
           fetch-depth: 0
+          # a pull request: the branch head, not the forge's test merge
+          # commit. Journals this branch's earlier jobs uploaded are then
+          # this line of history's own evidence (their commits are ancestors
+          # of HEAD), so a later push runs what changed since the last one,
+          # not the whole pull request again. The price: the job tests the
+          # branch as pushed, not as merged with the default branch.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -72,6 +79,19 @@ jobs:
           mkdir -p "$RUNNER_TEMP/prongs-ci/journals"
           for id in $(gh run list --workflow "${{ github.workflow }}" --event pull_request \
                         --status completed --limit 50 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$id" --pattern 'prongs-journals-*' \
+              --dir "$RUNNER_TEMP/prongs-ci/journals/$id" || true  # expired or none
+          done
+
+      - name: Collect this branch's earlier journals
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/prongs-ci/journals"
+          for id in $(gh run list --workflow "${{ github.workflow }}" --event pull_request \
+                        --branch "${{ github.head_ref }}" --status completed --limit 20 \
+                        --json databaseId --jq '.[].databaseId'); do
             gh run download "$id" --pattern 'prongs-journals-*' \
               --dir "$RUNNER_TEMP/prongs-ci/journals/$id" || true  # expired or none
           done
