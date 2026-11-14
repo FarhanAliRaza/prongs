@@ -88,7 +88,10 @@ def mapped_functions(db: Path) -> list[tuple[str, str]]:
         return con.execute(
             "SELECT DISTINCT f.path, fn.qualname FROM funcs fn JOIN files f ON f.id=fn.file_id "
             "JOIN current_links l ON l.func_id=fn.id WHERE f.path NOT LIKE 'tests%' "
-            "AND f.path NOT LIKE '%conftest%' ORDER BY f.path, fn.qualname"
+            "AND f.path NOT LIKE '%conftest%' "
+            # real functions only: the map also holds evidence that is not one
+            # (a file a test read, a module whose names it listed)
+            "AND f.path LIKE '%.py' AND fn.qualname NOT LIKE '<%' ORDER BY f.path, fn.qualname"
         ).fetchall()
     finally:
         con.close()
