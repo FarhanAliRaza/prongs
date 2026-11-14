@@ -56,7 +56,7 @@ def test_empty_session_is_never_a_full_run(recorded):
 
 
 def test_dirty_files_are_snapshotted_with_content(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # dirty")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.write("tests/test_extra.py", "def test_x():\n    assert True\n")  # untracked
     assert recorded.record().returncode == 0
     run = recorded.runs()[-1]

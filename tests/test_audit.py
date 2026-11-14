@@ -66,7 +66,7 @@ def test_audit_separates_pollution_from_misses(recorded):
 
 
 def test_audit_record_appends_the_full_run(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("audit", "--record")
     assert out["verdict"] == "pass"
     assert recorded.journal_files() == [out["full_run"]["journal"] + ".sqlite"]  # pending
@@ -95,7 +95,7 @@ def run_once_test(repo) -> None:
 
 def test_a_control_run_separates_environment_drift_from_misses(recorded):
     run_once_test(recorded)
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     assert recorded.cli("audit", code=1)["misses"][0]["test"] == "tests/test_once.py::test_once"
 
     def control(tests):  # the same tests, alone, on the unedited code
@@ -116,7 +116,7 @@ def test_a_control_run_separates_environment_drift_from_misses(recorded):
 def test_audit_control_checks_out_the_base_commit_in_place(recorded):
     run_once_test(recorded)
     branch = recorded.git("rev-parse", "--abbrev-ref", "HEAD")
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     # uncommitted work: the control will not check anything out over it
     out = recorded.cli("audit", "--control", code=1)
     assert out["misses"][0]["test"] == "tests/test_once.py::test_once"
@@ -128,4 +128,4 @@ def test_audit_control_checks_out_the_base_commit_in_place(recorded):
     assert (d["test"], d["alone"], d["on_base"]) == (
         "tests/test_once.py::test_once", "failed", "failed")
     assert recorded.git("rev-parse", "--abbrev-ref", "HEAD") == branch  # put back
-    assert "# edited" in recorded.read("pkg/mod.py")
+    assert "2 * 1" in recorded.read("pkg/mod.py")

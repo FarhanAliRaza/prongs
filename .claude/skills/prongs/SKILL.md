@@ -63,7 +63,7 @@ Selection reasons you will see under `selected_by_reason`:
 
 | Reason | When |
 |---|---|
-| `touches changed function` | the test entered a function whose lines changed |
+| `touches changed function` | the test entered a function whose body or signature changed |
 | `imports/touches changed file` | the file was added, deleted, changed at module level, or changed mid-run |
 | `changed function not in the map` | a new function in a known file: every test touching that file runs |
 | `test file changed` / `new test file` | the test module itself changed |
@@ -71,7 +71,13 @@ Selection reasons you will see under `selected_by_reason`:
 | `unmapped test (conservative)` | the map holds no dependency evidence for it |
 
 `mode: "run_all"` happens for a changed `conftest.py`, a changed tracked non-Python file, module-level or import-time code in a production module, a file that did not exist when the map was recorded, or a map more than `max_map_age` commits behind HEAD.
-Files that cannot affect tests are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `docs/`, `.github/`, `.gitignore`, `LICENSE`.
+Files that cannot affect tests are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `py.typed`, `docs/`, `.github/`, `.gitignore`, `LICENSE`.
+
+A file is compared by its code, not its lines, so these select nothing: formatting and comments, reordered imports, a new plain function or constant or import that nothing referred to before, and a removed import nothing uses.
+The result's `units` block says what was decided: `module_level` (why a file was taken whole), `additive` (bindings judged unobserved), `unexecuted` (changed functions no test enters).
+When `additive` is not empty, `run` first collects the whole suite (`import_check`); if that fails it runs everything.
+Editing the body of one test selects that test only.
+Docstring edits count as changes unless `ignore_docstrings = true` is set in `[tool.prongs]`.
 
 ## Building the map for the first time
 
@@ -141,6 +147,7 @@ max_map_age = 50
 flaky_window = 50
 flaky_retries = 2
 inert = ["*.svg", "assets/*"]   # extra files that can never affect tests; never matches .py
+ignore_docstrings = false       # true: a docstring edit is not a change
 ```
 
 Useful environment variables: `PRONGS_DIR` (state directory, default `.prongs`; share one across worktrees to pool runs), `PRONGS_RUN_ARGS`, `PRONGS_WARM_ARGS`, `PRONGS_WARM_DB_TEST` (a test the daemon runs at warm-up so forked children inherit the test database).

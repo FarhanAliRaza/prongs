@@ -50,7 +50,7 @@ def test_rollup_never_folds_a_run_twice(recorded):
 
 
 def test_history_keeps_a_row_per_test_per_run(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.cli("run")
     recorded.rollup()
     con = recorded.db()

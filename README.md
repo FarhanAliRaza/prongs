@@ -89,15 +89,17 @@ Concurrent sessions each write their own file.
 The selector diffs against the tree the evidence actually saw, not the tree you assume.
 A dirty file that still matches what the run saw is not a change.
 
-**Selection.** Changed lines map to functions via AST spans, then to tests through the inverted map.
+**Selection.** A changed file is compared unit by unit, not line by line.
+The units are each function body and each statement of the module and of its classes, fingerprinted from the AST.
+Changed functions map to tests through the inverted map.
 Each selected test carries a reason:
 
 | Reason | When |
 |---|---|
-| `touches changed function` | the test entered a function whose lines changed |
+| `touches changed function` | the test entered a function whose body or signature changed |
 | `imports/touches changed file` | the file was added, deleted, changed at module level, or changed mid-run, so it is taken whole |
-| `changed function not in the map` | a new function in a known file: every test that touches the file runs |
-| `test file changed` / `new test file` | the test module itself changed |
+| `changed function not in the map` | a new function something may already reach (a method, a decorated function) in a known file: every test that touches the file runs |
+| `test file changed` / `new test file` | the test module changed beyond the body of a known test |
 | `recent status change` | the outcome flipped within the last `history_window` rollups |
 | `unmapped test (conservative)` | the map holds no dependency evidence for it |
 | `evidence commit ... is not in this repository` | there is nothing to diff its evidence against |
@@ -105,7 +107,7 @@ Each selected test carries a reason:
 Some changes run everything (`mode: "run_all"`).
 These include a changed `conftest.py`, a changed tracked non-Python file, and module-level or import-time code in a production module.
 A new file that did not exist when the map was recorded also runs everything.
-Files that cannot affect test outcomes are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `docs/`, `.github/`, `.gitignore` and `LICENSE`.
+Files that cannot affect test outcomes are never a change: `*.md`, `*.rst`, `*.txt`, `*.lock`, `py.typed`, `docs/`, `.github/`, `.gitignore` and `LICENSE`.
 Add your own with glob patterns, matched against the path and against the file name:
 
 ```toml
@@ -116,6 +118,30 @@ inert = ["*.svg", "assets/*"]
 These patterns never match a `.py` file: a changed module is always analyzed.
 
 As a safety net, a map more than `max_map_age` commits behind HEAD runs everything.
+
+**What counts as a change.** The unit comparison borrows two ideas.
+From [Salsa](https://github.com/salsa-rs/salsa): a changed input matters only if the value derived from it changed.
+From [pytest-testmon](https://github.com/tarpas/pytest-testmon): the derived value is a checksum of the code's AST, one per block.
+
+- **Formatting is not a change.** Whitespace, comments, wrapped lines, and `import a` to `import a as a` leave every fingerprint equal, so nothing is selected.
+- **A function body is its own unit.** Editing a nested function changes neither its parent nor the statement that defines it.
+- **A test selects itself.** Editing the body of one known test selects that test, not its module. A changed fixture, helper, decorator or module-level statement still selects the module.
+- **A new name nothing observes selects nothing.** A new plain function, a new constant with a plain value, or a new import binds a name the old module never bound and never looked up. The code that uses the new name is a change of its own and is selected as one.
+- **A removed import nothing refers to selects nothing.** That holds when the module no longer uses the name, no other file takes it from this module, and the imported module is still imported elsewhere.
+- **Reordered imports and functions select nothing.** Reordering any other statement is a module-level change.
+- **A changed function no test enters selects nothing**, when the diff is taken from the tree the map was recorded on. From an explicit `--base` the map may be older than the function, so its file is broadened as before.
+
+Whenever one of the "selects nothing" rules for bindings is used, `prongs run` first collects the whole suite without running it.
+A new binding still executes at import; if collection fails, everything runs and the errors are reported.
+
+Everything else at module or class level is still a module-level change: a changed assignment, a class statement, a class attribute, a new method, a decorated function, a default or value that calls project code.
+The result lists what the analysis decided under `units`: `module_level` (why a file was taken whole), `additive` (bindings judged unobserved) and `unexecuted` (changed functions no test enters).
+
+These rules are static. They cannot see a test that finds a new name by enumerating a module (`dir()`, `vars()`, `inspect.getmembers`), or code reached only in a subprocess.
+Run `prongs audit` on your suite to check them.
+
+A docstring is data a program can read, so a docstring edit is a change by default.
+Set `ignore_docstrings = true` to treat docstring edits as formatting.
 
 **Flaky tests.** A test that both passed and failed on one tree within `flaky_window` rollups is flaky.
 Flaky tests still run.
@@ -202,11 +228,13 @@ history_window = 3   # a test whose outcome flipped in the last N rollups is sel
 max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
 flaky_retries = 2    # re-run a failing flaky test alone up to N times
+ignore_docstrings = false  # true: a docstring edit is not a change
 ```
 
 | Variable | Meaning |
 |---|---|
 | `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES` | Override the settings above |
+| `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
 | `PRONGS_DIR` | State directory, relative to the repository root (default `.prongs`); point worktrees at one directory to pool runs |
 | `PRONGS_JOURNAL` | Journal directory only (default `<state dir>/journal`) |

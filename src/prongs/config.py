@@ -18,6 +18,9 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
                    affect test outcomes, on top of the built-in list (docs,
                    .github/, *.md ...). A pattern is matched against the
                    path and against the file name: "*.svg", "assets/*"
+  ignore_docstrings  true: a docstring edit is not a change. Off by default:
+                   a docstring is data a program can read (`__doc__`, a CLI's
+                   help text). Also PRONGS_IGNORE_DOCSTRINGS=1
 """
 
 from __future__ import annotations
@@ -47,6 +50,13 @@ def inert(repo: Path) -> tuple[str, ...]:
     if not isinstance(patterns, list):  # a bare string would match per character
         return ()
     return tuple(p for p in patterns if isinstance(p, str))
+
+
+def flag(repo: Path, name: str) -> bool:
+    env = os.environ.get(f"PRONGS_{name.upper()}")
+    if env:
+        return env.lower() in ("1", "true", "yes")
+    return _table(repo).get(name) is True
 
 
 def settings(repo: Path, **overrides) -> dict:

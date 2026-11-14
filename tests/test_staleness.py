@@ -26,7 +26,8 @@ def test_receipt_reports_map_age_and_unmapped_tests(recorded):
 
 
 def test_a_changed_function_the_map_never_saw_selects_its_whole_file(recorded):
-    recorded.edit("pkg/mod.py", "def c():", "def d():\n    return 4\n\n\ndef c():")
+    # a default that runs project code at import: not a plain new definition
+    recorded.edit("pkg/mod.py", "def c():", "def d(x=b()):\n    return 4\n\n\ndef c():")
     sel = recorded.select()
     assert sel["mode"] == "select" and set(sel["selected"]) == {T_A, T_B, T_C}
     reason = "changed function not in the map: pkg/mod.py::d; every test that touches pkg/mod.py runs"
@@ -84,7 +85,7 @@ def test_evidence_from_a_commit_this_clone_lacks_is_never_diffed_from_head(recor
     # branch; in CI, a shallow clone), while the map's own commit is here
     main = recorded.git("rev-parse", "--abbrev-ref", "HEAD")
     recorded.git("checkout", "-q", "-b", "side")
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # side")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     side = recorded.commit("side edit")
     assert recorded.record("tests/test_m.py::test_b").returncode == 0
     recorded.git("checkout", "-q", main)

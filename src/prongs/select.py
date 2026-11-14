@@ -13,8 +13,12 @@ selection is computed per observed tree:
      line diff of the content the run saw (stored in the journal) against the
      content now — so a file that is still what the run saw is not a change,
      and a file that differs is diffed at function level, not wholesale
-  3. map changed lines to (file, qualname) functions via AST spans, look them
-     up in the inverted map, restricted to the tests that tree observed
+  3. compare each modified file with what the tree held, unit by unit
+     (units.py: function bodies and module/class statements, by AST
+     fingerprint), so formatting is no change and a binding nothing observes
+     selects nothing; look the changed (file, qualname) functions up in the
+     inverted map, restricted to the tests that tree observed. A version
+     that does not parse falls back to changed lines and AST spans
   4. history on top (the second signal): a test whose outcome flipped in the
      last N rollups is selected ("recent status change"), and a test that
      both passed and failed on one tree is reported as flaky
@@ -49,14 +53,16 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from prongs import config, journal, mapdb, provenance
+from prongs import config, journal, mapdb, provenance, units
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 # files that cannot affect test outcomes: skip entirely
 INERT_SUFFIXES = (".md", ".rst", ".txt", ".lock")
 INERT_PREFIXES = ("docs/", ".github/", ".gitignore")
-INERT_NAMES = {"LICENSE", "LICENSE.md", "CHANGELOG.md", "README.md", "CODE_OF_CONDUCT.md"}
+# py.typed is PEP 561's marker for type checkers: nothing reads it at run time
+INERT_NAMES = {"LICENSE", "LICENSE.md", "CHANGELOG.md", "README.md", "CODE_OF_CONDUCT.md",
+               "py.typed"}
 
 
 def is_inert(path: str, patterns: tuple[str, ...] = ()) -> bool:
@@ -250,6 +256,11 @@ class Analysis:
     unseen: dict[str, list[str]] = field(default_factory=dict)  # file -> changed funcs the map never saw
     unchanged: list[str] = field(default_factory=list)
     forced: list[str] = field(default_factory=list)
+    exact: bool = False  # diffed from the tree the evidence saw, not from an explicit base
+    existed: set[tuple[str, str]] = field(default_factory=set)  # changed funcs the old tree had
+    unexecuted: list[str] = field(default_factory=list)  # of those: ones no recorded test enters
+    module_level: dict[str, list[str]] = field(default_factory=dict)  # file -> what changed
+    additive: dict[str, list[str]] = field(default_factory=dict)  # file -> unobserved bindings
 
 
 def _brief(run: dict | None) -> dict | None:
@@ -399,6 +410,145 @@ class _Now:
             return None
 
 
+class RepoProject:
+    """What `units` asks about the rest of the repository: which project
+    modules an import loads, and who uses a module's names. Answered from
+    the tracked Python files as they are now (or at `head`), parsed only
+    when a `git grep` says a file can matter."""
+
+    def __init__(self, repo: Path, now: _Now, coll_files: set[str]):
+        self.repo, self.now, self.coll_files = repo, now, coll_files
+        self._files: list[str] | None = None
+        self._trees: dict[str, ast.Module | None] = {}
+        self._hits: dict[tuple[str, ...], list[str]] = {}
+        self._star: list[tuple[str, ast.ImportFrom]] | None = None
+
+    def files(self) -> list[str]:
+        if self._files is None:
+            if self.now.head is None:
+                out = git(self.repo, "ls-files", "--cached", "--others", "--exclude-standard")
+            else:
+                out = git(self.repo, "ls-tree", "-r", "--name-only", self.now.head)
+            self._files = [f for f in out.splitlines() if f.endswith(".py")]
+        return self._files
+
+    def grep(self, *pattern: str) -> list[str]:
+        """Python files containing a pattern (`git grep` arguments)."""
+        rev = [self.now.head] if self.now.head else ["--untracked"]
+        p = subprocess.run(
+            ["git", "grep", "-l", *pattern, *rev, "--", "*.py"],
+            cwd=self.repo, capture_output=True, text=True,
+        )
+        return [ln.split(":", 1)[1] if self.now.head else ln for ln in p.stdout.splitlines()]
+
+    def tree(self, path: str) -> ast.Module | None:
+        if path not in self._trees:
+            src = self.now.text(path)
+            try:
+                self._trees[path] = ast.parse(src) if src is not None else None
+            except (SyntaxError, ValueError, RecursionError):
+                self._trees[path] = None
+        return self._trees[path]
+
+    def imports(self, path: str) -> list[ast.stmt]:
+        tree = self.tree(path)
+        return [] if tree is None else [
+            n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+
+    def loads(self, path: str, node: ast.stmt, alias: ast.alias | None) -> list[str]:
+        """The project files one import (or one name of it) loads."""
+        cands = tuple(units.import_candidates(path, node, alias))
+        if cands not in self._hits:
+            self._hits[cands] = [
+                f for f in self.files() if any(units.matches(c, f) for c in cands)]
+        return self._hits[cands]
+
+    def module_state(self, path: str, node: ast.stmt, alias: ast.alias) -> str:
+        hits = self.loads(path, node, alias)
+        if not hits:
+            return "external"
+        return "loaded" if all(h in self.coll_files for h in hits) else "unloaded"
+
+    def provides(self, path: str, node: ast.stmt, alias: ast.alias) -> bool:
+        if not isinstance(node, ast.ImportFrom):
+            return True
+        modules = [f for f in self.files()
+                   if any(units.matches(c, f) for c in units.from_candidates(path, node))]
+        if not modules:
+            return True  # not a project module
+        if any(f not in modules and self._stem(f) == alias.name
+               for f in self.loads(path, node, alias)):
+            return True  # the name is a submodule
+        for f in modules:
+            src = self.now.text(f)
+            try:
+                mod = units.Module(src) if src is not None else None
+            except (SyntaxError, ValueError, RecursionError):
+                mod = None
+            if mod is None or mod.binds(alias.name) or mod.star_import or mod.binds("__getattr__"):
+                return True
+        return False
+
+    @staticmethod
+    def _stem(path: str) -> str:
+        p = Path(path)
+        return p.parent.name if p.name == "__init__.py" else p.stem
+
+    def still_imported(self, path: str, node: ast.stmt, alias: ast.alias) -> bool:
+        for target in self.loads(path, node, alias):
+            others = (
+                f for f in self.grep("-w", "-F", "-e", self._stem(target))
+                if f != path and f in self.coll_files
+            )
+            if not any(target in self.loads(f, imp, None)
+                       for f in others for imp in self.imports(f)):
+                return False
+        return True
+
+    def star_imported(self, path: str, name: str, _seen: frozenset = frozenset()) -> bool:
+        if self._star is None:
+            self._star = [
+                (f, imp) for f in self.grep("-E", "-e", r"import +\*") for imp in self.imports(f)
+                if isinstance(imp, ast.ImportFrom) and any(a.name == "*" for a in imp.names)
+            ]
+        for f, imp in self._star:
+            if f in _seen or not any(
+                    units.matches(c, path) for c in units.from_candidates(f, imp)):
+                continue
+            # the name lands in f's namespace too: observed if f uses it, or
+            # hands it on (to a file that imports it from f, or star-imports f)
+            src = self.now.text(f)
+            try:
+                mod = units.Module(src) if src is not None else None
+            except (SyntaxError, ValueError, RecursionError):
+                mod = None
+            if (mod is None or mod.binds(name) or name in mod.loads or name in mod.strings
+                    or self.used_elsewhere(f, name)
+                    or self.star_imported(f, name, _seen | {path})):
+                return True
+        return False
+
+    def used_elsewhere(self, path: str, name: str) -> bool:
+        stem = self._stem(path)
+        for f in self.grep("-w", "-F", "-e", name):
+            tree = self.tree(f)
+            if f == path:
+                continue
+            if tree is None:
+                return True  # cannot tell
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom) and any(a.name == name for a in n.names):
+                    if any(units.matches(c, path) for c in units.from_candidates(f, n)):
+                        return True
+                elif isinstance(n, ast.Attribute) and n.attr == name:
+                    owner = n.value
+                    last = (owner.attr if isinstance(owner, ast.Attribute)
+                            else owner.id if isinstance(owner, ast.Name) else None)
+                    if last == stem:
+                        return True
+        return False
+
+
 def tree_changes(
     repo: Path, tree: Tree, now: _Now, con, git_cache: dict, untracked: dict[str, str | None],
     an: Analysis,
@@ -464,9 +614,12 @@ def tree_changes(
 
 
 def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis,
-            inert: tuple[str, ...] = ()) -> Analysis:
+            inert: tuple[str, ...] = (), project: RepoProject | None = None,
+            seen_funcs: set | None = None, ignore_docstrings: bool = False) -> Analysis:
     """Turn a change set into changed functions, wholesale files, run-all
-    reasons and test-file selections."""
+    reasons and test-file selections. With a `project`, a modified file is
+    compared unit by unit (see units.py); without one, or when a version
+    does not parse, line by line."""
 
     def old_source(source: str, path: str) -> str | None:
         if source.startswith("blob:"):
@@ -540,18 +693,63 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
             an.wholesale.add(path)
             continue
 
-        # modified file: map changed lines -> functions, in NEW and each OLD version
+        new_src = now.text(path)
+        olds = [old_source(source, path) for source in ch["old"]]
+        deltas = [
+            units.delta(old, new_src, path, project, ignore_docstrings)
+            for old in olds if project is not None and old is not None and new_src is not None
+        ]
+        if deltas and len(deltas) == len(olds) and all(d is not None for d in deltas):
+            # modified file, by units: what the change means, not where it is
+            changed = {q for d in deltas for q in d.changed}
+            added = {q for d in deltas for q in d.added}
+            headers = {q for d in deltas for q in d.headers}
+            module_level = sorted({r for d in deltas for r in d.module_level})
+            additive = sorted({r for d in deltas for r in d.additive})
+            if additive and not is_test_file(path):
+                an.additive[path] = additive
+            if not (changed or added or module_level or additive):
+                an.production.discard(path)  # formatting and comments: not a change
+                continue
+            if not (changed or added or module_level) and not is_test_file(path):
+                continue  # bindings nothing observes
+            if is_test_file(path):
+                # a test whose body alone changed is its own concern: the
+                # tests that enter it are that test. Anything else (a fixture
+                # or helper, a new or removed test, a decorator: parameters
+                # the map has no ids for) selects the module, as before.
+                tests = {n.replace("::", ".") for n in static_test_names(new_src)}
+                # an unobserved new binding in a test module may be a new test
+                narrow = not (added or module_level or headers or additive) and all(
+                    q in tests and (path, q) in (seen_funcs or ()) for q in changed)
+                if narrow:
+                    an.changed_funcs |= {(path, q) for q in changed}
+                    an.existed |= {(path, q) for q in changed}
+                else:
+                    select_test_file(
+                        path,
+                        f"module-level change in test file: {path}" if module_level
+                        else f"test file changed: {path}",
+                    )
+                continue
+            an.changed_funcs |= {(path, q) for q in changed | added}
+            an.existed |= {(path, q) for q in changed}
+            if module_level:
+                # import-time code changed: every test importing this file is suspect
+                an.wholesale.add(path)
+                an.module_level[path] = module_level
+            continue
+
+        # modified file, by lines: changed lines -> functions, in NEW and each OLD version
         module_level = set()
         unreadable = False
-        new_src = now.text(path)
         if new_src is None:
             unreadable = True
         else:
             hit, uncovered = funcs_touching(function_spans(new_src), ch["new"], new_src)
             an.changed_funcs |= {(path, q) for q in hit}
             module_level |= uncovered
-        for source, old_lines in ch["old"].items():
-            old_src = old_source(source, path)
+        for old_lines, old_src in zip(ch["old"].values(), olds):
             if old_src is None:
                 unreadable = True
                 continue
@@ -749,10 +947,17 @@ def unseen_changes(an: "Analysis", seen_funcs: set, seen_files: set, files: Evid
     touches its file, or — when the map has never seen the file either and
     the file did not exist when the evidence was recorded — to everything.
     A file that did exist then and that no recorded run ever executed is
-    reachable only through some other change, which the diff shows."""
+    reachable only through some other change, which the diff shows; so is a
+    function that existed in the tree the evidence was recorded on (known
+    when the diff is taken from that tree, not from an explicit base)."""
     for path, qual in sorted(an.changed_funcs):
         if (path, qual) not in seen_funcs and path in seen_files:
-            an.unseen.setdefault(path, []).append(qual)
+            if an.exact and (path, qual) in an.existed:
+                # it existed in the very tree the tests were recorded on and
+                # none of them entered it: its body can reach none of them
+                an.unexecuted.append(f"{path}::{qual}")
+            else:
+                an.unseen.setdefault(path, []).append(qual)
     for path in sorted(an.production - seen_files):
         if not files.existed(path):
             an.run_all_reasons.append(
@@ -787,7 +992,10 @@ def broadening(path: str, quals: list[str]) -> str:
 def select(db_path: Path, repo: Path, base: str | None = None, head: str | None = None, *,
            history_window: int = config.DEFAULTS["history_window"],
            max_map_age: int = config.DEFAULTS["max_map_age"],
-           flaky_window: int = config.DEFAULTS["flaky_window"]) -> dict:
+           flaky_window: int = config.DEFAULTS["flaky_window"],
+           force_all: str | None = None) -> dict:
+    """`force_all` is a reason to run everything that the caller found
+    (a failed import check): the result is the run-all plan, with it."""
     if provenance.git_head(repo) is None:
         return {"error": f"not a git repository with commits: {repo}", "mode": "error"}
     for rev in (base, head):
@@ -841,7 +1049,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     evidence_files = EvidenceFiles(repo, contributing)
     ev["unmapped_tests"] = sum(1 for mapped, _ in all_tests.values() if not mapped)
     ev["map_age"] = age = map_age(con, repo, head) | {"max_map_age": max_map_age}
-    stale: list[str] = []
+    stale: list[str] = [force_all] if force_all else []
     if age["commits_behind_head"] is None:
         stale.append(f"map age unknown: {age['unknown']}")
     elif age["commits_behind_head"] > max_map_age:
@@ -854,10 +1062,13 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     git_cache: dict[str, dict] = {}
     analyses: list[Analysis] = []
     inert = config.inert(repo)
+    project = RepoProject(repo, now, coll_files)
+    ignore_docstrings = config.flag(repo, "ignore_docstrings")
     for tree in trees:
-        an = Analysis()
+        an = Analysis(exact=tree.run_ids is not None)
         changes = tree_changes(repo, tree, now, con, git_cache, untracked, an)
-        analyze(repo, con, now, changes, all_tests, an, inert)
+        analyze(repo, con, now, changes, all_tests, an, inert, project, seen_funcs,
+                ignore_docstrings)
         # import/collection-time execution: a changed function that runs during
         # collection (decorators, module-level declarations) can break any test
         # before it even starts — no per-test attribution possible, so run all.
@@ -883,6 +1094,14 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     broadened = [broadening(path, quals) for path, quals in sorted(unseen.items())]
     changed_funcs = sorted({f"{p}::{q}" for a in analyses for p, q in a.changed_funcs})
     wholesale = sorted({p for a in analyses for p in a.wholesale})
+    # what the unit analysis decided, for the receipt
+    units_block = {
+        "module_level": {p: r for a in analyses for p, r in sorted(a.module_level.items())},
+        "additive": {p: r for a in analyses for p, r in sorted(a.additive.items())},
+        "unexecuted": sorted({f for a in analyses for f in a.unexecuted}),
+    }
+    # an unobserved binding still executes at import: collect everything once
+    import_check = sorted({t.split("::", 1)[0] for t in all_tests}) if units_block["additive"] else []
     # known tests the selector expects not to exist any more: they are
     # selected (their module runs whole), and cannot produce a result
     vanished = sorted({t for a in analyses for t in a.vanished if t in all_tests})
@@ -907,6 +1126,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "changed_files_wholesale": wholesale,
             "vanished": vanished,
             "broadened": broadened,
+            "units": units_block,
+            "import_check": [],  # everything is collected anyway
             "flaky": flaky,
             "history": history,
             "evidence": ev,
@@ -993,6 +1214,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "n_total": len(all_tests),
         "vanished": vanished,
         "broadened": broadened,
+        "units": units_block,
+        "import_check": import_check,
         "flaky": flaky,
         "history": history,
         "evidence": ev,

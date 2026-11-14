@@ -37,7 +37,7 @@ def test_a_fresh_clone_selects_from_a_restored_map(recorded, tmp_path):
     res = job.cli("ci", "restore", str(tmp_path))  # finds the artifact below the path
     assert res["map"]["installed"] is True and res["history"]["missing"] == 0
     assert res["journals"]["known"] == 1  # the map already holds that run
-    job.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    job.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = job.cli("affected")
     assert out["mode"] == "select" and out["tests"] == sorted([T_B, T_C])
 
@@ -68,7 +68,7 @@ def test_a_pull_requests_merge_checkout_is_deepened_to_the_map(recorded, tmp_pat
     docs(recorded, 2)  # main moves on after the map was saved
     main = recorded.git("rev-parse", "--abbrev-ref", "HEAD")
     recorded.git("checkout", "-q", "-b", "feature")
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # pr")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.commit("pr edit")
     recorded.git("checkout", "-q", main)
     recorded.git("merge", "-q", "--no-ff", "--no-edit", "feature")
@@ -144,7 +144,7 @@ def test_this_branchs_journals_are_own_evidence_and_save_carries_only_new_ones(
         recorded, tmp_path):
     art1 = tmp_path / "job1"
     recorded.cli("ci", "save", str(art1))
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.commit("edit b")
     # job 2 runs what the edit affects and saves its journal
     job2 = clone(recorded, tmp_path / "clone2")
@@ -160,7 +160,7 @@ def test_this_branchs_journals_are_own_evidence_and_save_carries_only_new_ones(
     out = job3.cli("affected")
     assert out["mode"] == "select" and out["tests"] == [] and len(out["evidence"]["contributing_runs"]) == 2
     # restored files are not this job's: save carries only what job 3 wrote
-    job3.edit("pkg/mod.py", "return 1", "return 1  # edited")
+    job3.edit("pkg/mod.py", "return 1", "return 0 + 1")
     mine = job3.cli("run")["summary"]["recorded"]["journal"]
     assert job3.cli("ci", "save", str(tmp_path / "job3"))["journals"] == [mine]
 
@@ -168,7 +168,7 @@ def test_this_branchs_journals_are_own_evidence_and_save_carries_only_new_ones(
 def test_restore_keeps_a_local_map_that_knows_more(recorded, tmp_path):
     art = tmp_path / "artifact"
     recorded.cli("ci", "save", str(art))
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.cli("run")
     recorded.rollup()
     res = recorded.cli("ci", "restore", str(art))
@@ -210,7 +210,7 @@ def test_a_foreign_journal_never_makes_restore_fetch_history(recorded, tmp_path)
     recorded.cli("ci", "save", str(main_art))
     pr = clone(recorded, tmp_path / "pr")
     pr.cli("ci", "restore", str(main_art))
-    pr.edit("pkg/mod.py", "return 2", "return 2  # pr")
+    pr.edit("pkg/mod.py", "return 2", "return 2 * 1")
     pr.commit("a pull request's commit, pushed nowhere")
     pr.cli("run")
     pr_art = tmp_path / "pr-artifact"

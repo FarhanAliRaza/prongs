@@ -22,7 +22,7 @@ def test_clean_tree_selects_nothing_and_reports_evidence(recorded):
 
 
 def test_function_change_selects_its_dependents(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     sel = recorded.select()
     assert sel["mode"] == "select"
     assert sel["targets"] == [T_C, T_B]
@@ -32,7 +32,7 @@ def test_function_change_selects_its_dependents(recorded):
 
 
 def test_recorded_partial_run_is_credited_exactly(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("run")  # recording is the default
     s = out["summary"]
     assert s["status"] == "passed" and s["ran"] == 2 and s["complete"] is True
@@ -52,9 +52,9 @@ def test_recorded_partial_run_is_credited_exactly(recorded):
 
 
 def test_second_edit_is_line_diffed_against_observed_content(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.cli("run", "--record")
-    recorded.edit("pkg/mod.py", "return 1", "return 1  # edited")
+    recorded.edit("pkg/mod.py", "return 1", "return 0 + 1")
     sel = recorded.select()
     # test_a: evidence from run 1 (commit), diff commit..now touches a and b
     # test_c: evidence from run 2 (dirty blob), diff blob..now touches a only
@@ -64,9 +64,9 @@ def test_second_edit_is_line_diffed_against_observed_content(recorded):
 
 
 def test_commit_after_partial_run_diffs_from_evidence_not_head(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.cli("run", "--record")
-    recorded.edit("pkg/mod.py", "return 1", "return 1  # edited")
+    recorded.edit("pkg/mod.py", "return 1", "return 0 + 1")
     recorded.commit("edit a and b")
     sel = recorded.select()
     ev = sel["evidence"]
@@ -100,21 +100,28 @@ def test_test_module_changes_never_escalate_to_run_all(recorded):
     assert sel["selected_files"] == {"tests/test_m.py": "1 known test(s) not found statically: test_b"}
     assert set(sel["selected"]) == {T_A, T_B, T_C}
     assert all(r.startswith("test file changed") for r in sel["selected"].values())
-    # editing a test body selects that file's known tests: all of them here,
-    # so pytest gets the file, not one id per test
+    # editing one test's body selects that test: the tests that enter it
     recorded.git("checkout", "--", "tests/test_m.py")
-    recorded.edit("tests/test_m.py", "assert a() == 1", "assert a() == 1  # edited")
+    recorded.edit("tests/test_m.py", "assert a() == 1", "assert a() == 0 + 1")
     sel = recorded.select()
-    assert set(sel["selected"]) == {T_A, T_B, T_C} and sel["selected_files"] == {}
-    assert sel["targets"] == ["tests/test_m.py"]
+    assert sel["selected"] == {T_A: "touches changed function tests/test_m.py::test_a"}
+    assert sel["targets"] == [T_A] and sel["selected_files"] == {}
+    # a changed decorator can change which ids exist: the module runs
+    recorded.edit("tests/test_m.py", "def test_a():", "@staticmethod\ndef test_a():")
+    sel = recorded.select()
+    assert set(sel["selected"]) == {T_A, T_B, T_C} and sel["targets"] == ["tests/test_m.py"]
+    assert sel["selected"][T_A] == "test file changed: tests/test_m.py"
 
 
 def test_import_time_change_in_production_code_runs_all(recorded):
-    recorded.edit("pkg/mod.py", "def a():", "X = 1\ndef a():")
+    recorded.edit("pkg/mod.py", "def a():", "X = a\ndef a():")
+    recorded.edit("pkg/mod.py", "X = a\n", "X = print('imported')\n")
     sel = recorded.select()
     assert sel["mode"] == "run_all"
     assert sel["reasons"] == ["module-level change in import-time file: pkg/mod.py"]
     assert sel["targets"] == ["tests/test_m.py"] and sel["selected"][T_A] == "run_all"
+    assert sel["units"]["module_level"] == {"pkg/mod.py": [
+        "new assignment to X (line 1): its value is not a plain expression"]}
 
 
 def test_conftest_change_runs_all(recorded):
@@ -153,7 +160,7 @@ def test_configured_inert_patterns_never_hide_python(recorded):
     recorded.write("pyproject.toml", recorded.read("pyproject.toml")
                    + '\n[tool.prongs]\ninert = ["pkg/*"]\n')
     recorded.write("pkg/data.json", "x")
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     recorded.commit()
     sel = recorded.select()
     assert sel["changed_functions"] == ["pkg/mod.py::b"]
@@ -177,7 +184,7 @@ def test_deleted_module_is_excluded_from_selection(recorded):
 
 
 def test_explicit_base_collapses_to_one_tree_and_warns_when_off_evidence(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     sel = recorded.select(base="HEAD")
     assert sel["targets"] == [T_C, T_B]
     assert sel["evidence"]["base_source"] == "explicit" and sel["evidence"]["warnings"] == []
@@ -192,7 +199,7 @@ def test_explicit_base_collapses_to_one_tree_and_warns_when_off_evidence(recorde
 
 def test_commit_to_commit_selection(recorded):
     """The replay harness diffs two commits with the map built at the first."""
-    recorded.edit("pkg/mod.py", "return 1", "return 1  # edited")
+    recorded.edit("pkg/mod.py", "return 1", "return 0 + 1")
     first = recorded.head()
     second = recorded.commit("edit a")
     sel = recorded.select(base=first, head=second)
@@ -200,7 +207,7 @@ def test_commit_to_commit_selection(recorded):
 
 
 def test_no_record_leaves_the_journal_alone(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("run", "--no-record")
     assert out["summary"]["ran"] == 2 and "recorded" not in out["summary"]
     assert [r[1] for r in recorded.runs()] == ["full"]
@@ -244,14 +251,16 @@ def test_unittest_style_classes_are_found_statically(recorded):
     )
     recorded.commit("unittest style")
     assert recorded.record().returncode == 0
-    recorded.edit("tests/test_u.py", "assertEqual(a(), 1)", "assertEqual(a(), 1)  # edited")
+    recorded.edit("tests/test_u.py", "assertEqual(a(), 1)", "assertEqual(a(), 0 + 1)")
     sel = recorded.select()
-    assert sel["selected"] == {"tests/test_u.py::ModTests::test_a": "test file changed: tests/test_u.py"}
+    assert sel["selected"] == {
+        "tests/test_u.py::ModTests::test_a":
+            "touches changed function tests/test_u.py::ModTests.test_a"}
     assert sel["targets"] == ["tests/test_u.py"] and sel["selected_files"] == {}
 
 
 def test_skip_receipt_is_tied_to_the_evidence(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("affected")
     receipt = out["skip_receipt"]
     assert receipt["skipped"] == 1 and receipt["evidence"]["runs"] == [1]

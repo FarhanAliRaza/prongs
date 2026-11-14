@@ -9,7 +9,7 @@ from prongs.__main__ import exception_line, group_failures
 
 
 def test_selected_run_balances_its_books(recorded):
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("run")
     assert out["summary"]["status"] == "passed"
     assert out["conservation"] == {
@@ -69,7 +69,7 @@ def test_without_a_map_everything_runs_and_the_run_builds_the_map(repo):
     assert out["summary"]["ran"] == 3 and out["summary"]["recorded"]["scope"] == "full"
     assert out["conservation"]["census"] == "no map: the run's own collection"
     # the next command rolls that run up and selects precisely
-    repo.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    repo.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = repo.cli("affected")
     assert out["mode"] == "select" and out["tests"] == sorted([T_B, T_C])
 
@@ -197,6 +197,6 @@ def test_run_args_reach_a_cold_run(recorded):
     # an option pytest rejects: the run must fail as an error, proving the
     # arguments reached the in-process pytest, not just the daemon's children
     recorded.env["PRONGS_RUN_ARGS"] = "--no-such-option"
-    recorded.edit("pkg/mod.py", "return 2", "return 2  # edited")
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("run", code=2)
     assert out["summary"]["status"] == "error"

@@ -74,7 +74,26 @@ def roll_up(repo: Path) -> dict:
     return mapdb.rollup(journal.map_path(repo), journal.journal_dir(repo))
 
 
-def cmd_affected(args) -> dict:
+def import_check(modules: list[str]) -> dict:
+    """Collect every test module once, running nothing: a binding the
+    selector judged unobserved (a new function, constant or import) still
+    executes when its module is imported, and a selection that imports
+    nothing would never find out that it raises."""
+    env = {k: v for k, v in os.environ.items() if k != "PRONGS_COV"}
+    t0 = time.monotonic()
+    p = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+         *shlex.split(os.environ.get("PRONGS_RUN_ARGS", "")), *modules],
+        capture_output=True, text=True, env=env,
+    )
+    ok = p.returncode in (0, 5)  # 5: nothing collected
+    out = {"ok": ok, "exit": p.returncode, "wall_s": round(time.monotonic() - t0, 3)}
+    if not ok:
+        out["output"] = p.stdout[-1500:]
+    return out
+
+
+def cmd_affected(args, force_all: str | None = None) -> dict:
     repo = Path.cwd()
     db, jdir = journal.map_path(repo), journal.journal_dir(repo)
     rolled = roll_up(repo) if getattr(args, "rollup", True) else None
@@ -82,7 +101,8 @@ def cmd_affected(args) -> dict:
         return no_map_selection(len(journal.pending_all(jdir)))
     cfg = settings(repo, args)
     sel = select(db, repo, args.base, history_window=cfg["history_window"],
-                 max_map_age=cfg["max_map_age"], flaky_window=cfg["flaky_window"])
+                 max_map_age=cfg["max_map_age"], flaky_window=cfg["flaky_window"],
+                 force_all=force_all)
     if "error" in sel:
         return sel
     reasons = Counter(v.split(":")[0].split(" (")[0] for v in sel["selected"].values())
@@ -98,6 +118,8 @@ def cmd_affected(args) -> dict:
         "selected_files": sel.get("selected_files", {}),
         "vanished": sel.get("vanished", []),
         "broadened": sel.get("broadened", []),
+        "units": sel.get("units", {}),
+        "import_check": sel.get("import_check", []),
         # flaky tests still run; their history is the receipt, and a failure
         # of one is reported as flaky, not as a failure
         "flaky": {
@@ -164,6 +186,10 @@ def skip_receipt(sel: dict) -> dict:
         } | ({"unknown": age["unknown"]} if "unknown" in age else {}),
         "unmapped_tests": ev["unmapped_tests"],
         "broadened": sel.get("broadened", []),
+        # what the unit analysis decided: bindings added or removed with
+        # nothing to observe them, and changed functions no test enters
+        "additive": sel.get("units", {}).get("additive", {}),
+        "unexecuted": sel.get("units", {}).get("unexecuted", []),
     }
     if sel["mode"] == "run_all":
         return {"skipped": 0, "rule": "nothing skipped: " + "; ".join(sel["reasons"])} | freshness
@@ -450,6 +476,15 @@ def cmd_run(args) -> dict:
     aff = cmd_affected(args)
     if "error" in aff:
         return aff
+    checked = None
+    if aff.get("import_check"):
+        checked = import_check(aff["import_check"])
+        if not checked["ok"]:
+            # the tree does not even import: run everything, so the errors
+            # are reported as any collection error is
+            args.rollup = False
+            aff = cmd_affected(args, force_all="import check failed: collecting the suite "
+                                               f"exited {checked['exit']}")
     out = {
         "selection": {
             k: aff[k]
@@ -459,6 +494,8 @@ def cmd_run(args) -> dict:
         "evidence": aff["evidence"],
         "skip_receipt": aff["skip_receipt"],
     }
+    if checked is not None:
+        out["import_check"] = checked
     if not aff["targets"] and not aff.get("whole_suite"):
         out["results"] = []
         out["conservation"] = conservation(aff, [])
