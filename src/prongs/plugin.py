@@ -330,7 +330,7 @@ class ProngsCov:
         key = config.getoption("prongs_journal_key") or os.environ.get("PRONGS_JOURNAL_KEY")
         info = self.run_info()
         res = journal.append(jdir, self.rootpath, self.records, info, key=key)
-        if self._state is not None and info["scope"] == "full":
+        if self._state is not None and info["scope"] != "collect":
             # collect once more, elsewhere: what differs between two imports
             # of one tree says nothing about a change
             again = state.collect(self.rootpath, self._modules)["snapshot"]

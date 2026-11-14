@@ -219,12 +219,16 @@ def diff(base: dict, now: dict) -> dict:
     reach any of it}."""
     skip = {tuple(v) for v in base.get("volatile", [])}
     fa, fb = _flat(base), _flat(now)
-    changed = sorted(k for k in fa.keys() | fb.keys() if k not in skip and fa.get(k) != fb.get(k))
+    # a module only one of the two sessions imported (they collected
+    # different test modules) says nothing: compare what both imported
+    both = base["modules"].keys() & now["modules"].keys()
+    changed = sorted(k for k in fa.keys() | fb.keys()
+                     if k[0] in both and k not in skip and fa.get(k) != fb.get(k))
     names = {k for _, k in changed}
     classes = []
     for cls in sorted(base["classes"].keys() | now["classes"].keys()):
         path, qual = cls.split("::", 1)
-        if (path, qual.split(".")[0]) in skip:
+        if path not in both or (path, qual.split(".")[0]) in skip:
             continue
         a, b = base["classes"].get(cls, {}), now["classes"].get(cls, {})
         attrs = {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)}

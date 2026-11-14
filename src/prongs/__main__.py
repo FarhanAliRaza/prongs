@@ -104,8 +104,11 @@ def import_state_selection(repo: Path, aff: dict) -> tuple[set[str], dict] | Non
 
     con = sqlite3.connect(journal.map_path(repo))
     try:
-        full = mapdb.last_full_run(con)
-        base = state.load(repo, full["journal_key"]) if full else None
+        base = None  # the newest recorded run that stored what import produced
+        for run in reversed(mapdb.runs(con, lineage="own")):
+            base = state.load(repo, run["journal_key"])
+            if base is not None:
+                break
         if base is None:
             return None
         modules = sorted({t.split("::", 1)[0] for t in aff["tests"]})
