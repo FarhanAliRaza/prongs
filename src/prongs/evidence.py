@@ -93,7 +93,10 @@ def _audit(event: str, args: tuple) -> None:
         if event == "open":
             ev.opened(args[0], args[1])
         elif event in SPAWN_EVENTS:
-            ev.spawned(event, args)
+            # subprocess reports the process it starts (subprocess.Popen), and
+            # then the call it starts it with (os.posix_spawn) reports it again
+            if event == "subprocess.Popen" or sys._getframe(1).f_globals.get("__name__") != "subprocess":
+                ev.spawned(event, args)
     except Exception:  # never let bookkeeping break the program's own call
         pass
 

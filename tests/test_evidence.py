@@ -171,6 +171,32 @@ def test_a_recorded_child_process_is_credited_to_its_test(project, tmp_path):
     }
 
 
+def test_a_process_started_through_posix_spawn_is_one_process(project, tmp_path):
+    # subprocess starts a child with os.posix_spawn where it can (always
+    # without close_fds; on a recent glibc, from Python 3.13, by default), and
+    # the interpreter then reports both calls: that is one process, and its
+    # one report accounts for it
+    (tmp_path / "site").mkdir()
+    (tmp_path / "site" / "sitecustomize.py").write_text(
+        "import os\nif os.environ.get('PRONGS_CHILD'):\n    import prongs.child\n")
+    project.env["PYTHONPATH"] = str(tmp_path / "site")
+    project.env["PRONGS_RECORD_CHILDREN"] = "1"
+    project.edit("pkg/mod.py", '[sys.executable, "-c", code]))',
+                 '[sys.executable, "-c", code], close_fds=False))')
+    project.commit("posix_spawn")
+    assert project.record().returncode == 0
+    project.rollup()
+    con = project.db()
+    deps = {(p, q) for p, q in con.execute(
+        "SELECT f.path, fn.qualname FROM tests t JOIN current_links l ON l.test_id = t.id "
+        "JOIN funcs fn ON fn.id = l.func_id JOIN files f ON f.id = fn.file_id "
+        "WHERE t.test_id = ?", (T + "test_spawn",))}
+    con.close()
+    assert deps == {("pkg/__init__.py", "<module>"), ("pkg/mod.py", "<module>"),
+                    ("pkg/mod.py", "child_only"), ("pkg/mod.py", "spawn"),
+                    ("tests/test_e.py", "test_spawn")}
+
+
 def test_a_changed_data_file_selects_the_tests_that_read_it(project):
     project.edit("data/table.json", '{"k": 1}', '{"k": 2}')
     assert selected(project) == {
