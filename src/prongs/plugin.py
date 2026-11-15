@@ -157,9 +157,8 @@ class ProngsCov:
         self._fixtures: dict = {}  # FixtureDef -> (deps, started a process)
         self._shared: tuple[set, bool] = (set(), False)
         self._spawns: dict[str, tuple[int, bool]] = {}  # test -> (own spawns, via a fixture)
-        self._state: dict | None = None  # what import produced (state.py), when asked for
         # read now: the recorder's own look at pyproject.toml is not the suite's
-        self._want_state = settings.flag(config.rootpath, "import_state")
+        self._want_state = settings.import_state(config.rootpath) is not None
         self._modules: list[str] = []
         self.evidence.start()
         if MON:
@@ -211,8 +210,6 @@ class ProngsCov:
         # pseudo-context. A diff touching any of it invalidates the whole suite.
         self.n_collected = len(session.items)
         self._modules = sorted({item.nodeid.split("::", 1)[0] for item in session.items})
-        if self._want_state:
-            self._state = state.snapshot(self.rootpath)
         # a process started while collecting is not marked: what collection
         # runs is already a reason to run everything when it changes
         self.records[journal.COLLECTION] = (
@@ -330,13 +327,14 @@ class ProngsCov:
         key = config.getoption("prongs_journal_key") or os.environ.get("PRONGS_JOURNAL_KEY")
         info = self.run_info()
         res = journal.append(jdir, self.rootpath, self.records, info, key=key)
-        if self._state is not None and info["scope"] != "collect":
-            # collect once more, elsewhere: what differs between two imports
-            # of one tree says nothing about a change
+        if self._want_state and info["scope"] != "collect":
+            # what import produced, taken in two fresh processes: what differs
+            # between two imports of one tree says nothing about a change
+            first = state.collect(self.rootpath, self._modules)["snapshot"]
             again = state.collect(self.rootpath, self._modules)["snapshot"]
-            if again is not None:
-                self._state["volatile"] = state.volatile(self._state, again)
-                state.save(Path(self.rootpath), res["key"], self._state)
+            if first is not None and again is not None:
+                state.save(Path(self.rootpath), res["key"],
+                           state.stored(first, state.volatile(first, again)))
         sys.stderr.write(
             f"\n[prongs] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"

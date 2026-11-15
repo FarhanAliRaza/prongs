@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from prongs import config, evidence, journal, mapdb, provenance, units
+from prongs import config, evidence, journal, mapdb, provenance, state, units
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -1152,6 +1152,26 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     # selected (their module runs whole), and cannot produce a result
     vanished = sorted({t for a in analyses for t in a.vanished if t in all_tests})
 
+    # import-time code changed and nothing else asks for everything: select
+    # by what import now produces differently (state.py), when every tree
+    # that saw such a change has a snapshot to compare with
+    state_bases: list | None = None
+    if (run_all_reasons and head is None and config.import_state(repo) == "select"
+            and all(r.startswith(state.REASONS) for r in run_all_reasons)):
+        keys = {r["id"]: r["journal_key"] for r in contributing}
+        state_bases = []
+        for tree, an in zip(trees, analyses):
+            if not an.run_all_reasons:
+                continue
+            snap = None
+            for rid in sorted(tree.run_ids or (), reverse=True):
+                snap = state.load(repo, keys[rid]) if rid in keys else None
+                if snap is not None:
+                    break
+            state_bases.append((tree, snap))
+        if not state_bases or any(snap is None for _, snap in state_bases):
+            state_bases = None
+
     known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids} | set(missing)
     selected: dict[str, str] = {}  # test_id -> reason
     selected_files: dict[str, str] = {}
@@ -1179,6 +1199,11 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
                 if t in in_tree:
                     selected.setdefault(t, reason)
         for path in an.wholesale:
+            if state_bases is not None and path in coll_files and path in an.module_level:
+                # what this module's import-time code built is compared
+                # itself: the tests that reach what changed, not every test
+                # that touches the file
+                continue
             rows = con.execute(
                 "SELECT DISTINCT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
                 "JOIN funcs fn ON fn.id=l.func_id JOIN files f ON f.id=fn.file_id "
@@ -1220,6 +1245,25 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         for t in all_tests
         if t not in selected
     }
+    import_state = None
+    if state_bases is not None:
+        got = state.collect(repo, sorted({t.split("::", 1)[0] for t in all_tests}))
+        if not got["ok"] or got["snapshot"] is None:
+            # the tree does not import: everything runs, and reports it
+            run_all_reasons.append(
+                f"import check failed: collecting the suite exited {got['exit']}")
+        else:
+            import_state = {"overrode": run_all_reasons, "trees": []}
+            for tree, snap in state_bases:
+                change = state.diff(snap, got["snapshot"])
+                for t in state.reach(con, repo, change):
+                    if t in all_tests and (all_tests[t][1] in tree.run_ids
+                                           or all_tests[t][1] not in known_runs):
+                        selected.setdefault(t, "reaches import-time state that changed")
+                import_state["trees"].append(state.summary(change))
+            run_all_reasons = []
+            import_check = []  # the suite was just collected
+
     if run_all_reasons:
         # a changed test module is still targeted whole, so its new tests run
         # and its deleted ones never reach pytest as node ids
@@ -1266,6 +1310,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "broadened": broadened,
         "units": units_block,
         "import_check": import_check,
+        "import_state": import_state,
         "flaky": flaky,
         "history": history,
         "evidence": ev,

@@ -21,10 +21,12 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
   native_commands  programs (by file name: "git", "node") that are not Python
                    and run no project Python: a test that starts one is
                    selected by a changed non-Python file, not by changed code
-  import_state     true: a full recorded run also stores a fingerprint of
-                   what import produced, and a run of everything for an
-                   import-time reason reports what selecting by it would
-                   have skipped (experimental, shadow only: see state.py)
+  import_state     true: a recorded run also stores a fingerprint of what
+                   import produced, and a change that would run everything
+                   only because import-time code changed selects the tests
+                   that can reach what import now produces differently
+                   (state.py). "shadow": keep running everything, and report
+                   what selecting would have skipped. PRONGS_IMPORT_STATE too
   ignore_docstrings  true: a docstring edit is not a change. Off by default:
                    a docstring is data a program can read (`__doc__`, a CLI's
                    help text). Also PRONGS_IGNORE_DOCSTRINGS=1
@@ -62,6 +64,14 @@ def names(repo: Path, name: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(v for v in value if isinstance(v, str))
+
+
+def import_state(repo: Path) -> str | None:
+    """'select' (true), 'shadow', or None: what the import-state rule does."""
+    value = os.environ.get("PRONGS_IMPORT_STATE") or _table(repo).get("import_state")
+    if value is True or (isinstance(value, str) and value.lower() in ("1", "true", "select")):
+        return "select"
+    return "shadow" if isinstance(value, str) and value.lower() == "shadow" else None
 
 
 def flag(repo: Path, name: str) -> bool:

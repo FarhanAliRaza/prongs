@@ -86,21 +86,17 @@ def import_check(repo: Path, modules: list[str]) -> dict:
     return out | {"wall_s": round(time.monotonic() - t0, 3)}
 
 
-IMPORT_TIME = ("module-level change in import-time file", "executed at import/collection time",
-               "collection lists the names of")
-
-
 def import_state_selection(repo: Path, aff: dict) -> tuple[set[str], dict] | None:
     """What the import-state rule (state.py) would select for a run that
     executes everything only because import-time code changed: the tests the
     remaining rules select, plus those that can reach what import now
     produces differently. None when the rule has nothing to go on."""
-    if not config.flag(repo, "import_state") or not aff.get("run_all_reasons") or not all(
-            r.startswith(IMPORT_TIME) for r in aff["run_all_reasons"]):
+    from prongs import mapdb, state
+
+    if config.import_state(repo) != "shadow" or not aff.get("run_all_reasons") or not all(
+            r.startswith(state.REASONS) for r in aff["run_all_reasons"]):
         return None
     import sqlite3
-
-    from prongs import mapdb, state
 
     con = sqlite3.connect(journal.map_path(repo))
     try:
@@ -119,8 +115,7 @@ def import_state_selection(repo: Path, aff: dict) -> tuple[set[str], dict] | Non
         tests = state.reach(con, repo, change) & set(aff["tests"])
     finally:
         con.close()
-    info = {"globals": len(change["globals"]), "classes": len(change["classes"]),
-            "names": change["names"][:20], "volatile": len(base.get("volatile", []))}
+    info = state.summary(change)
     return set(aff["shadow"]) | tests, info
 
 
@@ -230,6 +225,7 @@ def cmd_affected(args, force_all: str | None = None) -> dict:
         "units": sel.get("units", {}),
         "import_check": sel.get("import_check", []),
         "shadow": sel.get("shadow"),
+        "import_state": sel.get("import_state"),
         # flaky tests still run; their history is the receipt, and a failure
         # of one is reported as flaky, not as a failure
         "flaky": {
@@ -606,6 +602,8 @@ def cmd_run(args) -> dict:
     }
     if checked is not None:
         out["import_check"] = checked
+    if aff.get("import_state"):
+        out["import_state"] = aff["import_state"]
     baseline = shadow_baseline(repo, aff)
     shadow_rules: dict[str, set[str]] = {}
     if baseline is not None:

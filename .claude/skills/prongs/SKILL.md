@@ -70,6 +70,7 @@ Selection reasons you will see under `selected_by_reason`:
 | `reads changed file` | the test opened a tracked non-Python file that changed |
 | `lists the names of` | the test called `dir()`/`vars()` on a module or class that gained or lost a name |
 | `starts a process prongs could not record` | the test starts a process (not Python, or killed): it runs on any production change |
+| `reaches import-time state that changed` | import-time code changed and `import_state` is on: the test entered a function naming a global or class that import now builds differently |
 | `recent status change` | the outcome flipped within the last `history_window` rollups |
 | `unmapped test (conservative)` | the map holds no dependency evidence for it |
 
@@ -152,6 +153,7 @@ flaky_window = 50
 flaky_retries = 2
 inert = ["*.svg", "assets/*"]   # extra files that can never affect tests; never matches .py
 ignore_docstrings = false       # true: a docstring edit is not a change
+import_state = false            # true: import-time changes select by what import produced, not everything
 ```
 
 Useful environment variables: `PRONGS_DIR` (state directory, default `.prongs`; share one across worktrees to pool runs), `PRONGS_RUN_ARGS`, `PRONGS_WARM_ARGS`, `PRONGS_WARM_DB_TEST` (a test the daemon runs at warm-up so forked children inherit the test database).

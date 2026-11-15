@@ -163,6 +163,26 @@ A non-Python file no test was ever seen reading still runs everything, unless it
 These rules cannot see a file read by a C library or by a child that is not Python, a module's names taken from `module.__dict__` directly, or a process started while collecting.
 Run `prongs audit` on your suite to check them.
 
+**Import-time code.** A changed module-level statement, class attribute, or function that a module body calls runs everything by default: function entry cannot say which tests use the objects that code built.
+With `import_state = true`, prongs compares what import *produced* instead.
+
+- A recorded run stores a fingerprint of every project module global and every project class attribute, taken after collection in a fresh process. Functions are fingerprinted without their code, since a changed body is found by the tests that enter it.
+- When a change would run everything only for an import-time reason, the suite is collected once (nothing runs) and fingerprinted again.
+- Selected are the tests the other rules select, plus those that can reach what changed: tests that entered a function whose source names a changed global, a changed class or one of its subclasses, or anything that holds a changed class or an instance of one; and tests that entered a method of a changed class.
+- A changed function body that leaves import's result as it was selects only the tests that enter the function.
+- If the tree does not import, everything runs and reports the error.
+
+The result's `import_state` block lists the run-all reasons it overrode and what changed.
+What differs between two imports of the same tree (a lock, a timestamp, a cache keyed by a salted hash) is found by taking the stored snapshot twice, and is never compared.
+
+```toml
+[tool.prongs]
+import_state = true      # or "shadow": keep running everything, and report what selecting would skip
+```
+
+This rule cannot see state that no project global or class reaches (a registry inside a third-party library, the contents of an `lru_cache`), or a name reached only through a computed string.
+It needs the diff to come from the tree the map was recorded on, so it does not apply with `--base`.
+
 A docstring is data a program can read, so a docstring edit is a change by default.
 Set `ignore_docstrings = true` to treat docstring edits as formatting.
 
@@ -254,13 +274,14 @@ flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing i
 flaky_retries = 2    # re-run a failing flaky test alone up to N times
 ignore_docstrings = false  # true: a docstring edit is not a change
 native_commands = []       # programs that run no project Python: "git", "node"
-import_state = false       # true: fingerprint import-time state, audited in shadow
+import_state = false       # true: select by what import produces; "shadow": only report
 ```
 
 | Variable | Meaning |
 |---|---|
 | `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES` | Override the settings above |
 | `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
+| `PRONGS_IMPORT_STATE=1` or `=shadow` | Like `import_state = true` or `"shadow"` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
 | `PRONGS_RECORD_CHILDREN=0` | Do not record inside child processes: every test that starts one keeps its process marker |
 | `PRONGS_DIR` | State directory, relative to the repository root (default `.prongs`); point worktrees at one directory to pool runs |
@@ -311,11 +332,7 @@ what the remaining rules would have selected, and every skipped test whose outco
 Each such run appends one line to `.prongs/shadow.jsonl`, and `prongs shadow` summarizes them by rule and by run-all reason.
 A difference is a miss of the rule, a flake, or fallout from a selected failure: read it before trusting or relaxing a rule.
 
-**Import state (experimental).** Code that runs at import runs everything when it changes, because function entry cannot say which tests use what that code built.
-With `import_state = true`, a full recorded run also stores a fingerprint of every project module global and class attribute after collection.
-A run of everything for an import-time reason then reports a second shadow rule, `import_state`:
-the tests that entered a function naming a global or attribute whose fingerprint changed, or a method of a changed class.
-Nothing selects by it. It exists to be measured.
+With `import_state = "shadow"`, the report carries a second rule, `import_state`: what selecting by import state (see "Import-time code" above) would have skipped.
 
 ## Audit mode
 

@@ -231,7 +231,10 @@ def test_a_run_of_everything_audits_the_rules_it_overrode(project):
 
 
 
-def test_import_state_is_audited_in_shadow_when_asked_for(project):
+@pytest.fixture
+def tables(project):
+    """The project plus a module whose globals import-time code builds, with
+    the import-state rule on and a snapshot recorded."""
     project.write("pkg/tables.py", "from pkg.mod import build\n\nTABLE = {'k': 1}\n"
                   "OTHER = build()\n\n\ndef lookup():\n    return TABLE['k']\n\n\n"
                   "def other():\n    return OTHER['v']\n")
@@ -240,34 +243,100 @@ def test_import_state_is_audited_in_shadow_when_asked_for(project):
                   "    assert tables.other() == 1\n")
     project.write("pyproject.toml", project.read("pyproject.toml")
                   + "\n[tool.prongs]\nimport_state = true\n")
-    project.commit("tables, and the import-state shadow")
+    project.commit("tables, and the import-state rule")
     assert project.record().returncode == 0
-    project.rollup()
-    con = project.db()
+    return project
+
+
+def test_a_recorded_run_stores_what_import_produced(tables):
+    tables.rollup()
+    con = tables.db()
     key = con.execute("SELECT journal_key FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0]
     con.close()
-    snap = json.loads((journal.state_dir(project.path) / "state" / f"{key}.json").read_text())
+    snap = json.loads((journal.state_dir(tables.path) / "state" / f"{key}.json").read_text())
     assert sorted(snap["modules"]["pkg/tables.py"]) == ["OTHER", "TABLE", "build", "lookup", "other"]
-    assert snap["volatile"] == []
-    # module-level data changes: everything runs; import-state would select
-    # the test that reaches TABLE, and the one whose outcome changed is in it
-    project.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
-    out = project.cli("run", "--no-record", code=1)
+    assert snap["volatile"] == {"globals": {}, "classes": {}} and snap["parts"] == {}
+
+
+def test_changed_module_level_data_selects_the_tests_that_reach_it(tables):
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    out = tables.cli("affected")
+    # not everything, and not every test that touches the file: test_other
+    # reads OTHER, which is what it was
+    assert out["mode"] == "select" and out["run_all_reasons"] == []
+    assert out["import_state"] == {
+        "overrode": ["module-level change in import-time file: pkg/tables.py"],
+        "trees": [{"globals": 1, "classes": 0, "holders": 0, "names": ["TABLE"]}],
+    }
+    assert {t: out_reason for t, out_reason in tables.select()["selected"].items()} == {
+        T + "test_spawn": "starts a process prongs could not record",
+        T + "test_git": "starts a process prongs could not record",
+        "tests/test_t.py::test_lookup": "reaches import-time state that changed",
+    }
+    run = tables.cli("run", "--no-record", code=1)
+    assert run["summary"]["failed"] == 1 and run["selection"]["mode"] == "select"
+
+
+def test_a_changed_import_time_function_selects_by_what_it_built(tables):
+    # build() runs while pkg/tables.py is imported: OTHER holds what it
+    # returned, and test_other reads OTHER without ever entering build()
+    tables.edit("pkg/mod.py", 'return {"v": 1}', 'return {"v": 3}')
+    sel = tables.select()
+    assert sel["mode"] == "select" and sel["import_state"] == {
+        "overrode": ["executed at import/collection time: pkg/mod.py::build"],
+        "trees": [{"globals": 1, "classes": 0, "holders": 0, "names": ["OTHER"]}],
+    }
+    assert {t.split("::")[-1]: why for t, why in sel["selected"].items()} == {
+        "test_one": "touches changed function pkg/mod.py::build",
+        "test_two": "touches changed function pkg/mod.py::build",
+        "test_spawn": "starts a process prongs could not record",
+        "test_git": "starts a process prongs could not record",
+        "test_other": "reaches import-time state that changed",
+    }
+    assert tables.cli("run", "--no-record", code=1)["summary"]["failed"] == 3
+    # a body change that leaves what import built as it was: only the tests
+    # that enter the function
+    tables.git("checkout", "--", "pkg/mod.py")
+    tables.edit("pkg/mod.py", 'return {"v": 1}', 'return dict(v=1)')
+    sel = tables.select()
+    assert sel["import_state"]["trees"] == [
+        {"globals": 0, "classes": 0, "holders": 0, "names": []}]
+    assert "tests/test_t.py::test_other" not in sel["selected"]
+
+
+def test_a_changed_class_selects_whoever_holds_it(tables):
+    tables.write("pkg/shapes.py", "class Shape:\n    sides = 4\n\n\nDEFAULT = Shape()\n\n\n"
+                 "def default_sides():\n    return DEFAULT.sides\n\n\ndef unrelated():\n    return 0\n")
+    tables.write("tests/test_s.py", "from pkg import shapes\n\n\ndef test_default():\n"
+                 "    assert shapes.default_sides() == 4\n\n\ndef test_unrelated():\n"
+                 "    assert shapes.unrelated() == 0\n")
+    tables.commit("shapes")
+    assert tables.record().returncode == 0
+    tables.edit("pkg/shapes.py", "sides = 4", "sides = 5")
+    sel = tables.select()
+    # DEFAULT is an instance of the changed class: default_sides() names it
+    assert sel["import_state"]["trees"] == [
+        {"globals": 0, "classes": 1, "holders": 1, "names": ["DEFAULT", "Shape"]}]
+    assert sel["selected"]["tests/test_s.py::test_default"] == "reaches import-time state that changed"
+    assert "tests/test_s.py::test_unrelated" not in sel["selected"]
+
+
+def test_import_state_in_shadow_runs_everything_and_reports(tables):
+    tables.write("pyproject.toml", tables.read("pyproject.toml").replace(
+        "import_state = true", 'import_state = "shadow"\ninert = ["pyproject.toml"]'))
+    tables.edit("pkg/mod.py", 'return {"v": 1}', 'return {"v": 3}')
+    out = tables.cli("run", "--no-record", code=1)
     assert out["selection"]["mode"] == "run_all"
-    assert out["import_state"] == {"globals": 1, "classes": 0, "names": ["TABLE"], "volatile": 0}
-    rules = out["shadow"]["rules"]
-    # (the two tests that start a process run on any code change)
-    assert rules["import_state"] == {
-        "would_select": 4, "would_skip": 6, "missed": [], "n_missed": 0}
-    assert rules["selection"]["would_select"] == 4
-    # an import-time function changes what a global holds: the tests that
-    # reach the global are found though they never enter the function
-    project.git("checkout", "--", "pkg/tables.py")
-    project.edit("pkg/mod.py", 'return {"v": 1}', 'return {"v": 3}')
-    out = project.cli("run", "--no-record", code=1)
-    assert out["selection"]["run_all_reasons"] == [
-        "executed at import/collection time: pkg/mod.py::build"]
-    assert out["import_state"]["names"] == ["OTHER"]
     assert out["shadow"]["status_changes"] == 3
-    assert out["shadow"]["rules"]["import_state"]["n_missed"] == 0
-    assert out["shadow"]["rules"]["selection"]["missed"] == ["tests/test_t.py::test_other"]
+    rules = out["shadow"]["rules"]
+    assert rules["import_state"]["n_missed"] == 0
+    # without it, selecting would have skipped the test that reads OTHER
+    assert rules["selection"]["missed"] == ["tests/test_t.py::test_other"]
+
+
+def test_a_tree_that_does_not_import_runs_everything(tables):
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 1}[0]")
+    sel = tables.select()
+    assert sel["mode"] == "run_all" and sel["reasons"] == [
+        "module-level change in import-time file: pkg/tables.py",
+        "import check failed: collecting the suite exited 2"]
