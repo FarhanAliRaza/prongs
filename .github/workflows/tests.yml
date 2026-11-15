@@ -12,6 +12,8 @@
 #                  request jobs uploaded, run everything recorded, save the map
 # pull request     restore the newest map, `prongs run` the affected tests,
 #                  then the full suite, upload this job's journals
+# by hand          either of the two, on any branch (Actions > tests > Run
+#                  workflow): a branch can be tried before it has a pull request
 
 name: tests
 
@@ -21,6 +23,12 @@ on:
   pull_request:
   schedule:
     - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      select:
+        description: Select like a pull request (off: run everything recorded and save the map)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -31,10 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PRONGS_IMPORT_STATE: "1"  # import-time changes select too (the full run is still the gate)
+      SELECT: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.select) }}
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,7 +64,7 @@ jobs:
           restore-keys: prongs-map-py${{ matrix.python }}-
 
       - name: Collect pull-request journals
-        if: github.event_name != 'pull_request'
+        if: env.SELECT != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -71,16 +80,16 @@ jobs:
 
       - name: Affected tests (prongs run)
         id: affected
-        if: github.event_name == 'pull_request'
+        if: env.SELECT == 'true'
         shell: bash
         run: prongs run | tee "$RUNNER_TEMP/prongs-result.json"
 
       - name: Full suite (the gate)
-        if: github.event_name == 'pull_request'
+        if: env.SELECT == 'true'
         run: python -m pytest
 
       - name: Selection miss check
-        if: github.event_name == 'pull_request' && always() && steps.affected.outcome != 'skipped'
+        if: env.SELECT == 'true' && always() && steps.affected.outcome != 'skipped'
         run: |
           # `prongs run` passed while the full suite failed: the selector
           # skipped a test the change broke. Fail loudly, not just via pytest.
@@ -90,26 +99,26 @@ jobs:
           fi
 
       - name: Full suite, recorded
-        if: github.event_name != 'pull_request'
+        if: env.SELECT != 'true'
         run: python -m pytest --prongs-cov
 
       - name: Save this job's journals
-        if: always() && github.event_name == 'pull_request'
+        if: always() && env.SELECT == 'true'
         run: prongs ci save --no-map "$RUNNER_TEMP/prongs-out"
 
       - uses: actions/upload-artifact@v4
-        if: always() && github.event_name == 'pull_request'
+        if: always() && env.SELECT == 'true'
         with:
           name: prongs-journals-py${{ matrix.python }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/prongs-out
           retention-days: 14
 
       - name: Save the map
-        if: always() && github.event_name != 'pull_request'
+        if: always() && env.SELECT != 'true'
         run: prongs ci save --no-journals "$RUNNER_TEMP/prongs-ci/map"
 
       - uses: actions/cache/save@v4
-        if: always() && github.event_name != 'pull_request'
+        if: always() && env.SELECT != 'true'
         with:
           path: ${{ runner.temp }}/prongs-ci/map
           key: prongs-map-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

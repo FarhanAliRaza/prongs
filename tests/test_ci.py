@@ -221,3 +221,40 @@ def test_a_foreign_journal_never_makes_restore_fetch_history(recorded, tmp_path)
     assert len(res["journals"]["foreign"]) == 1
     assert [f["args"][0] for f in res["history"]["fetches"]] == ["--deepen=64"]
     assert res["history"]["still_missing"] == [] and res["warnings"] == []
+
+
+def test_each_configuration_of_one_job_selects_from_its_own_map(repo, tmp_path):
+    """A job that runs the suite once per configuration (plainly, against a
+    service): a test runs other code in each, so each configuration has a
+    state directory and an artifact of its own, outside the checkout."""
+    repo.write("pkg/store.py", "def memory():\n    return 1\n\ndef service():\n    return 2 - 1\n")
+    repo.write("tests/test_store.py",
+               "import os\nfrom pkg import store\n\n"
+               "def test_store():\n"
+               "    assert (store.service if os.environ.get('SERVICE') else store.memory)() == 1\n")
+    repo.commit("store")
+    store = "tests/test_store.py::test_store"
+
+    def configurations(checkout: Path) -> dict[str, Repo]:
+        return {
+            name: Repo(checkout, {"PRONGS_DIR": str(tmp_path / "state" / checkout.name / name), **env})
+            for name, env in (("plain", {}), ("service", {"SERVICE": "1"}))
+        }
+
+    for name, cfg in configurations(repo.path).items():
+        p = cfg.record()
+        assert p.returncode == 0, p.stdout + p.stderr
+        assert cfg.cli("ci", "save", str(tmp_path / "art" / name))["map"]["tests"] == 4
+    assert repo.git("status", "--porcelain") == ""  # neither left anything in the checkout
+
+    job = configurations(clone(repo, tmp_path / "job").path)
+    for name, cfg in job.items():
+        assert cfg.cli("ci", "restore", str(tmp_path / "art" / name))["map"]["installed"] is True
+    job["plain"].edit("pkg/store.py", "return 2 - 1", "return 3 - 2")
+    selected = {name: (out["mode"], out["tests"])
+                for name, cfg in job.items() for out in [cfg.cli("affected")]}
+    assert selected == {"plain": ("select", []), "service": ("select", [store])}
+    ran = job["service"].cli("run")
+    assert (ran["summary"]["status"], ran["summary"]["ran"]) == ("passed", 1)
+    job["plain"].edit("pkg/store.py", "return 1\n\ndef service", "return 0 + 1\n\ndef service")
+    assert job["plain"].cli("affected")["tests"] == [store]
