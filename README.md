@@ -221,9 +221,10 @@ A pass reports it under `flaky`; failing every time counts it as a failure.
 **Order-dependent tests.** A selected run is the suite with tests left out, so a test can meet state that an earlier test left behind and that, in the full suite, a test in between tidies up.
 The failures of a selected run are therefore run once more, in a fresh process that holds only them.
 What the change broke fails there too, and is a failure.
-A test that passes there is reported under `order_dependent` and does not fail the run; the pass is recorded next to the failure, so the test is flaky from then on.
-This cannot see a change that makes one test break another through shared state: the full run on the default branch finds that.
-Set `isolate_failures = 0` to count every failure as one.
+A test that passes there is order-dependent, and passing alone proves nothing about the suite: the change may be what makes one test break another.
+So the whole suite is then run, in a process of its own, and its verdict is the run's. The result lists the tests under `order_dependent` with how they fared alone and in the suite, and the selected run under `selected_run`.
+A test that failed after the selected tests and passed in the suite has both outcomes on one tree: it is flaky from then on, and its retries settle it without the suite.
+Set `isolate_failures = 1` to take an isolated pass at its word (reported, not a failure, no suite run), or `0` to count every failure as one.
 
 Selected tests run in the order pytest is handed them: whole files first (those in a parent directory before those below it), then single tests.
 A parametrized test is handed over as its function, with the known parametrizations that are not selected deselected (`deselect` in the result), never as `name[id]`: an id built from a timestamp or a process id is different in the next run, and pytest refuses a whole run over one id it cannot find.
@@ -310,7 +311,7 @@ history_window = 3   # a test whose outcome flipped in the last N rollups is sel
 max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
 flaky_retries = 2    # re-run a failing flaky test alone up to N times
-isolate_failures = 1 # re-run a selected run's failures without the other selected tests (0: off)
+isolate_failures = 2 # a failure that passes without the other selected tests is settled by the whole suite (1: excused; 0: a failure)
 ignore_docstrings = false  # true: a docstring edit is not a change
 native_commands = []       # programs that run no project Python: "git", "node"
 import_state = false       # true: select by what import produces; "shadow": only report

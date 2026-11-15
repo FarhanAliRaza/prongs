@@ -151,7 +151,7 @@ history_window = 3
 max_map_age = 50
 flaky_window = 50
 flaky_retries = 2
-isolate_failures = 1            # a selected run's failures are re-run without the other selected tests
+isolate_failures = 2            # a failure that passes without the other selected tests is settled by the whole suite
 inert = ["*.svg", "assets/*"]   # extra files that can never affect tests; never matches .py
 ignore_docstrings = false       # true: a docstring edit is not a change
 import_state = false            # true: import-time changes select by what import produced, not everything
@@ -167,7 +167,9 @@ Pull requests restore the map, run `prongs run` as the gate, and upload their jo
 With `import_state` on, the artifacts carry the import-state snapshots too, so import-time changes are selected from in CI as well.
 With no map, the gate runs everything, so it never depends on the cache.
 
-A failure in a selected run that passes in a fresh process without the other selected tests is reported under `order_dependent`, not as a failure: another selected test left state behind that, in the full suite, a test in between tidies up.
+A failure in a selected run that passes in a fresh process without the other selected tests is order-dependent: another selected test left state behind. The whole suite is then run and its verdict stands; the result lists such tests under `order_dependent` (how they fared alone and in the suite) and reports `selection.mode` as `run_all`.
+
+On Linux the recorder also asks the kernel which project files any process opened during each test, so a test that runs `git` or `node` depends on what was opened rather than on every change, and a changed non-Python file nothing opened no longer runs everything (`units.unread` lists those). When the installed packages differ from the ones the map was recorded with, everything runs.
 
 ```yaml
 - run: python -m prongs ci restore "$RUNNER_TEMP/prongs-ci"
