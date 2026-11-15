@@ -328,13 +328,10 @@ class ProngsCov:
         info = self.run_info()
         res = journal.append(jdir, self.rootpath, self.records, info, key=key)
         if self._want_state and info["scope"] != "collect":
-            # what import produced, taken in two fresh processes: what differs
-            # between two imports of one tree says nothing about a change
-            first = state.collect(self.rootpath, self._modules)["snapshot"]
-            again = state.collect(self.rootpath, self._modules)["snapshot"]
-            if first is not None and again is not None:
-                state.save(Path(self.rootpath), res["key"],
-                           state.stored(first, state.volatile(first, again)))
+            # what import produced in this tree, over the whole suite's
+            # modules: a later change is compared with it
+            state.record(self.rootpath, res["key"],
+                         state.suite_modules(Path(self.rootpath), self._modules))
         sys.stderr.write(
             f"\n[prongs] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"

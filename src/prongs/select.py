@@ -1013,14 +1013,22 @@ def targets_for(selected: set[str], selected_files, all_tests) -> list[str]:
     whose every known test is selected runs as one file too (and so does
     every module when everything runs): pytest resolves one path instead of
     one id per test, which on DRF (1,626 ids) cost ~10% of the suite's wall
-    time. A whole-file target subsumes that file's node ids."""
+    time. A whole-file target subsumes that file's node ids.
+
+    Files in a parent directory come before files below it. pytest collects
+    a file target's directory afresh, with new nodes for its subdirectories;
+    from pytest 9 a conftest's fixtures belong to the directory node they
+    were first collected under, so a target in tests/ after one in tests/sub/
+    leaves every later tests/sub/ id without tests/sub/conftest.py's
+    fixtures ("fixture not found")."""
     modules: dict[str, list[str]] = {}
     for t in all_tests:
         modules.setdefault(t.split("::", 1)[0], []).append(t)
     files = set(selected_files) | {
         mod for mod, tests in modules.items() if all(t in selected for t in tests)
     }
-    return sorted(files) + sorted(t for t in selected if t.split("::", 1)[0] not in files)
+    return (sorted(files, key=lambda f: (f.count("/"), f))
+            + sorted(t for t in selected if t.split("::", 1)[0] not in files))
 
 
 def broadening(path: str, quals: list[str]) -> str:
@@ -1155,6 +1163,10 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     # import-time code changed and nothing else asks for everything: select
     # by what import now produces differently (state.py), when every tree
     # that saw such a change has a snapshot to compare with
+    if head is None and config.import_state(repo) is not None:
+        jdir = journal.journal_dir(repo)
+        state.prune(repo, {r["journal_key"] for r in contributing}
+                    | {f.stem for f in journal.pending_all(jdir)})
     state_bases: list | None = None
     if (run_all_reasons and head is None and config.import_state(repo) == "select"
             and all(r.startswith(state.REASONS) for r in run_all_reasons)):
@@ -1173,6 +1185,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             state_bases = None
 
     known_runs = {rid for t in trees if t.run_ids for rid in t.run_ids} | set(missing)
+    by_state: dict[int, set[str]] = {}  # tree -> files left to the import-state rule
     selected: dict[str, str] = {}  # test_id -> reason
     selected_files: dict[str, str] = {}
     for t, (_, deps_run) in all_tests.items():
@@ -1203,6 +1216,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
                 # what this module's import-time code built is compared
                 # itself: the tests that reach what changed, not every test
                 # that touches the file
+                by_state.setdefault(id(tree), set()).add(path)
                 continue
             rows = con.execute(
                 "SELECT DISTINCT t.test_id FROM tests t JOIN current_links l ON l.test_id=t.id "
@@ -1240,18 +1254,23 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         if not mapped:
             selected.setdefault(t, "unmapped test (conservative)")
 
-    skipped = {
-        t: "no overlap between this test's coverage map and the diff"
-        for t in all_tests
-        if t not in selected
-    }
     import_state = None
     if state_bases is not None:
         got = state.collect(repo, sorted({t.split("::", 1)[0] for t in all_tests}))
+        # a changed module one of the two snapshots never imported (a run
+        # that collected other test modules) cannot be compared
+        blind = sorted({
+            path for tree, snap in state_bases for path in by_state.get(id(tree), ())
+            if got["snapshot"] is not None
+            and (path not in snap["modules"] or path not in got["snapshot"]["modules"])
+        })
         if not got["ok"] or got["snapshot"] is None:
             # the tree does not import: everything runs, and reports it
             run_all_reasons.append(
                 f"import check failed: collecting the suite exited {got['exit']}")
+        elif blind:
+            run_all_reasons.append(
+                "no import-state snapshot covers " + ", ".join(blind))
         else:
             import_state = {"overrode": run_all_reasons, "trees": []}
             for tree, snap in state_bases:
@@ -1296,6 +1315,11 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
 
     targets = targets_for(set(selected), selected_files, all_tests)
     con.close()
+    skipped = {
+        t: "no overlap between this test's coverage map and the diff"
+        for t in all_tests
+        if t not in selected
+    }
     return {
         "mode": "select",
         "changed_functions": changed_funcs,

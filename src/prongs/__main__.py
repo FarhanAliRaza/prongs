@@ -576,6 +576,35 @@ def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
         entry["counted_as"] = "flaky" if "passed" in entry["retries"] else "failure"
 
 
+def rerun_failures(repo: Path, failures: list[dict], record: bool) -> list[dict]:
+    """The failures of a selected run that pass in a fresh process holding
+    only the failures: order-dependent ones. A selected run is the suite
+    with tests left out, so a test can meet state a test before it left
+    behind and that, in the suite, a test in between tidies up. What the
+    change broke fails here as it did there.
+
+    With `record`, a re-run in which something passed is kept as a run of
+    its own: the pass lands in history next to the failure, on one tree (the
+    test is flaky from then on), and the map gets what the test touches when
+    it passes. It stores no import-state snapshot: the run it follows has
+    this tree's."""
+    from prongs.audit import observe
+
+    obs = observe(repo, sys.executable, shlex.split(os.environ.get("PRONGS_RUN_ARGS", "")),
+                  targets=sorted(r["id"] for r in failures), record=record,
+                  env={"PRONGS_IMPORT_STATE": "0"})
+    passed = [r for r in failures if obs["statuses"].get(r["id"]) == "passed"]
+    if not passed and obs["journal"]:
+        path = journal.find(journal.journal_dir(repo), obs["journal"])
+        if path:
+            path.unlink()  # the same failures again: nothing the first run did not say
+    return [
+        {"test": r["id"], "error": exception_line(r), "alone": "passed",
+         "why": "failed after the other selected tests, passed in a fresh process without them"}
+        for r in passed
+    ]
+
+
 def cmd_run(args) -> dict:
     t0 = time.monotonic()
     repo = Path.cwd()
@@ -651,12 +680,21 @@ def cmd_run(args) -> dict:
     t_retry = time.monotonic()
     retry_flaky(repo, flaky, cfg["flaky_retries"], record=mode is not None,
                 warm=out["executor"] == "daemon")
-    retry_s = time.monotonic() - t_retry
     failures = [r for r in results if r["status"] == "failed"
                 and flaky.get(r["id"], {}).get("counted_as") != "flaky"]
+    order_dependent: list[dict] = []
+    # a flaky test has its retries, and its own verdict
+    suspects = [r for r in failures if r["id"] not in flaky]
+    if suspects and aff["mode"] == "select" and cfg["isolate_failures"]:
+        order_dependent = rerun_failures(repo, suspects, record=mode == "coverage")
+        excused = {e["test"] for e in order_dependent}
+        failures = [r for r in failures if r["id"] not in excused]
+    retry_s = time.monotonic() - t_retry
     out["failures"] = group_failures(failures)  # passes are summarized, not listed
     if flaky:
         out["flaky"] = list(flaky.values())
+    if order_dependent:
+        out["order_dependent"] = order_dependent
     ran = len(results)
     out["conservation"] = conservation(aff, results)
     if baseline is not None:
@@ -700,6 +738,7 @@ def cmd_run(args) -> dict:
             "passed_on_retry": sum(f.get("counted_as") == "flaky" for f in flaky.values()),
             "retries": cfg["flaky_retries"],
         },
+        "order_dependent": len(order_dependent),
         "ran": ran,
         "unrun_targets": unrun,
         "complete": not unrun and not error,
@@ -804,6 +843,11 @@ def main():
                            help="re-run a failing flaky test alone up to N times; a pass makes "
                                 "it a flake, else it is a failure (default: [tool.prongs] "
                                 "flaky_retries, else 2; 0: a flaky failure is a failure)")
+            p.add_argument("--isolate-failures", type=int, default=None, metavar="0|1",
+                           help="re-run the failures of a selected run in a fresh process "
+                                "without the other selected tests; one that passes there is "
+                                "order-dependent, not a failure (default: [tool.prongs] "
+                                "isolate_failures, else 1; 0: it is a failure)")
         if name == "audit":
             p.add_argument("--pytest-args", default=None,
                            help="extra pytest arguments for the full run "

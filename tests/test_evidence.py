@@ -340,3 +340,81 @@ def test_a_tree_that_does_not_import_runs_everything(tables):
     assert sel["mode"] == "run_all" and sel["reasons"] == [
         "module-level change in import-time file: pkg/tables.py",
         "import check failed: collecting the suite exited 2"]
+
+
+def snapshots(repo) -> list[str]:
+    return sorted(p.stem for p in (journal.state_dir(repo.path) / "state").glob("*.json"))
+
+
+def test_selection_and_skip_counts_cover_every_test(tables):
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    sel = tables.select()
+    assert (sel["n_selected"], sel["n_skipped"], sel["n_total"]) == (3, 7, 10)
+
+
+def test_a_partial_run_snapshots_the_whole_suite(tables):
+    tables.rollup()
+    full = snapshots(tables)
+    # one test of one module: the snapshot still holds what the other test
+    # module imports, so a later change there can be compared with it
+    assert tables.record("tests/test_e.py::test_plain").returncode == 0
+    (new,) = set(snapshots(tables)) - set(full)
+    snap = json.loads((journal.state_dir(tables.path) / "state" / f"{new}.json").read_text())
+    assert sorted(snap["modules"]) == [
+        "pkg/__init__.py", "pkg/mod.py", "pkg/tables.py", "tests/test_e.py", "tests/test_t.py"]
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    sel = tables.select()
+    assert sel["mode"] == "select"
+    assert sel["selected"]["tests/test_t.py::test_lookup"] == "reaches import-time state that changed"
+
+
+def test_a_module_no_snapshot_covers_runs_everything(tables):
+    tables.rollup()
+    (key,) = snapshots(tables)
+    path = journal.state_dir(tables.path) / "state" / f"{key}.json"
+    snap = json.loads(path.read_text())
+    del snap["modules"]["pkg/tables.py"]
+    path.write_text(json.dumps(snap))
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    sel = tables.select()
+    assert sel["mode"] == "run_all" and sel["reasons"] == [
+        "module-level change in import-time file: pkg/tables.py",
+        "no import-state snapshot covers pkg/tables.py"]
+
+
+def test_snapshots_of_runs_that_are_no_longer_evidence_are_deleted(tables):
+    tables.rollup()
+    (first,) = snapshots(tables)
+    assert tables.record().returncode == 0  # a newer full run: the evidence now
+    assert len(snapshots(tables)) == 2
+    tables.select()
+    (kept,) = snapshots(tables)
+    assert kept != first
+
+
+def test_snapshots_travel_with_the_ci_artifacts(tables, tmp_path):
+    import subprocess
+
+    from conftest import Repo
+
+    tables.rollup()
+    (key,) = snapshots(tables)
+    art = tmp_path / "artifact"
+    assert tables.cli("ci", "save", str(art))["states"] == [key]
+    assert json.loads((art / "manifest.json").read_text())["states"] == [key]
+    subprocess.run(["git", "clone", "-q", tables.path.as_uri(), str(tmp_path / "job")],
+                   check=True, capture_output=True)
+    job = Repo(tmp_path / "job")
+    assert job.cli("ci", "restore", str(art))["states"] == [key]
+    assert snapshots(job) == [key]
+    # a pull request that changes import-time code: selected in the fresh
+    # clone, from the snapshot the default branch's job recorded
+    job.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    out = job.cli("affected")
+    assert out["mode"] == "select" and out["run_all_reasons"] == []
+    assert "tests/test_t.py::test_lookup" in out["tests"]
+    assert "tests/test_t.py::test_other" not in out["tests"]
+    # and without it, everything
+    for f in (journal.state_dir(job.path) / "state").glob("*.json"):
+        f.unlink()
+    assert job.cli("affected")["mode"] == "run_all"

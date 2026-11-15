@@ -275,3 +275,24 @@ def test_cli_affected_reports_evidence(recorded):
     assert out["mode"] == "select" and out["targets"] == []
     assert out["evidence"]["last_full_run"]["id"] == 1 and out["evidence"]["commits_behind"] == 0
     assert "skip_receipt" in out
+
+
+def test_targets_keep_a_subdirectorys_conftest_fixtures(repo):
+    # pytest collects a file target's directory afresh. One in tests/ after
+    # a target in tests/sub/ would leave tests/sub/conftest.py's fixtures
+    # bound to a directory node later ids no longer hang from ("fixture
+    # 'thing' not found"): files in a parent directory go first
+    repo.write("tests/sub/conftest.py",
+               "import pytest\n\n\n@pytest.fixture\ndef thing():\n    return 1\n")
+    repo.write("tests/sub/test_s.py", "from pkg.mod import a, b\n\n\ndef test_x(thing):\n"
+               "    assert a() == thing\n\n\ndef test_y():\n    assert b() == 2\n")
+    repo.write("tests/sub/test_w.py", "from pkg.mod import a\n\n\ndef test_w():\n    assert a() == 1\n")
+    repo.write("tests/test_top.py", "from pkg.mod import a\n\n\ndef test_top():\n    assert a() == 1\n")
+    repo.commit("a subdirectory with a conftest")
+    assert repo.record().returncode == 0
+    repo.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    assert repo.select()["targets"] == [
+        "tests/test_top.py", "tests/sub/test_w.py",
+        "tests/sub/test_s.py::test_x", T_C, T_A]
+    out = repo.cli("run", "--no-record")
+    assert (out["summary"]["status"], out["summary"]["passed"], out["failures"]) == ("passed", 5, [])

@@ -11,6 +11,11 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
   flaky_retries    a flaky test that fails is re-run alone up to N times: a
                    pass makes the failure a flake, failing every time makes it
                    a failure (0: a flaky failure is a failure)
+  isolate_failures 1: a test that fails in a selected run is run again in a
+                   fresh process with only the other failures. Passing there,
+                   it is order-dependent (another selected test left state
+                   behind, and the tests that tidy up in a full run were not
+                   selected): reported, not a failure (0: a failure)
 
 [tool.prongs] only:
 
@@ -43,6 +48,7 @@ DEFAULTS = {
     "max_map_age": 50,
     "flaky_window": 50,
     "flaky_retries": 2,
+    "isolate_failures": 1,
 }
 
 

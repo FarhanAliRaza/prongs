@@ -151,6 +151,7 @@ history_window = 3
 max_map_age = 50
 flaky_window = 50
 flaky_retries = 2
+isolate_failures = 1            # a selected run's failures are re-run without the other selected tests
 inert = ["*.svg", "assets/*"]   # extra files that can never affect tests; never matches .py
 ignore_docstrings = false       # true: a docstring edit is not a change
 import_state = false            # true: import-time changes select by what import produced, not everything
@@ -163,7 +164,10 @@ Useful environment variables: `PRONGS_DIR` (state directory, default `.prongs`; 
 A CI job starts from a fresh clone, so the map travels as an artifact.
 Pushes to the default branch run the full suite with the recorder and save the map.
 Pull requests restore the map, run `prongs run` as the gate, and upload their journals so the next push folds them in as history.
+With `import_state` on, the artifacts carry the import-state snapshots too, so import-time changes are selected from in CI as well.
 With no map, the gate runs everything, so it never depends on the cache.
+
+A failure in a selected run that passes in a fresh process without the other selected tests is reported under `order_dependent`, not as a failure: another selected test left state behind that, in the full suite, a test in between tidies up.
 
 ```yaml
 - run: python -m prongs ci restore "$RUNNER_TEMP/prongs-ci"

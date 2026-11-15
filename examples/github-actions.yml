@@ -41,6 +41,12 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # select from a change to import-time code too (module-level statements,
+      # class attributes), by what import now produces differently. The
+      # snapshots it compares travel with the map and the journals. Leave it
+      # out, or set "shadow", to keep running everything for such a change.
+      PRONGS_IMPORT_STATE: "1"
     steps:
       - uses: actions/checkout@v4
         with:

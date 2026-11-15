@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import collections
@@ -635,6 +636,56 @@ def load(repo: Path, key: str) -> dict | None:
     except (OSError, ValueError):
         return None
     return snap if snap.get("version") == VERSION else None
+
+
+def prune(repo: Path, keep: set[str]) -> int:
+    """Delete the snapshots of runs that are no longer evidence; the number
+    deleted."""
+    n = 0
+    for f in state_dir(repo).glob("*.json"):
+        if f.stem not in keep:
+            f.unlink(missing_ok=True)
+            n += 1
+    return n
+
+
+def suite_modules(repo: Path, extra=()) -> list[str]:
+    """The test modules a snapshot collects: the ones the map knows (and that
+    still exist) and `extra`, the session's own. A session that ran three
+    tests then describes the same imports a full run does, so its snapshot
+    can be compared with one."""
+    from prongs import journal, mapdb
+
+    repo = Path(repo)
+    mods = set(extra)
+    db = journal.map_path(repo)
+    if db.exists():
+        try:
+            con = mapdb.connect(str(db))
+            try:
+                known = {t.split("::", 1)[0] for (t,) in con.execute(
+                    "SELECT test_id FROM tests WHERE retired_run IS NULL "
+                    "AND last_run IS NOT NULL AND test_id != ?", (mapdb.COLLECTION,))}
+            finally:
+                con.close()
+        except sqlite3.DatabaseError:
+            known = set()
+        mods |= {m for m in known if (repo / m).exists()}
+    return sorted(mods)
+
+
+def record(rootpath: str | Path, key: str, modules: list[str]) -> Path | None:
+    """Snapshot what import produces in this tree and store it under a run's
+    journal key. Two fresh processes, side by side: what differs between two
+    imports of one tree says nothing about a change."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(2) as pool:
+        first, again = (r["snapshot"] for r in pool.map(
+            lambda _: collect(rootpath, modules), range(2)))
+    if first is None or again is None:
+        return None
+    return save(Path(rootpath), key, stored(first, volatile(first, again)))
 
 
 def collect(rootpath: str | Path, modules: list[str]) -> dict:

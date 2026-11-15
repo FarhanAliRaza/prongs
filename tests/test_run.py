@@ -3,6 +3,7 @@ block that must balance, and failures grouped by root cause."""
 
 from __future__ import annotations
 
+import pytest
 from conftest import T_A, T_B, T_C
 
 from prongs.__main__ import exception_line, group_failures
@@ -200,3 +201,55 @@ def test_run_args_reach_a_cold_run(recorded):
     recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
     out = recorded.cli("run", code=2)
     assert out["summary"]["status"] == "error"
+
+
+SHARED = "SEEN = []\n\n\ndef reset():\n    SEEN.clear()\n"
+POLLUTED = (
+    "from pkg import shared\nfrom pkg.mod import a\n\n\n"
+    "def test_polluter():\n    shared.SEEN.append(a())\n\n\n"
+    "def test_cleanup():\n    shared.reset()\n\n\n"
+    "def test_victim():\n    assert a() == 1\n    assert shared.SEEN == []\n"
+)
+VICTIM = "tests/test_p.py::test_victim"
+
+
+@pytest.fixture
+def polluted(repo):
+    """A suite where one test leaves state behind that breaks a later one,
+    unless the test between them (which no change to a() selects) ran."""
+    repo.write("pkg/shared.py", SHARED)
+    repo.write("tests/test_p.py", POLLUTED)
+    repo.commit("a polluter, its cleanup and a victim")
+    p = repo.record()
+    assert p.returncode == 0, p.stdout + p.stderr
+    return repo
+
+
+def test_a_failure_that_passes_without_the_other_selected_tests_is_order_dependent(polluted):
+    polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    out = polluted.cli("run")
+    assert out["selection"]["mode"] == "select" and out["selection"]["n_selected"] == 4
+    assert out["failures"] == []
+    (entry,) = out["order_dependent"]
+    assert (entry["test"], entry["alone"]) == (VICTIM, "passed")
+    assert entry["error"] == "assert [1] == []"
+    s = out["summary"]
+    assert (s["status"], s["failed"], s["order_dependent"]) == ("passed", 0, 1)
+    # both outcomes are in history, on one tree: the next run knows
+    assert polluted.cli("affected")["flaky"][VICTIM]["failed"] == 1
+
+
+def test_a_failure_that_also_fails_alone_is_a_failure(polluted):
+    polluted.edit("pkg/mod.py", "return 1", "return 5")
+    out = polluted.cli("run", code=1)
+    assert "order_dependent" not in out
+    assert out["summary"]["status"] == "failed" and out["summary"]["order_dependent"] == 0
+    failed = {f["representative"] for f in out["failures"]} | {
+        t for f in out["failures"] for t in f["also_failed"]}
+    assert VICTIM in failed
+
+
+def test_failures_are_not_rerun_alone_when_asked_not_to(polluted):
+    polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    out = polluted.cli("run", "--isolate-failures", "0", code=1)
+    assert out["summary"]["status"] == "failed" and "order_dependent" not in out

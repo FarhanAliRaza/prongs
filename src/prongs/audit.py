@@ -58,7 +58,7 @@ def pytest_cmd(python: str, pytest_args=(), targets=()) -> list[str]:
 
 
 def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=(),
-            record: bool = False) -> dict:
+            record: bool = False, env: dict | None = None) -> dict:
     """Run pytest with the recorder on and return what it observed:
     {'exit', 'wall_s', 'statuses': {test_id: status}, 'collect_errors',
     'collect_skipped', 'journal', ['output']}. Everything comes from the run's
@@ -68,7 +68,8 @@ def observe(repo: Path, python: str = sys.executable, pytest_args=(), targets=()
     tmp = Path(tempfile.mkdtemp(prefix="prongs-audit-"))
     jdir = journal.journal_dir(repo) if record else tmp
     key = journal.new_key()
-    env = dict(os.environ, PRONGS_COV="1", PRONGS_JOURNAL=str(jdir), PRONGS_JOURNAL_KEY=key)
+    env = dict(os.environ, PRONGS_COV="1", PRONGS_JOURNAL=str(jdir), PRONGS_JOURNAL_KEY=key,
+               **(env or {}))
     t0 = time.monotonic()
     try:
         p = subprocess.run(

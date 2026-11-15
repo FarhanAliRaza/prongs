@@ -172,7 +172,10 @@ With `import_state = true`, prongs compares what import *produced* instead.
 - A changed function body that leaves import's result as it was selects only the tests that enter the function.
 - If the tree does not import, everything runs and reports the error.
 
+- If a changed module is in no snapshot to compare with, everything runs and says which.
+
 The result's `import_state` block lists the run-all reasons it overrode and what changed.
+A snapshot covers the modules the whole suite imports, whichever tests the run executed, and `prongs ci save` and `ci restore` carry the snapshots with the map and the journals.
 What differs between two imports of the same tree (a lock, a timestamp, a cache keyed by a salted hash) is found by taking the stored snapshot twice, and is never compared.
 
 ```toml
@@ -190,6 +193,15 @@ Set `ignore_docstrings = true` to treat docstring edits as formatting.
 Flaky tests still run.
 A failing flaky test is re-run alone up to `flaky_retries` times.
 A pass reports it under `flaky`; failing every time counts it as a failure.
+
+**Order-dependent tests.** A selected run is the suite with tests left out, so a test can meet state that an earlier test left behind and that, in the full suite, a test in between tidies up.
+The failures of a selected run are therefore run once more, in a fresh process that holds only them.
+What the change broke fails there too, and is a failure.
+A test that passes there is reported under `order_dependent` and does not fail the run; the pass is recorded next to the failure, so the test is flaky from then on.
+This cannot see a change that makes one test break another through shared state: the full run on the default branch finds that.
+Set `isolate_failures = 0` to count every failure as one.
+
+Selected tests run in the order pytest is handed them: whole files first (those in a parent directory before those below it), then single tests.
 
 **Books that balance.** Every `run` result carries a `conservation` block.
 It checks `collected == selected + run_all + skipped`, and that every planned test produced a result.
@@ -272,6 +284,7 @@ history_window = 3   # a test whose outcome flipped in the last N rollups is sel
 max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
 flaky_retries = 2    # re-run a failing flaky test alone up to N times
+isolate_failures = 1 # re-run a selected run's failures without the other selected tests (0: off)
 ignore_docstrings = false  # true: a docstring edit is not a change
 native_commands = []       # programs that run no project Python: "git", "node"
 import_state = false       # true: select by what import produces; "shadow": only report
@@ -279,7 +292,7 @@ import_state = false       # true: select by what import produces; "shadow": onl
 
 | Variable | Meaning |
 |---|---|
-| `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES` | Override the settings above |
+| `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES`, `PRONGS_ISOLATE_FAILURES` | Override the settings above |
 | `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
 | `PRONGS_IMPORT_STATE=1` or `=shadow` | Like `import_state = true` or `"shadow"` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
@@ -299,6 +312,7 @@ Pull requests restore that map, run `prongs run` as the gate, and upload their j
 The next push job folds those journals in as history, which feeds flaky detection.
 `ci restore` deepens a shallow clone until the map's evidence commits are present.
 A pull-request job that checks out the branch head, not the forge's test merge commit, can also restore its own earlier journals: they are this line of history's evidence, so a later push runs only what changed since the last one.
+With `import_state` on (set it in `[tool.prongs]`, or as `PRONGS_IMPORT_STATE=1` for every job), the artifacts also carry the import-state snapshots, so a pull request that changes import-time code is selected from, not run whole.
 With no map, `prongs run` runs everything and records it, so the gate never depends on the cache.
 See [`examples/github-actions.yml`](examples/github-actions.yml) for the full, commented workflow.
 

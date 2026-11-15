@@ -11,6 +11,9 @@ a directory:
                       journal files, the job's HEAD, versions
   map.sqlite          a consistent, compact snapshot of the map (VACUUM INTO)
   journal/*.sqlite    the journal files this job wrote (rolled up or not)
+  state/*.json        what import produced at the runs that are evidence
+                      (state.py), when the import-state rule is on: without
+                      them a change to import-time code runs everything
 
 The flow (examples/github-actions.yml has it as a workflow):
 
@@ -56,12 +59,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from prongs import __version__, journal, mapdb, provenance
+from prongs import __version__, journal, mapdb, provenance, state
 
 FORMAT = 1
 MANIFEST = "manifest.json"
 MAP = "map.sqlite"
 JOURNAL = "journal"
+STATE = "state"
 
 
 def _restored_path(repo: Path) -> Path:
@@ -120,6 +124,7 @@ def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = 
     if (out / MANIFEST).is_file():  # replacing an earlier save (a cache step's directory)
         (out / MAP).unlink(missing_ok=True)
         shutil.rmtree(out / JOURNAL, ignore_errors=True)
+        shutil.rmtree(out / STATE, ignore_errors=True)
     elif out.is_dir() and any(out.iterdir()):
         return {"error": f"{out} is not empty and holds no artifact: save into a new "
                          "directory, or into an earlier artifact to replace it"}
@@ -132,7 +137,9 @@ def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = 
         "head": provenance.git_head(repo),
         "map": None,
         "journals": [],
+        "states": [],
     }
+    states: set[str] = set()
     if with_map:
         db = journal.map_path(repo)
         mapdb.rollup(db, jdir)  # the snapshot holds this job's runs
@@ -145,6 +152,11 @@ def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = 
             finally:
                 con.close()
             manifest["map"] = _map_summary(target) | {"bytes": target.stat().st_size}
+            con = mapdb.connect(str(db))
+            try:
+                states |= {r["journal_key"] for r in mapdb.contributing_runs(con)}
+            finally:
+                con.close()
     if with_journals:
         imported = _restored(repo)
         dest = out / JOURNAL
@@ -157,14 +169,22 @@ def save(repo: Path, out: Path, *, with_map: bool = True, with_journals: bool = 
                 continue
             dest.mkdir(exist_ok=True)
             shutil.copy2(f, dest / f.name)
+            states.add(run["key"])
             manifest["journals"].append({
                 "key": run["key"], "commit": run["commit_sha"], "scope": run["scope"],
                 "mode": run["mode"], "finished_at": run["finished_at"],
                 "n_observed": run["n_observed"],
             })
+    for key in sorted(states):
+        f = state.state_dir(repo) / f"{key}.json"
+        if f.is_file():
+            (out / STATE).mkdir(exist_ok=True)
+            shutil.copy2(f, out / STATE / f.name)
+            manifest["states"].append(key)
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return {"saved": str(out), "map": manifest["map"],
-            "journals": [j["key"] for j in manifest["journals"]]}
+            "journals": [j["key"] for j in manifest["journals"]],
+            "states": manifest["states"]}
 
 
 # --- restore -------------------------------------------------------------------
@@ -337,6 +357,18 @@ def restore(repo: Path, paths, *, fetch: bool = True, remote: str = "origin") ->
         os.replace(tmp, dest / f"{run['key']}.sqlite")
         out["journals"][lineage].append(run["key"])
         imported.add(run["key"])
+    # 4. import-state snapshots: any a run here could be compared with
+    out["states"] = []
+    sdir = state.state_dir(repo)
+    for a in artifacts:
+        for f in sorted((a / STATE).glob("*.json")) if (a / STATE).is_dir() else []:
+            if (sdir / f.name).exists():
+                continue
+            sdir.mkdir(parents=True, exist_ok=True)
+            tmp = sdir / f".tmp-{f.name}"
+            shutil.copyfile(f, tmp)
+            os.replace(tmp, sdir / f.name)
+            out["states"].append(f.stem)
     if candidates:
         rp = _restored_path(repo)
         rp.parent.mkdir(parents=True, exist_ok=True)
