@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from prongs import journal, mapdb
+from prongs import evidence, journal, mapdb
 from prongs.select import select
 
 MOD = "def a():\n    return 1\n\ndef b():\n    return 2\n\ndef c():\n    return a() + b()\n"
@@ -24,6 +24,24 @@ TESTS = (
     "class TestC:\n    def test_c(self):\n        assert c() == 3\n"
 )
 T_A, T_B, T_C = "tests/test_m.py::test_a", "tests/test_m.py::test_b", "tests/test_m.py::TestC::test_c"
+
+
+RECORDER_CHANNEL = {evidence.CHILD_DIR, evidence.CHILD_ROOT, evidence.CHILD_TEST}
+
+
+def outer_setting(var: str) -> bool:
+    """A variable that configures prongs or pytest for the session running
+    these tests (a CI job's PRONGS_IMPORT_STATE, say), not for the throwaway
+    projects they build. Not the recorder's own channel to the processes a
+    test starts: recording this suite follows prongs into those."""
+    return var == "PYTEST_ADDOPTS" or (var.startswith("PRONGS_") and var not in RECORDER_CHANNEL)
+
+
+@pytest.fixture(autouse=True)
+def no_outer_settings(monkeypatch):
+    """The same for what a test calls in this process (select, rollup)."""
+    for var in [v for v in os.environ if outer_setting(v)]:
+        monkeypatch.delenv(var)
 
 
 class Repo:
@@ -63,12 +81,9 @@ class Repo:
 
     # --- prongs -------------------------------------------------------------
     def _run(self, *argv: str) -> subprocess.CompletedProcess:
-        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-        for var in ("PYTEST_ADDOPTS", "PRONGS_COV", "PRONGS_DIR", "PRONGS_JOURNAL",
-                    "PRONGS_JOURNAL_KEY"):
-            if var not in self.env:
-                env.pop(var, None)
-        env.update(self.env)
+        # nothing of the outer session's configuration reaches the inner one
+        env = {k: v for k, v in os.environ.items() if not outer_setting(k)}
+        env.update(self.env, PYTHONDONTWRITEBYTECODE="1")
         return subprocess.run(
             [sys.executable, "-m", *argv], cwd=self.path, capture_output=True, text=True, env=env
         )
