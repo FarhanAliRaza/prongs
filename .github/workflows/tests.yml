@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       select:
-        description: Select like a pull request (off: run everything recorded and save the map)
+        description: "Select like a pull request (off: run everything recorded and save the map)"
         type: boolean
         default: true
 
