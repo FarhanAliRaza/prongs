@@ -50,7 +50,7 @@ The `run` document contains:
 - `mode`: `select` (only affected tests ran) or `run_all` (everything ran). `run_all_reasons` says why.
 - `n_total`, `n_selected`, `n_skipped`, `changed_functions`, `selected_by_reason`.
 - `failures`: grouped by exception line with truncated tracebacks. Passes are counted, not listed.
-- `flaky`: known-flaky tests that failed and were retried alone. `counted_as` is `flaky` (a retry passed) or `failure`.
+- `flaky`: known-flaky tests that failed and were retried without the rest of the run. `counted_as` is `flaky` (a retry passed) or `failure`.
 - `skip_receipt`: the rule used, `map_age` (commits behind HEAD), `unmapped_tests`, `warnings`.
 - `evidence`: the runs the map is built from, including `last_full_run`.
 - `conservation`: the balance check behind exit code 3.

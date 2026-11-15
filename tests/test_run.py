@@ -251,6 +251,24 @@ def test_a_failure_that_passes_without_the_other_selected_tests_is_settled_by_th
     assert again["summary"]["flaky"]["passed_on_retry"] == 1
 
 
+def test_what_selected_tests_leave_in_the_environment_stays_out_of_later_processes(polluted):
+    # the selected tests run in the process that then starts the others (the
+    # failures alone, the whole suite): a variable a test set and never unset
+    # must not be what those start with, or the suite fails for no change
+    polluted.write("tests/conftest.py", "import os\n\nSTARTED_WITH = os.environ.get('LEAKED')\n")
+    polluted.write("tests/test_p.py", "import os\n\nimport conftest\n" + POLLUTED.replace(
+        "    shared.SEEN.append(a())\n", "    shared.SEEN.append(a())\n    os.environ['LEAKED'] = '1'\n")
+        + "\n\ndef test_started_clean():\n    assert conftest.STARTED_WITH is None\n")
+    polluted.commit("a test that leaks a variable")
+    assert polluted.record().returncode == 0
+    polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    out = polluted.cli("run")
+    (entry,) = out["order_dependent"]
+    assert (entry["test"], entry["alone"], entry["suite"]) == (VICTIM, "passed", "passed")
+    s = out["summary"]
+    assert (s["status"], s["failed"], s["ran"]) == ("passed", 0, 7)
+
+
 def test_a_change_that_makes_one_test_break_another_fails(repo):
     # no test tidies up here: with the change, test_polluter leaves state
     # behind in the suite too. test_victim passes alone, and that is no excuse

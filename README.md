@@ -215,7 +215,7 @@ Set `ignore_docstrings = true` to treat docstring edits as formatting.
 
 **Flaky tests.** A test that both passed and failed on one tree within `flaky_window` rollups is flaky.
 Flaky tests still run.
-A failing flaky test is re-run alone up to `flaky_retries` times.
+A failing flaky test is re-run without the rest of the run up to `flaky_retries` times (several that failed together share one process per round).
 A pass reports it under `flaky`; failing every time counts it as a failure.
 
 **Order-dependent tests.** A selected run is the suite with tests left out, so a test can meet state that an earlier test left behind and that, in the full suite, a test in between tidies up.
@@ -267,7 +267,7 @@ All commands print one JSON document on stdout, except `daemon`.
 |---|---|---|
 | `--record` / `--no-record` | on | Append this run to the journal |
 | `--cov` / `--no-cov` | on | Record per-test coverage; `--no-cov` still appends outcomes and durations |
-| `--flaky-retries N` | 2 | Re-run a failing flaky test alone up to N times; 0 makes a flaky failure a failure |
+| `--flaky-retries N` | 2 | Re-run failing flaky tests without the rest of the run up to N times; 0 makes a flaky failure a failure |
 
 `audit` adds:
 
@@ -310,7 +310,7 @@ Settings are read from `[tool.prongs]` in `pyproject.toml`, then `PRONGS_<NAME>`
 history_window = 3   # a test whose outcome flipped in the last N rollups is selected
 max_map_age = 50     # a map more than N commits behind HEAD runs everything
 flaky_window = 50    # flaky evidence older than N rollups expires (0: nothing is flaky)
-flaky_retries = 2    # re-run a failing flaky test alone up to N times
+flaky_retries = 2    # re-run failing flaky tests without the rest of the run up to N times
 isolate_failures = 2 # a failure that passes without the other selected tests is settled by the whole suite (1: excused; 0: a failure)
 ignore_docstrings = false  # true: a docstring edit is not a change
 native_commands = []       # programs that run no project Python: "git", "node"

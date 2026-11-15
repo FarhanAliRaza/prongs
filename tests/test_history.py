@@ -123,6 +123,32 @@ def test_a_flake_passes_on_retry_and_is_reported_apart_from_failures(coin):
     assert out["summary"]["status"] == "passed" and out["flaky"][0]["counted_as"] == "flaky"
 
 
+def test_flaky_tests_that_fail_together_are_retried_in_one_process(recorded, tmp_path):
+    # one start-up per round, however many tests it holds: a run with many
+    # flaky failures must not cost one process per test and retry
+    recorded.env["COIN"] = str(tmp_path / "coin")
+    recorded.write("tests/test_coin.py", "import os, pathlib\n\n\n"
+                   "def flip(name):\n"
+                   "    with open(os.environ['COIN'] + '.pids', 'a') as f:\n"
+                   "        f.write(f'{os.getpid()}\\n')\n"
+                   "    p = pathlib.Path(os.environ['COIN'] + name)\n"
+                   "    n = int(p.read_text()) if p.exists() else 0\n"
+                   "    p.write_text(str(n + 1))\n"
+                   "    assert n % 2 == 0\n\n\n"
+                   "def test_heads():\n    flip('heads')\n\n\n"
+                   "def test_tails():\n    flip('tails')\n")
+    recorded.commit("two coin-flip tests")
+    assert recorded.record().returncode == 0
+    out = recorded.cli("run", "--base", "HEAD~1")
+    assert out["summary"]["status"] == "passed"
+    assert out["summary"]["flaky"] == {"ran": 2, "failed": 2, "passed_on_retry": 2, "retries": 2}
+    assert [(f["test"], f["retries"]) for f in out["flaky"]] == [
+        ("tests/test_coin.py::test_heads", ["passed"]), ("tests/test_coin.py::test_tails", ["passed"])]
+    recording, run, retry = (set(pids) for pids in zip(*[iter(
+        (tmp_path / "coin.pids").read_text().split())] * 2, strict=True))
+    assert len(recording) == len(run) == len(retry) == 1 and len(recording | run | retry) == 3
+
+
 def test_a_known_flake_that_fails_every_retry_is_a_failure(coin):
     coin.cli("run", "--base", "HEAD~1")  # the flake, known from now on
     coin.env["COIN_BROKEN"] = "1"  # now it fails for real, on the same tree

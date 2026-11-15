@@ -362,6 +362,11 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
     buf = io.StringIO()
     saved = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = buf  # stdout is the JSON document; nothing else may print
+    # the tests run in this process, and what they leave in it (a variable
+    # set and never unset, another working directory) is not what the
+    # processes started after them must begin with: flaky retries, the
+    # failures alone, the whole suite
+    environ, cwd = dict(os.environ), os.getcwd()
     crash = None
     try:
         code = pytest.main(
@@ -378,6 +383,9 @@ def run_via_subprocess(targets: list[str], extra_args: list[str]) -> dict:
         crash, code = e, 3
     finally:
         sys.stdout, sys.stderr = saved
+        os.environ.clear()
+        os.environ.update(environ)
+        os.chdir(cwd)
     # exit 2-5 is an error result, exactly as from the daemon: a collection
     # failure that ran nothing must never read as "passed"
     resp = execution_response(code, time.monotonic() - t0, collector, buf.getvalue)
@@ -554,37 +562,42 @@ def flaky_results(repo: Path, aff: dict, results: list[dict], tree: dict,
 
 def retry_flaky(repo: Path, flaky: dict[str, dict], retries: int, record: bool,
                 warm: bool) -> None:
-    """Re-run each failing flaky test alone, up to `retries` times, until it
-    passes. A pass makes its failure a flake; failing every time makes it a
-    failure, flaky or not — a known flake is no licence to fail. Retries are
-    recorded like any run (unless --no-record), so a pass lands in history
-    next to the failure on the same tree: the next run knows the flake.
-    Retries use the warm daemon when the run did, else a fresh pytest."""
+    """Re-run the failing flaky tests without the rest of the run, up to
+    `retries` times, until each passes. A pass makes its failure a flake;
+    failing every time makes it a failure, flaky or not — a known flake is
+    no licence to fail. Each round is one process holding the tests still
+    failing (one test alone, when one is): a run with many of them costs
+    `retries` start-ups, not one per test. Retries are recorded like any run
+    (unless --no-record), so a pass lands in history next to the failure on
+    the same tree: the next run knows the flake. Retries use the warm daemon
+    when the run did, else a fresh pytest."""
     from prongs.audit import observe
 
     jdir = journal.journal_dir(repo)
-    for entry in flaky.values():
-        if entry["status"] != "failed":
-            continue
+    pending = [entry for entry in flaky.values() if entry["status"] == "failed"]
+    for entry in pending:
         entry["retries"] = []
-        for _ in range(retries):
-            status = None
-            if warm:
-                key = journal.new_key()
-                extra = ["--tb=no"] + (["--prongs-cov", "--prongs-journal", str(jdir),
-                                        "--prongs-journal-key", key] if record else [])
-                resp = run_via_daemon([entry["test"]], extra)
-                if resp and not resp.get("stale") and "error" not in resp:
-                    status = next((r["status"] for r in resp.get("results", [])
-                                   if r["id"] == entry["test"]), "absent")
-            if status is None:
-                args = shlex.split(os.environ.get("PRONGS_RUN_ARGS", ""))
-                status = observe(repo, sys.executable, args, targets=[entry["test"]],
-                                 record=record)["statuses"].get(entry["test"], "absent")
-            entry["retries"].append(status)
-            if status == "passed":
-                break
-        entry["counted_as"] = "flaky" if "passed" in entry["retries"] else "failure"
+    for _ in range(retries):
+        if not pending:
+            break
+        tests = [entry["test"] for entry in pending]
+        statuses = None
+        if warm:
+            key = journal.new_key()
+            extra = ["--tb=no"] + (["--prongs-cov", "--prongs-journal", str(jdir),
+                                    "--prongs-journal-key", key] if record else [])
+            resp = run_via_daemon(tests, extra)
+            if resp and not resp.get("stale") and "error" not in resp:
+                statuses = {r["id"]: r["status"] for r in resp.get("results", [])}
+        if statuses is None:
+            args = shlex.split(os.environ.get("PRONGS_RUN_ARGS", ""))
+            statuses = observe(repo, sys.executable, args, targets=tests, record=record)["statuses"]
+        for entry in pending:
+            entry["retries"].append(statuses.get(entry["test"], "absent"))
+        pending = [entry for entry in pending if entry["retries"][-1] != "passed"]
+    for entry in flaky.values():
+        if entry["status"] == "failed":
+            entry["counted_as"] = "flaky" if "passed" in entry["retries"] else "failure"
 
 
 def rerun_failures(repo: Path, failures: list[dict], record: bool) -> list[dict]:
@@ -716,6 +729,7 @@ def cmd_run(args) -> dict:
         # modules, and whatever its tests left in them)
         reason = (f"{len(order_dependent)} failure(s) of the selected run passed without "
                   "the other selected tests: the whole suite settles them")
+        selected_s = round(time.monotonic() - t0, 3)
         p = subprocess.run([sys.executable, "-m", "prongs", *sys.argv[1:], "--force-all", reason],
                            capture_output=True, text=True, cwd=repo)
         try:
@@ -732,7 +746,7 @@ def cmd_run(args) -> dict:
                         "without them; settled by the whole suite"}
             for e in order_dependent]
         full["selected_run"] = {"n_selected": aff["n_selected"], "ran": len(results),
-                                "wall_s": round(time.monotonic() - t0, 3)}
+                                "wall_s": selected_s}
         if "summary" in full:
             full["summary"]["order_dependent"] = len(order_dependent)
             full["summary"]["total_wall_s"] = round(

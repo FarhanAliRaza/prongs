@@ -8,7 +8,7 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
   flaky_window     a test is flaky while both outcomes on one tree were
                    observed within the last N rollups; older evidence
                    expires (0: nothing is ever flaky)
-  flaky_retries    a flaky test that fails is re-run alone up to N times: a
+  flaky_retries    flaky tests that fail are re-run without the rest up to N times: a
                    pass makes the failure a flake, failing every time makes it
                    a failure (0: a flaky failure is a failure)
   isolate_failures a test that fails in a selected run is run again in a
