@@ -436,3 +436,18 @@ def test_an_environment_variable_a_test_leaves_set_is_not_in_the_snapshot(tables
     assert sel["import_state"]["trees"] == [
         {"globals": 1, "classes": 0, "holders": 0, "names": ["TABLE"]}]
     assert "tests/test_mode.py::test_mode" not in sel["selected"]
+
+
+def test_an_explicit_base_the_map_was_recorded_at_selects_by_import_state_too(tables):
+    base = tables.head()
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    tables.commit("a change to import-time data")
+    sel = tables.select(base=base)
+    assert sel["mode"] == "select" and sel["import_state"]["trees"] == [
+        {"globals": 1, "classes": 0, "holders": 0, "names": ["TABLE"]}]
+    assert sel["selected"]["tests/test_t.py::test_lookup"] == "reaches import-time state that changed"
+    assert "tests/test_t.py::test_other" not in sel["selected"]
+    # a base no recorded run saw: nothing to compare with
+    tables.edit("pkg/tables.py", "TABLE = {'k': 2}", "TABLE = {'k': 3}")
+    assert tables.select(base="HEAD")["mode"] == "run_all"
+

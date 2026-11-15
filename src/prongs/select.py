@@ -65,6 +65,15 @@ INERT_NAMES = {"LICENSE", "LICENSE.md", "CHANGELOG.md", "README.md", "CODE_OF_CO
                "py.typed"}
 
 
+# read when the environment is built or pytest starts, before any test: no
+# evidence from a test session can say who depends on them
+ENVIRONMENT_SUFFIXES = (".toml", ".cfg", ".ini")
+
+
+def is_environment(path: str) -> bool:
+    return path.endswith(ENVIRONMENT_SUFFIXES)
+
+
 def configured_inert(path: str, patterns: tuple[str, ...]) -> bool:
     """Matched by a [tool.prongs] inert pattern. Those are for non-Python
     files: a pattern like "pkg/*" must never hide a changed module."""
@@ -265,6 +274,7 @@ class Analysis:
     existed: set[tuple[str, str]] = field(default_factory=set)  # changed funcs the old tree had
     unexecuted: list[str] = field(default_factory=list)  # of those: ones no recorded test enters
     module_level: dict[str, list[str]] = field(default_factory=dict)  # file -> what changed
+    unread: list[str] = field(default_factory=list)  # changed files no process opened
     code_changed: bool = False   # production Python changed: unrecorded processes may run it
     files_changed: bool = False  # a non-Python file changed: any started program may read it
     additive: dict[str, list[str]] = field(default_factory=dict)  # file -> unobserved bindings
@@ -622,7 +632,8 @@ def tree_changes(
 
 def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis,
             inert: tuple[str, ...] = (), project: RepoProject | None = None,
-            seen_funcs: set | None = None, ignore_docstrings: bool = False) -> Analysis:
+            seen_funcs: set | None = None, ignore_docstrings: bool = False,
+            watched: bool = False) -> Analysis:
     """Turn a change set into changed functions, wholesale files, run-all
     reasons and test-file selections. With a `project`, a modified file is
     compared unit by unit (see units.py); without one, or when a version
@@ -669,21 +680,37 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
             an.selected_files[path] = "; ".join(notes)
 
     seen = seen_funcs or ()
+    code_before = set(an.changed_funcs)
     for path, ch in changes.items():
         name = Path(path).name
+        if ch["status"] in ("A", "D"):
+            # whoever listed the directory saw a name appear or disappear
+            d = path.rsplit("/", 1)[0] if "/" in path else "."
+            an.changed_funcs.add((d, evidence.DIR))
+            an.existed.add((d, evidence.DIR))
         if not path.endswith(".py"):
             # a file the user declared inert is; otherwise evidence decides.
             # A test was seen reading it: those tests run (and everything, if
             # collection read it, by the import-time rule). Nothing was seen
-            # reading it: the built-in inert list applies, and any other file
-            # runs everything, as a file nothing can vouch for always did.
+            # reading it: the built-in inert list applies. Any other file
+            # runs everything, as a file nothing can vouch for always did,
+            # unless the kernel watched every open while the evidence was
+            # recorded (watch.py): then no process opened it during a test,
+            # and what is left is the tests whose evidence cannot be trusted
+            # (the process markers) and files read before any test starts
+            # (configuration: is_environment).
             if configured_inert(path, inert):
                 continue
             if (path, evidence.FILE) in seen:
                 an.changed_funcs.add((path, evidence.FILE))
                 an.existed.add((path, evidence.FILE))
                 an.files_changed = True
-            elif not is_inert(path):
+            elif is_inert(path):
+                pass
+            elif watched and not is_environment(path):
+                an.files_changed = True
+                an.unread.append(path)
+            else:
                 an.run_all_reasons.append(f"non-Python file changed: {path}")
             continue
         if name == "conftest.py" or "conftest" in name:
@@ -802,6 +829,11 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
             an.changed_funcs.add((path, evidence.NAMES))
         if not is_test_file(path):
             an.code_changed = True
+    # a process that did not report what it ran opened the module
+    for path in {p for p, q in an.changed_funcs - code_before
+                 if p.endswith(".py") and not evidence.describe(p, q)} | an.wholesale:
+        an.changed_funcs.add((path, evidence.CODE))
+        an.existed.add((path, evidence.CODE))
     # a process prongs could not record runs code, or reads files, unseen
     if an.code_changed or an.files_changed:
         an.changed_funcs.add((evidence.PROCESS, evidence.SPAWN))
@@ -1117,6 +1149,14 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         stale.append(f"map is {age['commits_behind_head']} commits behind HEAD "
                      f"(max_map_age {max_map_age})")
 
+    if head is None:
+        # a dependency that changed reaches any test, and no file of the
+        # repository need differ for it (a lock file is not what is installed)
+        here = provenance.environment(str(repo))
+        then = {provenance.fingerprint_field(r["recorder"], "env") for r in contributing}
+        if then - {None, here}:
+            stale.append("the installed packages differ from those the map's evidence "
+                         "was recorded with")
     missing: dict[int, str] = {}  # evidence run -> its commit, absent from this repository
     trees = build_trees(repo, contributing, base, ev, missing)
     untracked = provenance.dirty_files(repo) if head is None else {}
@@ -1125,11 +1165,14 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     inert = config.inert(repo)
     project = RepoProject(repo, now, coll_files)
     ignore_docstrings = config.flag(repo, "ignore_docstrings")
+    recorders = {r["id"]: r["recorder"] for r in contributing}
     for tree in trees:
         an = Analysis(exact=tree.run_ids is not None)
         changes = tree_changes(repo, tree, now, con, git_cache, untracked, an)
         analyze(repo, con, now, changes, all_tests, an, inert, project, seen_funcs,
-                ignore_docstrings)
+                ignore_docstrings, watched=all(
+                    provenance.fingerprint_field(recorders.get(rid), "watch") is not None
+                    for rid in (recorders if tree.run_ids is None else tree.run_ids)))
         # import/collection-time execution: a changed function that runs during
         # collection (decorators, module-level declarations) can break any test
         # before it even starts — no per-test attribution possible, so run all.
@@ -1164,6 +1207,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "module_level": {p: r for a in analyses for p, r in sorted(a.module_level.items())},
         "additive": {p: r for a in analyses for p, r in sorted(a.additive.items())},
         "unexecuted": sorted({f for a in analyses for f in a.unexecuted}),
+        # changed non-Python files that no process opened while a test ran
+        "unread": sorted({f for a in analyses for f in a.unread}),
     }
     # an unobserved binding still executes at import: collect everything once
     import_check = sorted({t.split("::", 1)[0] for t in all_tests}) if units_block["additive"] else []
@@ -1187,7 +1232,15 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             if not an.run_all_reasons:
                 continue
             snap = None
-            for rid in sorted(tree.run_ids or (), reverse=True):
+            if tree.run_ids is None:
+                # an explicit base: a recorded run of exactly that commit,
+                # with nothing uncommitted, saw what import produced there
+                at = provenance.rev_parse(repo, tree.commit)
+                runs = [r["id"] for r in contributing
+                        if r["commit_sha"] == at and not r["dirty_files"] and not r["tree_changed"]]
+            else:
+                runs = tree.run_ids
+            for rid in sorted(runs, reverse=True):
                 snap = state.load(repo, keys[rid]) if rid in keys else None
                 if snap is not None:
                     break
@@ -1287,7 +1340,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             for tree, snap in state_bases:
                 change = state.diff(snap, got["snapshot"])
                 for t in state.reach(con, repo, change):
-                    if t in all_tests and (all_tests[t][1] in tree.run_ids
+                    if t in all_tests and (tree.run_ids is None
+                                           or all_tests[t][1] in tree.run_ids
                                            or all_tests[t][1] not in known_runs):
                         selected.setdefault(t, "reaches import-time state that changed")
                 import_state["trees"].append(state.summary(change))

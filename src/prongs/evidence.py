@@ -19,6 +19,19 @@ carry it like any other dependency:
                              native_commands: only a changed non-Python file
                              selects it.
 
+  (<dir>, "<dir>")           the test listed a directory: a file that
+                             appears or disappears there selects it.
+  (<path>, "<code>")         a process the test started, and that did not
+                             report what it ran, opened this module (or its
+                             compiled file): a change to the module's code
+                             selects the test.
+
+The last two, and files opened by anything other than the test process's own
+open(), come from the kernel (watch.py, Linux). With it, a test that starts
+an unrecorded process depends on the project files that were opened while
+it ran, and carries a <spawn> marker only when that cannot be trusted:
+events were lost, or the repository's own git state was read.
+
 Python child processes are recorded too (child.py, started by prongs.pth):
 the functions a child enters are credited to the test that started it, and a
 test whose every direct child reported back carries no <spawn> marker.
@@ -38,9 +51,10 @@ import tempfile
 import types
 from pathlib import Path
 
-from prongs import journal
+from prongs import journal, watch
 
 FILE, NAMES, PROCESS, SPAWN, NATIVE = "<file>", "<names>", "<process>", "<spawn>", "<native>"
+DIR, CODE = "<dir>", "<code>"
 CHILD_DIR, CHILD_ROOT, CHILD_TEST = "PRONGS_CHILD", "PRONGS_CHILD_ROOT", "PRONGS_TEST"
 SPAWN_EVENTS = {"subprocess.Popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn",
                 "os.exec", "os.system", "os.startfile"}
@@ -60,6 +74,10 @@ def describe(path: str, qual: str) -> str | None:
         return f"reads changed file {path}"
     if qual == NAMES or qual.startswith("<names:"):
         return f"lists the names of {path}" + (f" ({qual[7:-1]})" if qual != NAMES else "")
+    if qual == DIR:
+        return f"lists directory {path}/"
+    if qual == CODE:
+        return f"starts a process that opens changed module {path}"
     if qual == SPAWN:
         return "starts a process prongs could not record"
     if qual == NATIVE:
@@ -132,6 +150,11 @@ class Evidence:
         self.native = set(native)
         self.deps: set[tuple[str, str, int]] = set()
         self.spawns = 0
+        # what the kernel saw opened in the current context: modules (as
+        # files), and whether it can be trusted (see sync)
+        self.code: set[str] = set()
+        self.blind = False
+        self.watch = watch.start(rootpath, tracked)
         self._modules: dict[str, str | None] = {}
         self.child_dir = tempfile.mkdtemp(prefix="prongs-child-")
         self._env = {k: os.environ.get(k) for k in (CHILD_DIR, CHILD_ROOT, CHILD_TEST)}
@@ -151,6 +174,8 @@ class Evidence:
         global _active
         if _active is self:
             _active = None
+        if self.watch is not None:
+            self.watch.close()
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -158,8 +183,48 @@ class Evidence:
                 os.environ[k] = v
 
     def test(self, nodeid: str) -> None:
-        self.deps, self.spawns = set(), 0
+        self.sync()  # what was opened between tests is no test's
+        self.reset()
         os.environ[CHILD_TEST] = nodeid
+
+    def reset(self) -> tuple:
+        """Start an empty context; the one it replaces, for restore()."""
+        outer = self.deps, self.spawns, self.code, self.blind
+        self.deps, self.spawns, self.code, self.blind = set(), 0, set(), False
+        return outer
+
+    def restore(self, outer: tuple) -> None:
+        """Back to an enclosing context, which saw what the inner one did."""
+        self.deps |= outer[0]
+        self.spawns += outer[1]
+        self.code |= outer[2]
+        self.blind = self.blind or outer[3]
+
+    def sync(self) -> None:
+        """Credit what the kernel saw opened since the last call to the
+        current context."""
+        if self.watch is None:
+            return
+        files, dirs, repo, lost = self.watch.drain()
+        for f in files:
+            if f not in self.tracked:
+                continue
+            if f.endswith(".py"):
+                self.code.add(self.root + f)
+            else:
+                self.deps.add((self.root + f, FILE, 0))
+        for d in dirs:
+            self.deps.add((self.root + (d or "."), DIR, 0))
+        # lost events, or a look at the repository's own state (which files
+        # are tracked, what is staged): nothing here describes what it saw
+        self.blind = self.blind or repo or lost
+
+    def unseen(self) -> set[tuple[str, str, int]]:
+        """What stands in for a process that did not report what it ran: the
+        modules opened while it could have run, or the marker."""
+        if self.watch is None or self.blind:
+            return {self.spawn_marker()}
+        return {(f, CODE, 0) for f in self.code}
 
     # --- what the hooks report ---------------------------------------------
     def opened(self, path, mode) -> None:
@@ -179,6 +244,11 @@ class Evidence:
                                   args[1][0] if args[1] else None)
         elif event in ("os.posix_spawn", "os.exec"):
             program = args[0]
+        log = os.environ.get("PRONGS_SPAWN_LOG")
+        if log:  # which programs a suite starts: what native_commands could name
+            with open(log, "a") as f:
+                f.write(f"{os.environ.get(CHILD_TEST)}\t{event}\t"
+                        f"{os.fsdecode(program) if program is not None else ''}\n")
         if program is not None and os.path.basename(os.fsdecode(program)) in self.native:
             self.deps.add((self.root + PROCESS, NATIVE, 0))
         else:

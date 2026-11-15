@@ -225,18 +225,58 @@ def polluted(repo):
     return repo
 
 
-def test_a_failure_that_passes_without_the_other_selected_tests_is_order_dependent(polluted):
+def test_a_failure_that_passes_without_the_other_selected_tests_is_settled_by_the_suite(polluted):
     polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
     out = polluted.cli("run")
-    assert out["selection"]["mode"] == "select" and out["selection"]["n_selected"] == 4
+    # the selected run failed test_victim, which passes alone: the whole
+    # suite, where test_cleanup runs between the two, is what decides
+    assert out["selection"]["mode"] == "run_all" and out["selection"]["run_all_reasons"] == [
+        "1 failure(s) of the selected run passed without the other selected tests: "
+        "the whole suite settles them"]
     assert out["failures"] == []
     (entry,) = out["order_dependent"]
-    assert (entry["test"], entry["alone"]) == (VICTIM, "passed")
+    assert (entry["test"], entry["alone"], entry["suite"]) == (VICTIM, "passed", "passed")
     assert entry["error"] == "assert [1] == []"
     s = out["summary"]
-    assert (s["status"], s["failed"], s["order_dependent"]) == ("passed", 0, 1)
-    # both outcomes are in history, on one tree: the next run knows
+    assert (s["status"], s["failed"], s["order_dependent"], s["ran"]) == ("passed", 0, 1, 6)
+    assert out["selected_run"]["ran"] == 4
+    # both outcomes are in history, on one tree: from now on the test is
+    # flaky, and its retries settle it without the suite
     assert polluted.cli("affected")["flaky"][VICTIM]["failed"] == 1
+    polluted.edit("pkg/mod.py", "return 0 + 1", "return 1 + 0")
+    again = polluted.cli("run")
+    assert again["selection"]["mode"] == "select" and again["summary"]["status"] == "passed"
+    assert again["summary"]["flaky"]["passed_on_retry"] == 1
+
+
+def test_a_change_that_makes_one_test_break_another_fails(repo):
+    # no test tidies up here: with the change, test_polluter leaves state
+    # behind in the suite too. test_victim passes alone, and that is no excuse
+    repo.write("pkg/shared.py", "SEEN = []\n\n\ndef note(value):\n    if value != 1:\n"
+               "        SEEN.append(value)\n")
+    repo.write("tests/test_p.py", "from pkg import shared\nfrom pkg.mod import a\n\n\n"
+               "def test_polluter():\n    shared.note(a())\n\n\n"
+               "def test_victim():\n    assert a() in (1, 5)\n    assert shared.SEEN == []\n")
+    repo.commit("a test that pollutes once a() changes")
+    assert repo.record().returncode == 0
+    repo.edit("pkg/mod.py", "return 1", "return 5")
+    out = repo.cli("run", code=1)
+    assert out["selection"]["mode"] == "run_all"
+    (entry,) = out["order_dependent"]
+    assert (entry["test"], entry["alone"], entry["suite"]) == (VICTIM, "passed", "failed")
+    failed = {f["representative"] for f in out["failures"]} | {
+        t for f in out["failures"] for t in f["also_failed"]}
+    assert VICTIM in failed and out["summary"]["status"] == "failed"
+
+
+def test_an_isolated_pass_can_be_taken_at_its_word(polluted):
+    polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    out = polluted.cli("run", "--isolate-failures", "1")
+    assert out["selection"]["mode"] == "select" and out["selection"]["n_selected"] == 4
+    (entry,) = out["order_dependent"]
+    assert (entry["test"], entry["alone"]) == (VICTIM, "passed") and "suite" not in entry
+    s = out["summary"]
+    assert (s["status"], s["failed"], s["order_dependent"]) == ("passed", 0, 1)
 
 
 def test_a_failure_that_also_fails_alone_is_a_failure(polluted):

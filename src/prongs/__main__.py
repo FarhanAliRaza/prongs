@@ -55,6 +55,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -618,7 +619,7 @@ def rerun_failures(repo: Path, failures: list[dict], record: bool) -> list[dict]
 def cmd_run(args) -> dict:
     t0 = time.monotonic()
     repo = Path.cwd()
-    aff = cmd_affected(args)
+    aff = cmd_affected(args, force_all=getattr(args, "force_all", None))
     if "error" in aff:
         return aff
     checked = None
@@ -696,13 +697,47 @@ def cmd_run(args) -> dict:
     # a flaky test has its retries, and its own verdict
     suspects = [r for r in failures if r["id"] not in flaky]
     if suspects and aff["mode"] == "select" and cfg["isolate_failures"]:
-        order_dependent = rerun_failures(repo, suspects, record=mode == "coverage")
+        # kept as a run only when its pass is the last word: before a run
+        # of the whole suite, a recorded pass would make the test flaky and
+        # the suite's failure of it a flake
+        order_dependent = rerun_failures(
+            repo, suspects, record=mode == "coverage" and cfg["isolate_failures"] == 1)
         excused = {e["test"] for e in order_dependent}
         failures = [r for r in failures if r["id"] not in excused]
     retry_s = time.monotonic() - t_retry
     out["failures"] = group_failures(failures)  # passes are summarized, not listed
     if flaky:
         out["flaky"] = list(flaky.values())
+    if order_dependent and cfg["isolate_failures"] >= 2:
+        # passing alone proves nothing about the suite: a change can make one
+        # test break another. The whole suite is what the selected run stands
+        # in for, so it settles them, and its verdict is this run's
+        # (in a process of its own: this one holds the selected run's
+        # modules, and whatever its tests left in them)
+        reason = (f"{len(order_dependent)} failure(s) of the selected run passed without "
+                  "the other selected tests: the whole suite settles them")
+        p = subprocess.run([sys.executable, "-m", "prongs", *sys.argv[1:], "--force-all", reason],
+                           capture_output=True, text=True, cwd=repo)
+        try:
+            full = json.loads(p.stdout)
+        except ValueError:
+            full = {"error": "the whole-suite run produced no result",
+                    "output": (p.stdout + p.stderr)[-2000:],
+                    "summary": {"status": "error"}}
+        still = {f["representative"] for f in full.get("failures", [])} | {
+            t for f in full.get("failures", []) for t in f["also_failed"]}
+        full["order_dependent"] = [
+            e | {"suite": "failed" if e["test"] in still else "passed",
+                 "why": "failed after the other selected tests, passed in a fresh process "
+                        "without them; settled by the whole suite"}
+            for e in order_dependent]
+        full["selected_run"] = {"n_selected": aff["n_selected"], "ran": len(results),
+                                "wall_s": round(time.monotonic() - t0, 3)}
+        if "summary" in full:
+            full["summary"]["order_dependent"] = len(order_dependent)
+            full["summary"]["total_wall_s"] = round(
+                full["summary"].get("total_wall_s", 0) + full["selected_run"]["wall_s"], 3)
+        return full
     if order_dependent:
         out["order_dependent"] = order_dependent
     ran = len(results)
@@ -855,11 +890,13 @@ def main():
                            help="re-run a failing flaky test alone up to N times; a pass makes "
                                 "it a flake, else it is a failure (default: [tool.prongs] "
                                 "flaky_retries, else 2; 0: a flaky failure is a failure)")
-            p.add_argument("--isolate-failures", type=int, default=None, metavar="0|1",
+            p.add_argument("--force-all", default=None, help=argparse.SUPPRESS)
+            p.add_argument("--isolate-failures", type=int, default=None, metavar="0|1|2",
                            help="re-run the failures of a selected run in a fresh process "
                                 "without the other selected tests; one that passes there is "
                                 "order-dependent, not a failure (default: [tool.prongs] "
-                                "isolate_failures, else 1; 0: it is a failure)")
+                                "isolate_failures, else 2: the whole suite then settles "
+                                "it; 1: it is reported and not a failure; 0: it is a failure)")
         if name == "audit":
             p.add_argument("--pytest-args", default=None,
                            help="extra pytest arguments for the full run "

@@ -10,7 +10,9 @@ assumes.
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
 import os
 import platform
 import subprocess
@@ -159,7 +161,8 @@ def tracked_files(repo: Path) -> set[str]:
     """Repository-relative paths git tracks, plus untracked files it does
     not ignore: the files a diff can ever show."""
     out = _git(Path(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard")
-    return set(out.split("\0")) - {""} if out else set()
+    own = _own_state(Path(repo))
+    return {p for p in out.split("\0") if p and not p.startswith(own)} if out else set()
 
 
 def snapshot(repo: Path) -> dict:
@@ -185,8 +188,33 @@ def between(start: dict, end: dict) -> dict:
     }
 
 
-def recorder_fingerprint() -> str:
-    from prongs import __version__
+@functools.cache
+def environment(root: str) -> str:
+    """A fingerprint of the installed distributions, the project's own
+    (installed from the tree at `root`) left out: their code is in the diff,
+    and their version often follows the commit. A changed dependency
+    reaches any test, and no file of the repository need differ for it."""
+    from importlib import metadata
+
+    root = Path(root).resolve().as_uri()
+    found = set()
+    for dist in metadata.distributions():
+        try:
+            name = dist.metadata["Name"]
+            url = json.loads(dist.read_text("direct_url.json") or "{}").get("url", "")
+        except Exception:
+            continue
+        if name and not url.startswith(root):
+            found.add(f"{name.lower()}=={dist.version}")
+    return hashlib.sha256("\n".join(sorted(found)).encode()).hexdigest()[:12]
+
+
+def recorder_fingerprint(watching: bool | None = None, root: str | Path | None = None) -> str:
+    """What observed a run: versions, platform, the installed environment,
+    and `watch` when the kernel reported the files every process opened
+    (watch.py): only then is "no test was seen reading it" a statement
+    about a file."""
+    from prongs import __version__, watch
 
     try:
         import pytest
@@ -195,4 +223,15 @@ def recorder_fingerprint() -> str:
     except ImportError:  # pragma: no cover - the recorder runs inside pytest
         pv = "?"
     py = ".".join(str(v) for v in sys.version_info[:3])
-    return f"prongs={__version__};python={py};pytest={pv};{platform.system().lower()}"
+    watching = watch.available() if watching is None else watching
+    return (f"prongs={__version__};python={py};pytest={pv};{platform.system().lower()}"
+            f"{';watch' if watching else ''};env={environment(str(root or Path.cwd()))}")
+
+
+def fingerprint_field(recorder: str | None, name: str) -> str | None:
+    """`env` -> its value, `watch` -> "" when present; None when absent."""
+    for part in (recorder or "").split(";"):
+        key, _, value = part.partition("=")
+        if key == name:
+            return value
+    return None

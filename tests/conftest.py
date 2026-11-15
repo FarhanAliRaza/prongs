@@ -29,7 +29,10 @@ T_A, T_B, T_C = "tests/test_m.py::test_a", "tests/test_m.py::test_b", "tests/tes
 class Repo:
     def __init__(self, path: Path, env: dict | None = None):
         self.path = path
-        self.env = env or {}  # extra environment for the recorder and the CLI
+        # extra environment for the recorder and the CLI. Without the kernel's
+        # watcher unless a test asks (tests/test_watch.py): these tests describe
+        # prongs wherever it runs, and the watcher is Linux's alone
+        self.env = {"PRONGS_WATCH": "0", **(env or {})}
 
     # --- files & git ---------------------------------------------------------
     def write(self, rel: str, text: str) -> None:

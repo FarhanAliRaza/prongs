@@ -29,6 +29,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PRONGS_IMPORT_STATE: "1"  # import-time changes select too (the full run is still the gate)
     strategy:
       fail-fast: false
       matrix:

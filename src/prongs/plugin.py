@@ -215,23 +215,32 @@ class ProngsCov:
         self._modules = sorted({item.nodeid.split("::", 1)[0] for item in session.items})
         # a process started while collecting is not marked: what collection
         # runs is already a reason to run everything when it changes
+        # (pytest lists directories to find test modules: a new test file
+        # is the test-file rules' business, not a reason to run everything)
+        ev = self.evidence
+        ev.sync()
         self.records[journal.COLLECTION] = (
-            0.0, "collection", frozenset(self._current | self.evidence.deps))
+            0.0, "collection",
+            frozenset(self._current | {d for d in ev.deps if d[1] != evidence.DIR}))
 
     @pytest.hookimpl(wrapper=True)
     def pytest_fixture_setup(self, fixturedef, request):
         if fixturedef.scope == "function":
             return (yield)
         ev = self.evidence
-        outer = self._current, ev.deps, ev.spawns
-        self._current, ev.deps, ev.spawns = set(), set(), 0
+        ev.sync()
+        outer, context = self._current, ev.reset()
+        self._current = set()
         try:
             return (yield)
         finally:
-            self._fixtures[fixturedef] = (self._current | ev.deps, ev.spawns > 0)
-            self._current |= outer[0]
-            ev.deps |= outer[1]
-            ev.spawns += outer[2]
+            ev.sync()
+            # a process the setup started reports to the first test that
+            # uses the fixture: for every user, what was opened stands in
+            deps = self._current | ev.deps | (ev.unseen() if ev.spawns or ev.blind else set())
+            self._fixtures[fixturedef] = (deps, ev.spawns > 0)
+            self._current |= outer
+            ev.restore(context)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_teardown(self, item):
@@ -257,24 +266,30 @@ class ProngsCov:
             dur = time.monotonic() - t0
             status = self._statuses.pop(item.nodeid, "unknown")
             ev = self.evidence
+            ev.sync()
             self.records[item.nodeid] = (
                 dur, status, frozenset(self._current | ev.deps | self._shared[0]))
-            if ev.spawns or self._shared[1]:
-                self._spawns[item.nodeid] = (ev.spawns, self._shared[1])
+            if ev.spawns or self._shared[1] or ev.blind:
+                self._spawns[item.nodeid] = (ev.spawns, self._shared[1], ev.unseen(), ev.blind)
 
     def _credit_children(self) -> None:
         """Fold the child processes' reports into the tests that started
-        them. A test keeps a <spawn> marker unless each process it started
-        itself reported back; one that reached a process through a shared
-        fixture always keeps it (the report goes to the fixture's first user)."""
+        them. A test whose every process reported back depends on what they
+        ran. One that started a process which did not (a program that is not
+        Python, a killed child), or reached one through a shared fixture (the
+        report goes to the fixture's first user), depends on the modules
+        opened while it ran, or carries a <spawn> marker where the kernel
+        could not say (see evidence.py)."""
         ev = self.evidence
         reports = ev.children()
         me = os.getpid()
-        for test, (spawns, via_fixture) in self._spawns.items():
+        for test, (spawns, via_fixture, unseen, blind) in self._spawns.items():
             mine = reports.get(test, [])
             extra = {tuple(f) for r in mine for f in r["funcs"]}
-            if via_fixture or sum(r.get("parent") == me for r in mine) < spawns:
+            if blind:
                 extra.add(ev.spawn_marker())
+            elif via_fixture or sum(r.get("parent") == me for r in mine) < spawns:
+                extra |= unseen
             dur, status, deps = self.records[test]
             self.records[test] = (dur, status, deps | extra)
         mine = reports.get(journal.COLLECTION, [])
@@ -306,7 +321,8 @@ class ProngsCov:
             "mode": "coverage",
             "worktree": self.rootpath.rstrip(os.sep),
             **provenance.between(self.snapshot_start, provenance.snapshot(Path(self.rootpath))),
-            "recorder": provenance.recorder_fingerprint(),
+            "recorder": provenance.recorder_fingerprint(
+                self.evidence.watch is not None, self.rootpath),
             "args": list(self.config.invocation_params.args),
             "n_collected": self.n_collected,
             "collect_errors": self.collect_errors,

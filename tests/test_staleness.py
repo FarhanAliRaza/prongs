@@ -112,3 +112,16 @@ def test_a_map_of_unknown_age_runs_everything(recorded):
     sel = recorded.select()
     assert sel["mode"] == "run_all"
     assert sel["reasons"] == ["map age unknown: map commit deadbeef is not in this repository"]
+
+
+def test_changed_dependencies_run_everything(recorded, monkeypatch):
+    # no file of the repository need differ for a dependency to: a lock file
+    # is not what is installed, and what is installed is what the tests ran on
+    recorded.edit("pkg/mod.py", "return 2", "return 2 * 1")
+    assert recorded.select()["mode"] == "select"
+    from prongs import provenance
+
+    monkeypatch.setattr(provenance, "environment", lambda root: "another")
+    sel = recorded.select()
+    assert sel["mode"] == "run_all" and sel["reasons"] == [
+        "the installed packages differ from those the map's evidence was recorded with"]

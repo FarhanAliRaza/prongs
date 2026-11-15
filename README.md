@@ -146,7 +146,7 @@ The recorder keeps four more kinds of evidence, as dependencies of the test like
 | shared fixtures | a module-, class- or session-scoped fixture is set up | what its setup entered is credited to every test that uses the fixture, not only the first |
 | files read | a test opens a tracked non-Python file | a change to that file selects its readers instead of running everything; a file tests read is never inert by default, wherever it lives |
 | names listed | a test calls `dir()` or `vars()` on a project module or class (`inspect.getmembers` does) | a name added to or removed from that module or class selects it |
-| processes started | a test starts a process | a Python child is recorded and its functions credited to the test; a test whose children could not all be recorded runs on any production change |
+| processes started | a test starts a process | a Python child is recorded and its functions credited to the test; a test whose children could not all be recorded depends on the files that were opened while it ran (Linux, below), or runs on any production change |
 
 Child processes are recorded through `prongs.pth`, which the wheel installs next to the package.
 It does nothing unless a recording session set `PRONGS_CHILD`; an editable install does not carry it.
@@ -158,10 +158,32 @@ Name programs that run no project Python in `native_commands`: a test that start
 native_commands = ["git", "node"]
 ```
 
-A non-Python file no test was ever seen reading still runs everything, unless it is inert.
+**What the kernel sees (Linux).** The hooks above see what the test process does in Python.
+They cannot see into `git`, `node` or a linter, a Python that runs without the recorder, or a C library that opens a file itself.
+On Linux the recorder also asks the kernel (inotify) which project files were opened while each test ran, by whichever process:
 
-These rules cannot see a file read by a C library or by a child that is not Python, a module's names taken from `module.__dict__` directly, or a process started while collecting.
-Run `prongs audit` on your suite to check them.
+| The kernel reports | Effect on selection |
+|---|---|
+| a tracked non-Python file was opened | the test depends on that file, whoever opened it |
+| a module or its compiled file was opened, during a test that started a process which did not report what it ran | a change to that module's code selects the test |
+| a directory was listed | a file added to or removed from it selects the test |
+| `.git/HEAD` or `.git/index` was read | the test looked at the repository's own state: it keeps the marker and runs on any change |
+
+So a test that starts `git` in a temporary repository, or `node` on two template files, depends on what those programs opened, not on every change there could be.
+And a changed non-Python file that no process opened during any test selects only the tests that keep a marker, where it used to run everything.
+Files read before any test starts are the exception: a changed `.toml`, `.cfg` or `.ini` that no test read still runs everything.
+The result lists the changed files nothing opened under `units.unread`.
+
+Without the watcher (macOS, Windows, `PRONGS_WATCH=0`, or a map recorded without it) a test whose processes could not all be recorded runs on any production change, and a non-Python file no test was seen reading runs everything unless it is inert.
+
+The watcher cannot see a program that only asks for a file's metadata (`git status` on an unchanged file, `make` comparing times): that opens nothing.
+If the kernel drops events because its queue is full, the test they belonged to keeps the marker.
+
+**Dependencies.** A recorded run stores a fingerprint of the installed packages (the project's own, installed from the tree, left out).
+When the packages installed now differ from it, everything runs: a lock file is inert, since what the tests ran on is what is installed, not what a file says.
+
+None of this can see a module's names taken from `module.__dict__` directly, or a process started while collecting.
+Run `prongs audit` on your suite to check these rules.
 
 **Import-time code.** A changed module-level statement, class attribute, or function that a module body calls runs everything by default: function entry cannot say which tests use the objects that code built.
 With `import_state = true`, prongs compares what import *produced* instead.
@@ -185,7 +207,7 @@ import_state = true      # or "shadow": keep running everything, and report what
 ```
 
 This rule cannot see state that no project global or class reaches (a registry inside a third-party library, the contents of an `lru_cache`), or a name reached only through a computed string.
-It needs the diff to come from the tree the map was recorded on, so it does not apply with `--base`.
+With `--base`, it applies when a recorded run of exactly that commit (nothing uncommitted) stored a snapshot; any other base still runs everything for an import-time change.
 
 A docstring is data a program can read, so a docstring edit is a change by default.
 Set `ignore_docstrings = true` to treat docstring edits as formatting.
@@ -299,6 +321,7 @@ import_state = false       # true: select by what import produces; "shadow": onl
 | `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
 | `PRONGS_IMPORT_STATE=1` or `=shadow` | Like `import_state = true` or `"shadow"` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
+| `PRONGS_WATCH=0` | Do not ask the kernel which files were opened (Linux): markers and the run-everything rule for unread files apply, as on other systems |
 | `PRONGS_RECORD_CHILDREN=0` | Do not record inside child processes: every test that starts one keeps its process marker |
 | `PRONGS_DIR` | State directory, relative to the repository root (default `.prongs`); point worktrees at one directory to pool runs |
 | `PRONGS_JOURNAL` | Journal directory only (default `<state dir>/journal`) |

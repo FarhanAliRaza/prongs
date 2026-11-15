@@ -232,6 +232,7 @@ def test_unobserved_bindings_select_nothing_and_ask_for_an_import_check(recorded
             "new assignment to _WORD (line 3)", "new def _helper (line 6)",
             "new import of re (line 1)"]},
         "unexecuted": [],
+        "unread": [],
     }
     assert sel["import_check"] == ["tests/test_m.py"]
     out = recorded.cli("run")

@@ -21,6 +21,19 @@
 # writes into the working tree would show up as changes in the tree every
 # recorded run describes.
 #
+# Several configurations in one job (the suite once plainly, once against a
+# service, once with a package uninstalled): each is its own evidence, since
+# a test runs other code in each. Give every configuration a state directory
+# and an artifact of its own:
+#
+#   export PRONGS_DIR="$RUNNER_TEMP/prongs-redis"   # outside the checkout
+#   python -m prongs ci restore "$RUNNER_TEMP/prongs-ci/redis"
+#   REDIS_URL=... python -m prongs run
+#   python -m prongs ci save --no-map "$RUNNER_TEMP/prongs-out/redis"
+#
+# and one cache key per configuration (and per Python version and system: a
+# map describes the interpreter and the installed packages that recorded it).
+#
 # Not run on GitHub itself: these are the commands bench/ci.py replays locally
 # with fresh clones and artifact directories. Adapt the install step, and the
 # branch name, to your project.
