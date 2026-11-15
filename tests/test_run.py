@@ -3,8 +3,10 @@ block that must balance, and failures grouped by root cause."""
 
 from __future__ import annotations
 
+import re
+
 import pytest
-from conftest import T_A, T_B, T_C
+from conftest import MOD, T_A, T_B, T_C
 
 from prongs.__main__ import exception_line, group_failures
 
@@ -335,3 +337,20 @@ def test_ids_that_changed_since_the_map_run_under_their_new_names(unstable):
     # test_stamp[<old pid>] and test_fn[a-<old pid>] ran as their new ids
     assert (c["conserved"], c["selected"], c["executed"], c["renamed"], c["unplanned"]) == (
         True, 5, 5, 2, 2)
+
+
+def test_a_run_says_in_one_line_what_it_did(repo):
+    """stdout is the JSON document; the line on stderr is for the log's reader."""
+    def line() -> tuple[int, str]:
+        p = repo._run("prongs", "run")
+        return p.returncode, re.sub(r" in \d+s\n$", " in Ns", p.stderr)
+
+    assert line() == (0, "prongs: passed: ran 3 tests (everything: no coverage map "
+                         "(this run records one)) in Ns")
+    assert line() == (0, "prongs: nothing_to_run: ran 0 of 3 tests "
+                         "(3 not affected by the change) in Ns")
+    repo.edit("pkg/mod.py", "return 2", "return 3")
+    assert line() == (1, "prongs: failed: ran 2 of 3 tests (1 not affected by the change), "
+                         "2 failed in Ns")
+    repo.write("pkg/mod.py", MOD)
+    assert line() == (0, "prongs: passed: ran 2 of 3 tests (1 not affected by the change) in Ns")

@@ -405,6 +405,7 @@ It rolls up, selects, executes, and reports in one JSON document.
 The output is built for a token budget: failures are grouped by exception line, tracebacks are truncated, passes are counted, not listed.
 The skip receipt and `evidence` let the agent decide whether to trust the skip.
 The exit code carries the verdict, so no output parsing is needed to gate on it.
+One line on stderr says the same to a person reading a log: `prongs: passed: ran 33 of 15375 tests (15342 not affected by the change) in 18s`.
 
 ## Status
 
