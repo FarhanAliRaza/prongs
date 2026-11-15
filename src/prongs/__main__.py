@@ -856,12 +856,13 @@ def headline(out: dict) -> str:
     summary, sel = out.get("summary"), out.get("selection")
     if not summary or not sel:
         return f"prongs: {out.get('error', 'no result')}"
-    known = "" if sel["n_total"] is None else f" of {sel['n_total']}"  # None: no map yet
-    line = f"prongs: {summary['status']}: ran {summary.get('ran', 0)}{known} tests"
+    ran = summary.get("ran", 0)
     if sel["mode"] == "run_all":
-        line += f" (everything: {'; '.join(sel['run_all_reasons'])})"
+        line = f"prongs: {summary['status']}: ran {ran} tests (everything: {'; '.join(sel['run_all_reasons'])})"
     else:
-        line += f" ({sel['n_skipped']} not affected by the change)"
+        # of what this run saw: the map's count misses a test the change adds
+        line = (f"prongs: {summary['status']}: ran {ran} of {ran + sel['n_skipped']} tests "
+                f"({sel['n_skipped']} not affected by the change)")
     if summary.get("failed"):
         line += f", {summary['failed']} failed"
     return line + f" in {summary.get('total_wall_s', summary.get('wall_s', 0)):.0f}s"

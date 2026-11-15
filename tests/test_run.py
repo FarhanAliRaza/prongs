@@ -354,3 +354,6 @@ def test_a_run_says_in_one_line_what_it_did(repo):
                          "2 failed in Ns")
     repo.write("pkg/mod.py", MOD)
     assert line() == (0, "prongs: passed: ran 2 of 3 tests (1 not affected by the change) in Ns")
+    # a test the change adds is not in the map's count, and is in this one
+    repo.write("tests/test_new.py", "def test_new():\n    assert True\n")
+    assert line() == (0, "prongs: passed: ran 3 of 4 tests (1 not affected by the change) in Ns")
