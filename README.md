@@ -150,7 +150,8 @@ The recorder keeps four more kinds of evidence, as dependencies of the test like
 
 Child processes are recorded through `prongs.pth`, which the wheel installs next to the package.
 It does nothing unless a recording session set `PRONGS_CHILD`; an editable install does not carry it.
-A child that is killed, or is not Python, reports nothing, and its test keeps the marker.
+A child writes what it enters as it goes, so one that is killed (a server a test starts and stops) still reports.
+A program that is not Python reports nothing: its test depends on the files that were opened while it ran (Linux, below), or keeps the marker.
 Name programs that run no project Python in `native_commands`: a test that starts only those is selected by a changed non-Python file, not by changed code.
 
 ```toml

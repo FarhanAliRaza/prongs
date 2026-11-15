@@ -451,3 +451,30 @@ def test_an_explicit_base_the_map_was_recorded_at_selects_by_import_state_too(ta
     tables.edit("pkg/tables.py", "TABLE = {'k': 2}", "TABLE = {'k': 3}")
     assert tables.select(base="HEAD")["mode"] == "run_all"
 
+
+def test_a_child_that_is_killed_still_says_what_it_ran(project, tmp_path):
+    # a server a test starts and kills never gets to exit: what it entered
+    # is written as it goes, not when it ends
+    (tmp_path / "site").mkdir()
+    (tmp_path / "site" / "sitecustomize.py").write_text(
+        "import os\nif os.environ.get('PRONGS_CHILD'):\n    import prongs.child\n")
+    project.env["PYTHONPATH"] = str(tmp_path / "site")
+    project.env["PRONGS_RECORD_CHILDREN"] = "1"
+    project.write("pkg/server.py", "import os\nimport signal\nimport subprocess\nimport sys\n\n\n"
+                  "def serve():\n    os.kill(os.getpid(), signal.SIGKILL)\n\n\n"
+                  "def start():\n    code = 'from pkg.server import serve; serve()'\n"
+                  "    return subprocess.run([sys.executable, '-c', code]).returncode\n")
+    project.write("tests/test_k.py", "import signal\n\nfrom pkg import server\n\n\n"
+                  "def test_killed():\n    assert server.start() == -signal.SIGKILL\n")
+    project.commit("a child that is killed")
+    assert project.record().returncode == 0
+    project.rollup()
+    con = project.db()
+    deps = {(p, q) for p, q in con.execute(
+        "SELECT f.path, fn.qualname FROM tests t JOIN current_links l ON l.test_id = t.id "
+        "JOIN funcs fn ON fn.id = l.func_id JOIN files f ON f.id = fn.file_id "
+        "WHERE t.test_id = ?", ("tests/test_k.py::test_killed",))}
+    con.close()
+    assert deps == {("pkg/__init__.py", "<module>"), ("pkg/server.py", "<module>"),
+                    ("pkg/server.py", "serve"), ("pkg/server.py", "start"),
+                    ("tests/test_k.py", "test_killed")}

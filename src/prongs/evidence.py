@@ -278,13 +278,22 @@ class Evidence:
 
     # --- child processes ----------------------------------------------------
     def children(self) -> dict[str, list[dict]]:
-        """test id -> the reports of the Python processes started under it."""
+        """test id -> the reports of the Python processes started under it
+        (child.py: a header line, then a function per line)."""
         out: dict[str, list[dict]] = {}
-        for p in Path(self.child_dir).glob("*.json"):
+        for p in Path(self.child_dir).glob("*.jsonl"):
             try:
-                report = json.loads(p.read_text())
-            except (OSError, ValueError):
-                continue  # killed while writing: no evidence
+                lines = p.read_text().splitlines()
+                report = json.loads(lines[0])
+            except (OSError, ValueError, IndexError):
+                continue  # it never got as far as its header: no evidence
+            funcs = []
+            for line in lines[1:]:
+                try:
+                    funcs.append(json.loads(line))
+                except ValueError:
+                    pass  # killed in the middle of a line
+            report["funcs"] = funcs
             out.setdefault(report.get("test") or "", []).append(report)
         return out
 

@@ -2,16 +2,20 @@
 
 prongs.pth imports this module in every Python process whose environment
 carries PRONGS_CHILD (set by a recording session): the functions the child
-enters are written, when it exits, as one report for the test named in
-PRONGS_TEST. A child that never gets to exit normally writes nothing, and the
-test that started it keeps its "<spawn>" marker (see evidence.py).
+enters are written, as it first enters each, to one report for the test
+named in PRONGS_TEST. Written as it goes, not when it exits: a server a test
+starts and then kills never gets to exit, and still said what it ran.
+
+A report is lines of JSON: a header ({"test", "pid", "parent"}), then one
+[file, qualname, line] per function. A process that cannot write it leaves
+none, and the test that started it is treated as having started a process
+that did not report (see evidence.py).
 
 A pytest session has a recorder of its own and is left alone.
 """
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import sys
@@ -22,15 +26,26 @@ def _start() -> None:
     out, root = os.environ.get("PRONGS_CHILD"), os.environ.get("PRONGS_CHILD_ROOT")
     if not out or not root or not os.path.isdir(out):
         return
-    seen: set = set()
     known: dict = {}
-    parent, pid = os.getppid(), os.getpid()
+    pid = os.getpid()
+    # line-buffered and appending: each function is one write, whole even
+    # when a fork of this child writes to the same report
+    report = open(os.path.join(out, f"{pid}.jsonl"), "a", buffering=1)
+    report.write(json.dumps({"test": os.environ.get("PRONGS_TEST"), "pid": pid,
+                             "parent": os.getppid()}) + "\n")
 
-    def project(code) -> bool:
+    def first(code) -> bool:
+        """Whether this is project code seen for the first time (and note it)."""
         k = known.get(code)
         if k is None:
             fn = code.co_filename
             k = known[code] = fn.startswith(root) and "site-packages" not in fn
+            if k:
+                try:
+                    report.write(json.dumps(
+                        [fn, code.co_qualname, code.co_firstlineno]) + "\n")
+                except (OSError, ValueError):
+                    pass
         return k
 
     if hasattr(sys, "monitoring"):
@@ -42,36 +57,18 @@ def _start() -> None:
             return
 
         def on_start(code, offset):
-            if not project(code):
-                return mon.DISABLE
-            seen.add(code)
+            first(code)
+            return mon.DISABLE  # once per function is all a report needs
 
         mon.register_callback(tool, mon.events.PY_START, on_start)
         mon.set_events(tool, mon.events.PY_START)
     else:
         def profile(frame, event, arg):
-            if event == "call" and project(frame.f_code):
-                seen.add(frame.f_code)
+            if event == "call":
+                first(frame.f_code)
 
         sys.setprofile(profile)
         threading.setprofile(profile)
-
-    def flush() -> None:
-        if os.getpid() != pid:
-            return  # a fork of this child: its parent reports
-        report = {
-            "test": os.environ.get("PRONGS_TEST"), "pid": pid, "parent": parent,
-            "funcs": sorted({(c.co_filename, c.co_qualname, c.co_firstlineno) for c in seen}),
-        }
-        tmp = os.path.join(out, f".{pid}.tmp")
-        try:
-            with open(tmp, "w") as f:
-                json.dump(report, f)
-            os.replace(tmp, os.path.join(out, f"{pid}.json"))
-        except OSError:
-            pass
-
-    atexit.register(flush)
 
 
 try:
