@@ -19,7 +19,7 @@ name: tests
 
 on:
   push:
-    branches: [master, ccr-c41bd064-03odtr]  # TEMPORARY: this branch, until it has a pull request
+    branches: [master]
   pull_request:
   schedule:
     - cron: "17 3 * * *"
@@ -39,8 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PRONGS_IMPORT_STATE: "1"  # import-time changes select too (the full run is still the gate)
-      # TEMPORARY: a push to the trial branch selects, unless its message says [record]
-      SELECT: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.select) || (github.event_name == 'push' && github.ref != 'refs/heads/master' && !contains(github.event.head_commit.message, '[record]')) }}
+      SELECT: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.select) }}
     strategy:
       fail-fast: false
       matrix:
