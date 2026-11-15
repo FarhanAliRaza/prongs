@@ -315,13 +315,19 @@ isolate_failures = 2 # a failure that passes without the other selected tests is
 ignore_docstrings = false  # true: a docstring edit is not a change
 native_commands = []       # programs that run no project Python: "git", "node"
 import_state = false       # true: select by what import produces; "shadow": only report
+suite = []                 # the paths that are the suite, when pytest's configuration names none: ["tests/units"]
 ```
+
+Set `suite` when the repository holds more than one suite and pytest has no `testpaths` (unit tests in one job, integration tests in another).
+With no map yet, everything runs as pytest collects it, and these paths are what it is told to collect.
+With a map, a changed test file or conftest outside them belongs to the other suite: it selects nothing here, and is listed under `units.outside`.
 
 | Variable | Meaning |
 |---|---|
 | `PRONGS_HISTORY_WINDOW`, `PRONGS_MAX_MAP_AGE`, `PRONGS_FLAKY_WINDOW`, `PRONGS_FLAKY_RETRIES`, `PRONGS_ISOLATE_FAILURES` | Override the settings above |
 | `PRONGS_IGNORE_DOCSTRINGS=1` | Like `ignore_docstrings = true` |
 | `PRONGS_IMPORT_STATE=1` or `=shadow` | Like `import_state = true` or `"shadow"` |
+| `PRONGS_SUITE` | Like `suite`, as one string: `"tests/units tests/more"` |
 | `PRONGS_COV=1` | Turn the recorder on, like `--prongs-cov` |
 | `PRONGS_WATCH=0` | Do not ask the kernel which files were opened (Linux): markers and the run-everything rule for unread files apply, as on other systems |
 | `PRONGS_RECORD_CHILDREN=0` | Do not record inside child processes: every test that starts one keeps its process marker |

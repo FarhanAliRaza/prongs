@@ -277,22 +277,59 @@ def test_cli_affected_reports_evidence(recorded):
     assert "skip_receipt" in out
 
 
-def test_targets_keep_a_subdirectorys_conftest_fixtures(repo):
-    # pytest collects a file target's directory afresh. One in tests/ after
-    # a target in tests/sub/ would leave tests/sub/conftest.py's fixtures
-    # bound to a directory node later ids no longer hang from ("fixture
-    # 'thing' not found"): files in a parent directory go first
-    repo.write("tests/sub/conftest.py",
-               "import pytest\n\n\n@pytest.fixture\ndef thing():\n    return 1\n")
-    repo.write("tests/sub/test_s.py", "from pkg.mod import a, b\n\n\ndef test_x(thing):\n"
-               "    assert a() == thing\n\n\ndef test_y():\n    assert b() == 2\n")
-    repo.write("tests/sub/test_w.py", "from pkg.mod import a\n\n\ndef test_w():\n    assert a() == 1\n")
+def test_targets_are_in_the_order_pytest_collects_the_tree(repo):
+    # a directory's entries by name, file or directory alike, and a file's
+    # ids where the file is: the selected tests meet each other as they do
+    # in the suite. It also keeps a directory's targets together: pytest
+    # collects a file target's directory afresh, and a target in tests/
+    # between two in tests/sub/ would leave tests/sub/conftest.py's fixtures
+    # bound to a directory node the second no longer hangs from ("fixture
+    # 'thing' not found", from pytest 9)
+    for sub, ids, whole in (("sub", "test_s", "test_w"), ("zub", "test_t", "test_v")):
+        repo.write(f"tests/{sub}/conftest.py",
+                   f"import pytest\n\n\n@pytest.fixture\ndef {sub}_thing():\n    return 1\n")
+        repo.write(f"tests/{sub}/{ids}.py", f"from pkg.mod import a, b\n\n\ndef test_x({sub}_thing):\n"
+                   f"    assert a() == {sub}_thing\n\n\ndef test_y():\n    assert b() == 2\n")
+        repo.write(f"tests/{sub}/{whole}.py",
+                   "from pkg.mod import a\n\n\ndef test_w():\n    assert a() == 1\n")
     repo.write("tests/test_top.py", "from pkg.mod import a\n\n\ndef test_top():\n    assert a() == 1\n")
-    repo.commit("a subdirectory with a conftest")
+    repo.commit("subdirectories with a conftest each, either side of tests/'s own files")
     assert repo.record().returncode == 0
     repo.edit("pkg/mod.py", "return 1", "return 0 + 1")
     assert repo.select()["targets"] == [
-        "tests/test_top.py", "tests/sub/test_w.py",
-        "tests/sub/test_s.py::test_x", T_C, T_A]
+        "tests/sub/test_s.py::test_x", "tests/sub/test_w.py", T_C, T_A, "tests/test_top.py",
+        "tests/zub/test_t.py::test_x", "tests/zub/test_v.py"]
     out = repo.cli("run", "--no-record")
-    assert (out["summary"]["status"], out["summary"]["passed"], out["failures"]) == ("passed", 5, [])
+    assert (out["summary"]["status"], out["summary"]["passed"], out["failures"]) == ("passed", 7, [])
+
+
+def test_the_tests_of_another_suite_are_not_this_ones(repo):
+    # a repository with two suites (unit tests here, integration tests in a
+    # job of their own) and no testpaths: pytest is told which paths are
+    # this suite, and so is prongs
+    repo.write("pyproject.toml", "")
+    repo.write("other/conftest.py", "import pytest\n\n\n@pytest.fixture\ndef browser():\n    return 1\n")
+    repo.write("other/test_o.py", "def test_o(browser):\n    assert browser == 2\n")
+    repo.write("conftest.py", "")
+    repo.commit("another suite, which fails here")
+    repo.env["PRONGS_SUITE"] = "tests"
+    # no map yet: everything runs, and everything is tests/
+    first = repo.cli("run")
+    assert (first["summary"]["status"], first["summary"]["ran"]) == ("passed", 3)
+    repo.write("other/test_o.py", "def test_o(browser):\n    assert browser == 3\n")
+    repo.write("other/test_new.py", "def test_new():\n    assert False\n")
+    repo.write("other/conftest.py", "import pytest\n\n\n@pytest.fixture\ndef browser():\n    return 3\n")
+    repo.git("add", "-A")
+    out = repo.cli("affected")
+    assert (out["mode"], out["targets"], out["run_all_reasons"]) == ("select", [], [])
+    assert out["units"]["outside"] == ["other/conftest.py", "other/test_new.py", "other/test_o.py"]
+    # without the setting they are tests like any other, and the conftest
+    # one that may reach every test
+    del repo.env["PRONGS_SUITE"]
+    out = repo.cli("affected")
+    assert (out["mode"], out["run_all_reasons"]) == ("run_all", ["conftest changed: other/conftest.py"])
+    # a conftest above the suite applies to it, setting or not
+    repo.env["PRONGS_SUITE"] = "tests"
+    repo.write("conftest.py", "import os\n")
+    out = repo.cli("affected")
+    assert (out["mode"], out["run_all_reasons"]) == ("run_all", ["conftest changed: conftest.py"])

@@ -34,6 +34,10 @@
 # and one cache key per configuration (and per Python version and system: a
 # map describes the interpreter and the installed packages that recorded it).
 #
+# A repository with more than one suite and no testpaths (unit tests here,
+# integration tests in a job of their own): name this job's with
+# PRONGS_SUITE="tests/units", or `suite` in [tool.prongs].
+#
 # Not run on GitHub itself: these are the commands bench/ci.py replays locally
 # with fresh clones and artifact directories. Adapt the install step, and the
 # branch name, to your project.

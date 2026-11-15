@@ -97,6 +97,22 @@ def is_test_file(path: str) -> bool:
     return name.startswith("test_") or name.endswith("_test.py")
 
 
+def concerns_suite(path: str, suite: tuple[str, ...]) -> bool:
+    """Whether a changed Python file can be this suite's business, given the
+    paths that are the suite ([tool.prongs] suite). Production code always
+    can. A test file can when it is under one of them; a conftest also when
+    its directory is above one, since it then applies to it."""
+    name = Path(path).name
+    conftest = "conftest" in name
+    if not (conftest or is_test_file(path)):
+        return True
+    roots = [s.rstrip("/") for s in suite]
+    if any(path == r or path.startswith(r + "/") for r in roots):
+        return True
+    above = path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+    return conftest and any((r + "/").startswith(above) for r in roots)
+
+
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=repo, capture_output=True, text=True, check=True
@@ -275,6 +291,7 @@ class Analysis:
     unexecuted: list[str] = field(default_factory=list)  # of those: ones no recorded test enters
     module_level: dict[str, list[str]] = field(default_factory=dict)  # file -> what changed
     unread: list[str] = field(default_factory=list)  # changed files no process opened
+    outside: list[str] = field(default_factory=list)  # changed tests of another suite
     code_changed: bool = False   # production Python changed: unrecorded processes may run it
     files_changed: bool = False  # a non-Python file changed: any started program may read it
     additive: dict[str, list[str]] = field(default_factory=dict)  # file -> unobserved bindings
@@ -633,7 +650,8 @@ def tree_changes(
 def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dict, an: Analysis,
             inert: tuple[str, ...] = (), project: RepoProject | None = None,
             seen_funcs: set | None = None, ignore_docstrings: bool = False,
-            watched: bool = False) -> Analysis:
+            watched: bool = False, suite: tuple[str, ...] = (),
+            seen_files: frozenset | set = frozenset()) -> Analysis:
     """Turn a change set into changed functions, wholesale files, run-all
     reasons and test-file selections. With a `project`, a modified file is
     compared unit by unit (see units.py); without one, or when a version
@@ -712,6 +730,12 @@ def analyze(repo: Path, con, now: _Now, changes: dict[str, dict], all_tests: dic
                 an.unread.append(path)
             else:
                 an.run_all_reasons.append(f"non-Python file changed: {path}")
+            continue
+        if suite and path not in seen_files and not concerns_suite(path, suite):
+            # a test file or a conftest of another suite (the repository's
+            # integration tests, in a job that runs its unit tests): no test
+            # of this one ran any of it, and its own job runs it
+            an.outside.append(path)
             continue
         if name == "conftest.py" or "conftest" in name:
             an.run_all_reasons.append(f"conftest changed: {path}")
@@ -1048,12 +1072,17 @@ def targets_for(selected: set[str], selected_files, all_tests) -> tuple[list[str
     (1,626 ids) cost ~10% of the suite's wall time. A whole-file target
     subsumes that file's node ids.
 
-    Files in a parent directory come before files below it. pytest collects
-    a file target's directory afresh, with new nodes for its subdirectories;
-    from pytest 9 a conftest's fixtures belong to the directory node they
-    were first collected under, so a target in tests/ after one in tests/sub/
-    leaves every later tests/sub/ id without tests/sub/conftest.py's
-    fixtures ("fixture not found").
+    Targets are in the order pytest itself collects a tree: by path, one
+    component at a time, a directory's entries by name whether file or
+    directory, with a file's ids where the file would be. The tests of a
+    suite that depends on its order (one test registers what a later one
+    needs) then meet each other as they do in the suite; when everything
+    runs, this is the suite's own order. It also keeps a directory's targets
+    together: pytest collects a file target's directory afresh, with new
+    nodes for its subdirectories, and from pytest 9 a conftest's fixtures
+    belong to the directory node they were first collected under, so a
+    target in tests/ between two in tests/sub/ would leave the second
+    without tests/sub/conftest.py's fixtures ("fixture not found").
 
     A parametrized test is targeted as its function, never as `name[id]`,
     and the known parametrizations that are not selected are deselected. An
@@ -1071,7 +1100,13 @@ def targets_for(selected: set[str], selected_files, all_tests) -> tuple[list[str
         t for t in all_tests
         if "[" in t and t not in selected and t.split("[", 1)[0] in ids
     )
-    return sorted(files, key=lambda f: (f.count("/"), f)) + sorted(ids), deselect
+    return sorted(files | ids, key=collection_order), deselect
+
+
+def collection_order(target: str) -> tuple[list[str], str]:
+    """Where pytest's own collection of the tree meets a file or a node id."""
+    path, _, node = target.partition("::")
+    return path.split("/"), node
 
 
 def broadening(path: str, quals: list[str]) -> str:
@@ -1162,7 +1197,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
     untracked = provenance.dirty_files(repo) if head is None else {}
     git_cache: dict[str, dict] = {}
     analyses: list[Analysis] = []
-    inert = config.inert(repo)
+    inert, suite = config.inert(repo), tuple(config.suite(repo))
     project = RepoProject(repo, now, coll_files)
     ignore_docstrings = config.flag(repo, "ignore_docstrings")
     recorders = {r["id"]: r["recorder"] for r in contributing}
@@ -1172,7 +1207,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         analyze(repo, con, now, changes, all_tests, an, inert, project, seen_funcs,
                 ignore_docstrings, watched=all(
                     provenance.fingerprint_field(recorders.get(rid), "watch") is not None
-                    for rid in (recorders if tree.run_ids is None else tree.run_ids)))
+                    for rid in (recorders if tree.run_ids is None else tree.run_ids)),
+                suite=suite, seen_files=seen_files)
         # import/collection-time execution: a changed function that runs during
         # collection (decorators, module-level declarations) can break any test
         # before it even starts — no per-test attribution possible, so run all.
@@ -1209,6 +1245,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "unexecuted": sorted({f for a in analyses for f in a.unexecuted}),
         # changed non-Python files that no process opened while a test ran
         "unread": sorted({f for a in analyses for f in a.unread}),
+        "outside": sorted({f for a in analyses for f in a.outside}),
     }
     # an unobserved binding still executes at import: collect everything once
     import_check = sorted({t.split("::", 1)[0] for t in all_tests}) if units_block["additive"] else []

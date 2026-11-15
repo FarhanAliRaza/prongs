@@ -203,7 +203,7 @@ def cmd_affected(args, force_all: str | None = None) -> dict:
     db, jdir = journal.map_path(repo), journal.journal_dir(repo)
     rolled = roll_up(repo) if getattr(args, "rollup", True) else None
     if not db.exists():
-        return no_map_selection(len(journal.pending_all(jdir)))
+        return no_map_selection(len(journal.pending_all(jdir)), config.suite(repo))
     cfg = settings(repo, args)
     sel = select(db, repo, args.base, history_window=cfg["history_window"],
                  max_map_age=cfg["max_map_age"], flaky_window=cfg["flaky_window"],
@@ -249,7 +249,7 @@ def settings(repo: Path, args) -> dict:
     return config.settings(repo, **{name: getattr(args, name, None) for name in config.DEFAULTS})
 
 
-def no_map_selection(pending: int) -> dict:
+def no_map_selection(pending: int, suite: list[str]) -> dict:
     """No evidence at all (a first CI run, an expired cache): the only safe
     selection is everything, as pytest itself would collect it. A run
     records coverage by default, so it builds the map it lacked."""
@@ -259,7 +259,7 @@ def no_map_selection(pending: int) -> dict:
     )
     return {
         "mode": "run_all",
-        "whole_suite": True,  # no node ids: pytest's own collection is the target
+        "whole_suite": True,  # no node ids: pytest's own collection (of `suite`) is the target
         "n_total": None,
         "n_selected": None,
         "n_skipped": 0,
@@ -272,7 +272,7 @@ def no_map_selection(pending: int) -> dict:
         "broadened": [],
         "flaky": {},
         "history": None,
-        "targets": [],
+        "targets": suite,
         "deselect": [],
         "evidence": {"map": None, "journal": {"rolled_up_now": 0, "pending": pending}},
         "skip_receipt": {"skipped": 0, "rule": f"nothing skipped: {reason}"},

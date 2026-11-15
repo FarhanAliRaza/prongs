@@ -35,6 +35,12 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
                    that can reach what import now produces differently
                    (state.py). "shadow": keep running everything, and report
                    what selecting would have skipped. PRONGS_IMPORT_STATE too
+  suite            the paths that are the suite (["tests/units"]), for a
+                   project whose pytest configuration names none (no
+                   testpaths) and whose repository holds other tests too.
+                   With no map to select from, everything runs as pytest
+                   collects it, and these are what it is told to collect.
+                   Also PRONGS_SUITE="tests/units tests/more"
   ignore_docstrings  true: a docstring edit is not a change. Off by default:
                    a docstring is data a program can read (`__doc__`, a CLI's
                    help text). Also PRONGS_IGNORE_DOCSTRINGS=1
@@ -43,6 +49,7 @@ PRONGS_<NAME> environment variables, overridden by CLI flags.
 from __future__ import annotations
 
 import os
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -73,6 +80,12 @@ def names(repo: Path, name: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(v for v in value if isinstance(v, str))
+
+
+def suite(repo: Path) -> list[str]:
+    """The paths pytest collects when prongs hands it no targets of its own."""
+    env = os.environ.get("PRONGS_SUITE")
+    return shlex.split(env) if env else list(names(repo, "suite"))
 
 
 def import_state(repo: Path) -> str | None:
