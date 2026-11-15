@@ -234,6 +234,7 @@ def cmd_affected(args, force_all: str | None = None) -> dict:
         },
         "history": sel["history"],
         "targets": sel["targets"],
+        "deselect": sel.get("deselect", []),
         "evidence": sel["evidence"] | {"journal": {
             "rolled_up_now": rolled["rolled_up"] if rolled else 0,
             "pending": len(journal.pending_all(jdir)),
@@ -271,6 +272,7 @@ def no_map_selection(pending: int) -> dict:
         "flaky": {},
         "history": None,
         "targets": [],
+        "deselect": [],
         "evidence": {"map": None, "journal": {"rolled_up_now": 0, "pending": pending}},
         "skip_receipt": {"skipped": 0, "rule": f"nothing skipped: {reason}"},
         "hint": "any recorded run builds the map: prongs run, or pytest --prongs-cov",
@@ -460,7 +462,13 @@ def conservation(aff: dict, results: list[dict]) -> dict:
     }
     ran = set(ids)
     vanished = set(aff.get("vanished", []))
-    not_executed = sorted(planned - ran - vanished)
+    # a parametrization the map knows and the function no longer has (an id
+    # built from a timestamp or a pid, a renamed parameter): the function
+    # ran, under the ids it has now
+    ran_functions = {i.split("[", 1)[0] for i in ran}
+    renamed = {t for t in planned - ran - vanished
+               if "[" in t and t.split("[", 1)[0] in ran_functions}
+    not_executed = sorted(planned - ran - vanished - renamed)
     books = block["collected"] == block["selected"] + block["run_all"] + block["skipped"]
     block["conserved"] = books and not not_executed and len(ran) == len(ids)
     if not books:
@@ -475,6 +483,8 @@ def conservation(aff: dict, results: list[dict]) -> dict:
         block["duplicate_results"] = len(ids) - len(ran)
     if vanished:
         block["vanished"] = len(vanished)
+    if renamed:
+        block["renamed"] = len(renamed)
     if ran - planned:
         block["unplanned"] = len(ran - planned)
     return block
@@ -654,7 +664,7 @@ def cmd_run(args) -> dict:
     mode = ("coverage" if args.cov else "results") if args.record else None
     key = journal.new_key() if mode else None
     jdir = journal.journal_dir(repo)
-    extra = [TRACEBACKS] + (
+    extra = [TRACEBACKS] + [f"--deselect={t}" for t in aff.get("deselect", [])] + (
         ["--prongs-cov", "--prongs-journal", str(jdir), "--prongs-journal-key", key]
         if mode == "coverage" else []
     )
@@ -714,10 +724,12 @@ def cmd_run(args) -> dict:
     # and "0 failed" must not read as "verified".
     ran_ids = {r["id"] for r in results}
 
+    ran_functions = {i.split("[", 1)[0] for i in ran_ids}
+    ran_files = {i.split("::", 1)[0] for i in ran_ids}
+
     def produced_results(target: str) -> bool:
-        if "::" in target:
-            return target in ran_ids
-        return any(i.startswith(target + "::") for i in ran_ids)  # whole-file target
+        # a function target: any of its parametrizations; a whole-file target: any test
+        return target in ran_functions if "::" in target else target in ran_files
 
     unrun = [t for t in aff["targets"] if not produced_results(t)]
     if error:

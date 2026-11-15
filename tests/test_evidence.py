@@ -418,3 +418,21 @@ def test_snapshots_travel_with_the_ci_artifacts(tables, tmp_path):
     for f in (journal.state_dir(job.path) / "state").glob("*.json"):
         f.unlink()
     assert job.cli("affected")["mode"] == "run_all"
+
+
+def test_an_environment_variable_a_test_leaves_set_is_not_in_the_snapshot(tables):
+    # the snapshot is taken when the session ends, in a fresh process: with
+    # what the tests did to os.environ it would describe another import
+    # than the one a later selection compares it with
+    tables.write("pkg/mode.py", "import os\n\nMODE = os.environ.get('PKG_MODE', 'plain')\n\n\n"
+                 "def mode():\n    return MODE\n")
+    tables.write("tests/test_mode.py", "import os\n\nfrom pkg import mode\n\n\n"
+                 "def test_mode():\n    assert mode.mode() == 'plain'\n\n\n"
+                 "def test_leaks():\n    os.environ['PKG_MODE'] = 'leaked'\n")
+    tables.commit("a test that leaves the environment changed")
+    assert tables.record().returncode == 0
+    tables.edit("pkg/tables.py", "TABLE = {'k': 1}", "TABLE = {'k': 2}")
+    sel = tables.select()
+    assert sel["import_state"]["trees"] == [
+        {"globals": 1, "classes": 0, "holders": 0, "names": ["TABLE"]}]
+    assert "tests/test_mode.py::test_mode" not in sel["selected"]

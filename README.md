@@ -177,6 +177,7 @@ With `import_state = true`, prongs compares what import *produced* instead.
 The result's `import_state` block lists the run-all reasons it overrode and what changed.
 A snapshot covers the modules the whole suite imports, whichever tests the run executed, and `prongs ci save` and `ci restore` carry the snapshots with the map and the journals.
 What differs between two imports of the same tree (a lock, a timestamp, a cache keyed by a salted hash) is found by taking the stored snapshot twice, and is never compared.
+The snapshot processes start from the environment the test session started in, not the one its tests left behind.
 
 ```toml
 [tool.prongs]
@@ -202,6 +203,8 @@ This cannot see a change that makes one test break another through shared state:
 Set `isolate_failures = 0` to count every failure as one.
 
 Selected tests run in the order pytest is handed them: whole files first (those in a parent directory before those below it), then single tests.
+A parametrized test is handed over as its function, with the known parametrizations that are not selected deselected (`deselect` in the result), never as `name[id]`: an id built from a timestamp or a process id is different in the next run, and pytest refuses a whole run over one id it cannot find.
+The `conservation` block counts such an id as `renamed`.
 
 **Books that balance.** Every `run` result carries a `conservation` block.
 It checks `collected == selected + run_all + skipped`, and that every planned test produced a result.

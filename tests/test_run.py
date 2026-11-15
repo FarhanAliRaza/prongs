@@ -253,3 +253,45 @@ def test_failures_are_not_rerun_alone_when_asked_not_to(polluted):
     polluted.edit("pkg/mod.py", "return 1", "return 0 + 1")
     out = polluted.cli("run", "--isolate-failures", "0", code=1)
     assert out["summary"]["status"] == "failed" and "order_dependent" not in out
+
+
+UNSTABLE = (
+    "import os\n\nimport pytest\n\nfrom pkg.mod import a, b\n\n\n"
+    "@pytest.mark.parametrize('stamp', ['fixed', str(os.getpid())])\n"
+    "def test_stamp(stamp):\n    assert a() == 1\n\n\n"
+    "@pytest.mark.parametrize('fn', [a, b], ids=[f'a-{os.getpid()}', 'b'])\n"
+    "def test_fn(fn):\n    assert fn() in (1, 2)\n\n\n"
+    "def test_other():\n    assert b() == 2\n"
+)
+
+
+@pytest.fixture
+def unstable(repo):
+    """Tests whose ids carry something that differs in every process."""
+    repo.write("tests/test_u.py", UNSTABLE)
+    repo.commit("parametrized by the process id")
+    p = repo.record()
+    assert p.returncode == 0, p.stdout + p.stderr
+    return repo
+
+
+def test_a_parametrized_test_is_targeted_as_its_function(unstable):
+    unstable.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    sel = unstable.select()
+    assert sum(t.startswith("tests/test_u.py::test_stamp[") for t in sel["selected"]) == 2
+    assert sum(t.startswith("tests/test_u.py::test_fn[a-") for t in sel["selected"]) == 1
+    # never `name[id]`: what the ids were when the map was recorded says
+    # nothing about what they are in the next process
+    assert sel["targets"] == [T_C, T_A, "tests/test_u.py::test_fn", "tests/test_u.py::test_stamp"]
+    assert sel["deselect"] == ["tests/test_u.py::test_fn[b]"]
+
+
+def test_ids_that_changed_since_the_map_run_under_their_new_names(unstable):
+    unstable.edit("pkg/mod.py", "return 1", "return 0 + 1")
+    out = unstable.cli("run")
+    s = out["summary"]
+    assert (s["status"], s["failed"], s["ran"], s["unrun_targets"]) == ("passed", 0, 5, [])
+    c = out["conservation"]
+    # test_stamp[<old pid>] and test_fn[a-<old pid>] ran as their new ids
+    assert (c["conserved"], c["selected"], c["executed"], c["renamed"], c["unplanned"]) == (
+        True, 5, 5, 2, 2)

@@ -159,6 +159,9 @@ class ProngsCov:
         self._spawns: dict[str, tuple[int, bool]] = {}  # test -> (own spawns, via a fixture)
         # read now: the recorder's own look at pyproject.toml is not the suite's
         self._want_state = settings.import_state(config.rootpath) is not None
+        # the environment the session started in: what its tests leave in
+        # os.environ is no part of what a fresh import of this tree produces
+        self._env = dict(os.environ)
         self._modules: list[str] = []
         self.evidence.start()
         if MON:
@@ -331,7 +334,7 @@ class ProngsCov:
             # what import produced in this tree, over the whole suite's
             # modules: a later change is compared with it
             state.record(self.rootpath, res["key"],
-                         state.suite_modules(Path(self.rootpath), self._modules))
+                         state.suite_modules(Path(self.rootpath), self._modules), self._env)
         sys.stderr.write(
             f"\n[prongs] journaled run {res['key']} ({info['scope']}"
             f"{', dirty' if info['dirty_files'] else ''}): {res['n_tests']} tests"

@@ -674,24 +674,26 @@ def suite_modules(repo: Path, extra=()) -> list[str]:
     return sorted(mods)
 
 
-def record(rootpath: str | Path, key: str, modules: list[str]) -> Path | None:
+def record(rootpath: str | Path, key: str, modules: list[str],
+           env: dict | None = None) -> Path | None:
     """Snapshot what import produces in this tree and store it under a run's
     journal key. Two fresh processes, side by side: what differs between two
-    imports of one tree says nothing about a change."""
+    imports of one tree says nothing about a change. `env` is the
+    environment they start from (default: this process's, as it is now)."""
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(2) as pool:
         first, again = (r["snapshot"] for r in pool.map(
-            lambda _: collect(rootpath, modules), range(2)))
+            lambda _: collect(rootpath, modules, env), range(2)))
     if first is None or again is None:
         return None
     return save(Path(rootpath), key, stored(first, volatile(first, again)))
 
 
-def collect(rootpath: str | Path, modules: list[str]) -> dict:
+def collect(rootpath: str | Path, modules: list[str], env: dict | None = None) -> dict:
     """Collect test modules in a fresh process, running nothing: {'ok',
     'exit', 'output' (on failure), 'snapshot' (what import produced there)}."""
-    env = {k: v for k, v in os.environ.items() if k != "PRONGS_COV"}
+    env = {k: v for k, v in (os.environ if env is None else env).items() if k != "PRONGS_COV"}
     # one hash seed for every snapshot: the order of a set, and of whatever is
     # built by iterating one, is then the same in each, and only what really
     # differs from import to import (a clock, a pid, an address) is volatile

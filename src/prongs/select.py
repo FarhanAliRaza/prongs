@@ -1008,27 +1008,38 @@ def unseen_changes(an: "Analysis", seen_funcs: set, seen_files: set, files: Evid
             )
 
 
-def targets_for(selected: set[str], selected_files, all_tests) -> list[str]:
-    """What pytest is handed: whole-file targets, then node ids. A module
-    whose every known test is selected runs as one file too (and so does
-    every module when everything runs): pytest resolves one path instead of
-    one id per test, which on DRF (1,626 ids) cost ~10% of the suite's wall
-    time. A whole-file target subsumes that file's node ids.
+def targets_for(selected: set[str], selected_files, all_tests) -> tuple[list[str], list[str]]:
+    """What pytest is handed: (targets, ids to deselect). Targets are
+    whole-file targets, then node ids. A module whose every known test is
+    selected runs as one file too (and so does every module when everything
+    runs): pytest resolves one path instead of one id per test, which on DRF
+    (1,626 ids) cost ~10% of the suite's wall time. A whole-file target
+    subsumes that file's node ids.
 
     Files in a parent directory come before files below it. pytest collects
     a file target's directory afresh, with new nodes for its subdirectories;
     from pytest 9 a conftest's fixtures belong to the directory node they
     were first collected under, so a target in tests/ after one in tests/sub/
     leaves every later tests/sub/ id without tests/sub/conftest.py's
-    fixtures ("fixture not found")."""
+    fixtures ("fixture not found").
+
+    A parametrized test is targeted as its function, never as `name[id]`,
+    and the known parametrizations that are not selected are deselected. An
+    id can differ from run to run (a timestamp or a pid in a parameter), and
+    pytest refuses the whole run over one id it cannot find; this way such a
+    test runs under whatever its ids are now."""
     modules: dict[str, list[str]] = {}
     for t in all_tests:
         modules.setdefault(t.split("::", 1)[0], []).append(t)
     files = set(selected_files) | {
         mod for mod, tests in modules.items() if all(t in selected for t in tests)
     }
-    return (sorted(files, key=lambda f: (f.count("/"), f))
-            + sorted(t for t in selected if t.split("::", 1)[0] not in files))
+    ids = {t.split("[", 1)[0] for t in selected if t.split("::", 1)[0] not in files}
+    deselect = sorted(
+        t for t in all_tests
+        if "[" in t and t not in selected and t.split("[", 1)[0] in ids
+    )
+    return sorted(files, key=lambda f: (f.count("/"), f)) + sorted(ids), deselect
 
 
 def broadening(path: str, quals: list[str]) -> str:
@@ -1295,7 +1306,8 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "reasons": run_all_reasons,
             "selected": {t: "run_all" for t in sorted(all_tests)},
             "selected_files": run_all_files,
-            "targets": targets_for(set(all_tests), run_all_files, all_tests),
+            "targets": targets_for(set(all_tests), run_all_files, all_tests)[0],
+            "deselect": [],
             "n_selected": len(all_tests),
             "n_skipped": 0,
             "n_total": len(all_tests),
@@ -1313,7 +1325,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
             "evidence": ev,
         }
 
-    targets = targets_for(set(selected), selected_files, all_tests)
+    targets, deselect = targets_for(set(selected), selected_files, all_tests)
     con.close()
     skipped = {
         t: "no overlap between this test's coverage map and the diff"
@@ -1327,6 +1339,7 @@ def select(db_path: Path, repo: Path, base: str | None = None, head: str | None 
         "selected": {t: selected[t] for t in sorted(selected)},
         "selected_files": selected_files,
         "targets": targets,
+        "deselect": deselect,
         "n_selected": len(selected),
         "n_skipped": len(skipped),
         "n_total": len(all_tests),
